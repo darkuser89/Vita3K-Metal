@@ -26,6 +26,10 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET 13.3)
 # https://gitlab.kitware.com/cmake/cmake/-/issues/24104
 if(APPLE)
     enable_language(OBJC)
+    enable_language(OBJCXX)
+    set(CMAKE_OBJCXX_STANDARD ${CMAKE_CXX_STANDARD})
+    set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+    set(CMAKE_OBJCXX_EXTENSIONS OFF)
 endif()
 
 if(ANDROID)

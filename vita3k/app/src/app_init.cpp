@@ -171,7 +171,8 @@ static void set_backend_renderer(EmuEnvState &emuenv, const std::string &backend
         ? renderer::Backend::OpenGL
         : renderer::Backend::Vulkan;
 #else
-    emuenv.backend_renderer = renderer::Backend::Vulkan;
+    emuenv.backend_renderer = string_utils::toupper(backend_renderer) == "METAL"
+        ? renderer::Backend::Metal : renderer::Backend::Vulkan;
 #endif
 }
 

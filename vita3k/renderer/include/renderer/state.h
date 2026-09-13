@@ -230,7 +230,7 @@ struct State {
         vita_fs_path = root_paths.get_vita_fs_path();
     }
 
-    void set_app(const char *title_id, const char *self_name) {
+    virtual void set_app(const char *title_id, const char *self_name) {
         shaders_path = cache_path / "shaders" / title_id / self_name;
         shaders_log_path = log_path / "shaderlog" / title_id / self_name;
     }

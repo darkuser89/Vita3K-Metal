@@ -410,9 +410,15 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
 
     const uint32_t org_layout_width = layout_width;
     const uint32_t org_layout_height = layout_height;
+    const uint32_t source_bpp = bpp;
 
     while (face_uploaded_count < face_total_count && org_width > 0 && org_height > 0) {
         pixels = texture_data;
+        if (backend == renderer::Backend::Metal) {
+            // Expanded uploads must not change the next guest mip's stride.
+            bpp = source_bpp;
+            bytes_per_pixel = (bpp + 7) / 8;
+        }
 
         SceGxmTextureBaseFormat upload_format = base_format;
         uint32_t memory_height = height;
@@ -492,7 +498,7 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
             break;
         case SCE_GXM_TEXTURE_BASE_FORMAT_U2F10F10F10:
             // don't change what openGL is doing (which is completely wrong)
-            if (!is_vulkan || support_a2rgb10) {
+            if ((!is_vulkan && backend != renderer::Backend::Metal) || support_a2rgb10) {
                 LOG_INFO_ONCE("Your device support SCE_GXM_TEXTURE_BASE_FORMAT_U2F10F10F10");
                 break;
             }
@@ -500,14 +506,20 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
             convert_u2f10f10f10_to_f16f16f16f16(texture_data_decompressed.data(), pixels, pixels_per_stride, memory_height, fmt);
             pixels = texture_data_decompressed.data();
             upload_format = SCE_GXM_TEXTURE_BASE_FORMAT_F16F16F16F16;
+            if (backend == renderer::Backend::Metal) {
+                bytes_per_pixel = 8;
+                bpp = 64;
+            }
             break;
         case SCE_GXM_TEXTURE_BASE_FORMAT_X8U24:
             texture_data_decompressed.resize(pixels_per_stride * memory_height * 4);
             if (is_vulkan && support_x8d24) {
                 LOG_INFO_ONCE("Your device support SCE_GXM_TEXTURE_BASE_FORMAT_X8U24");
                 break;
-            } else if (is_vulkan) {
+            } else if (is_vulkan || backend == renderer::Backend::Metal) {
                 // d24_u8 or x8_d24 is not supported on all GPUs (thanks AMD)
+                // Native Metal also consumes normalized F32, not GL's rotated
+                // packed depth/stencil representation.
                 convert_x8u24_to_f32(texture_data_decompressed.data(), pixels, pixels_per_stride, memory_height, fmt);
                 upload_format = SCE_GXM_TEXTURE_BASE_FORMAT_F32;
             } else {
@@ -628,6 +640,7 @@ static constexpr TextureGxmDataRepr strided_texture_mask = {
 
 void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemState &mem) {
     R_PROFILE(__func__);
+    const uint64_t additional_hash = additional_texture_hash(gxm_texture, mem);
 
     size_t index = 0;
     bool configure = false;
@@ -712,6 +725,9 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
             upload = info->dirty;
         }
     }
+    if (cached_gxm_texture_index != -1 && info->additional_hash != additional_hash)
+        upload = true;
+    info->additional_hash = additional_hash;
     current_info = info;
 
     if (gxm_texture.data_addr == 0) {

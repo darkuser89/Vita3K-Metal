@@ -26,6 +26,9 @@
 #include <util/tracy.h>
 
 #include <renderer/vulkan/state.h>
+#ifdef __APPLE__
+#include <renderer/metal/state.h>
+#endif
 
 // keywords.h must be after tracy.h for msvc compiler
 #include <util/keywords.h>
@@ -142,6 +145,16 @@ COMMAND(handle_transfer_copy) {
     SceGxmTransferType src_type = helper.pop<SceGxmTransferType>();
     SceGxmTransferType dst_type = helper.pop<SceGxmTransferType>();
 
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal) {
+        const std::unique_ptr<const SceGxmTransferImage[]> owned(images);
+        if (!dynamic_cast<metal::MetalState &>(renderer).transfer_copy(mem, images[0], images[1],
+                src_type, dst_type, colorKeyMode, colorKeyValue, colorKeyMask))
+            LOG_ERROR_ONCE("Metal: unsupported or invalid transfer copy");
+        return;
+    }
+#endif
+
     if (src_fmt != dst_fmt) {
         LOG_ERROR_ONCE("Unhandled format conversion from 0x{:0X} to 0x{:0X}", fmt::underlying(src_fmt), fmt::underlying(dst_fmt));
         delete[] images;
@@ -197,6 +210,15 @@ COMMAND(handle_transfer_downscale) {
     TRACY_FUNC_COMMANDS(handle_transfer_downscale);
     SceGxmTransferImage *src = helper.pop<SceGxmTransferImage *>();
     SceGxmTransferImage *dst = helper.pop<SceGxmTransferImage *>();
+
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal) {
+        const std::unique_ptr<SceGxmTransferImage> owned_src(src), owned_dst(dst);
+        if (!src || !dst || !static_cast<metal::MetalState &>(renderer).transfer_downscale(mem,*src,*dst))
+            LOG_ERROR_ONCE("Metal: unsupported or invalid transfer downscale");
+        return;
+    }
+#endif
 
     if (src->format != dst->format) {
         LOG_ERROR_ONCE("Unhandled format conversion from 0x{:0X} to 0x{:0X}", fmt::underlying(src->format), fmt::underlying(dst->format));
@@ -289,6 +311,15 @@ COMMAND(handle_transfer_fill) {
     TRACY_FUNC_COMMANDS(handle_transfer_fill);
     const uint32_t fill_color = helper.pop<uint32_t>();
     const SceGxmTransferImage *dest = helper.pop<SceGxmTransferImage *>();
+
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal) {
+        const std::unique_ptr<const SceGxmTransferImage> owned(dest);
+        if (!dest || !static_cast<metal::MetalState &>(renderer).transfer_fill(mem,*dest,fill_color))
+            LOG_ERROR_ONCE("Metal: unsupported or invalid transfer fill destination");
+        return;
+    }
+#endif
 
     const auto bpp = gxm::get_bits_per_pixel(dest->format);
 

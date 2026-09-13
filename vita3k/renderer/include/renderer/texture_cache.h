@@ -48,6 +48,7 @@ static constexpr size_t TextureCacheSize = 1024;
 typedef std::array<uint32_t, 4> TextureGxmDataRepr;
 struct TextureCacheInfo {
     uint64_t hash = 0;
+    uint64_t additional_hash = 0;
     SceGxmTexture texture;
     int index = 0;
     uint32_t texture_size = 0;
@@ -149,6 +150,9 @@ public:
     virtual void configure_texture(const SceGxmTexture &texture) = 0;
     virtual void upload_texture_impl(SceGxmTextureBaseFormat base_format, uint32_t width, uint32_t height, uint32_t mip_index, const void *pixels, int face, uint32_t pixels_per_stride) = 0;
     virtual void upload_done() {}
+    // Backends may track data outside the legacy replacement/base-mip hash.
+    // Keep that hash separate so existing replacement filenames stay valid.
+    virtual uint64_t additional_texture_hash(const SceGxmTexture &, const MemState &) const { return 0; }
 
     virtual void configure_sampler(size_t index, const SceGxmTexture &texture, bool no_linear) {}
 

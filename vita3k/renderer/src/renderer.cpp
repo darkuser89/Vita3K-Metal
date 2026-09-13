@@ -29,6 +29,9 @@
 #include <renderer/gl/state.h>
 #include <renderer/gl/types.h>
 #include <renderer/vulkan/functions.h>
+#ifdef __APPLE__
+#include <renderer/metal/state.h>
+#endif
 
 #include <gxm/functions.h>
 #include <util/log.h>
@@ -242,6 +245,11 @@ void destroy_context(State &state, std::unique_ptr<Context> &context) {
 void destroy_context_during_shutdown(State &state, std::unique_ptr<Context> &context) {
     assert(!state.render_thread);
 
+#ifdef __APPLE__
+    if (state.current_backend == Backend::Metal && context)
+        static_cast<metal::MetalState &>(state).finish(static_cast<metal::MetalContext &>(*context));
+#endif
+
     if (state.current_backend == Backend::OpenGL) {
         state.set_current();
     }
@@ -274,14 +282,19 @@ void destroy_render_target_during_shutdown(State &state, std::unique_ptr<RenderT
     case Backend::Vulkan:
         vulkan::destroy(dynamic_cast<vulkan::VKState &>(state), rt);
         break;
+    case Backend::Metal:
+        break;
     }
 
     rt.reset();
 }
 
-void set_uniform_buffer(State &state, Context *ctx, const bool is_vertex_uniform, const int block_number, const std::uint16_t block_size, const Ptr<const void> buffer) {
+void set_uniform_buffer(State &state, Context *ctx, const bool is_vertex_uniform, const int block_number, const std::uint32_t block_size, const Ptr<const void> buffer) {
     // Calculate the number of bytes
-    std::uint32_t bytes_to_copy_and_pad = ((block_size + 15) / 16) * 16;
+    // Preserve the legacy backends' upload behavior. Native Metal needs the
+    // complete range for writable buffers, which can exceed 64 KiB.
+    const uint32_t effective_size = state.current_backend == Backend::Metal ? block_size : static_cast<uint16_t>(block_size);
+    std::uint32_t bytes_to_copy_and_pad = ((effective_size + 15) / 16) * 16;
 
     renderer::add_state_set_command(ctx, renderer::GXMState::UniformBuffer, buffer, is_vertex_uniform, block_number, bytes_to_copy_and_pad);
 }

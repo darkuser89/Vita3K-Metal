@@ -26,6 +26,7 @@ struct FeatureState;
 namespace shader::usse::utils {
 
 struct SpirvUtilFunctions {
+    bool native_metal = false;
     spv::Id std_builtins{};
     std::map<DataType, spv::Function *> unpack_funcs;
     std::map<DataType, spv::Function *> pack_funcs;

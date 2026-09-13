@@ -168,6 +168,15 @@ ProgramInput get_program_input(const SceGxmProgram &program) {
                 // so set the size to unbounded in the shader
                 if (var_name == "g_mSkinTransforms")
                     uniform_buffers[parameter.container_index].size = SCE_GXM_MAX_UB_IN_FLOAT_UNIT;
+
+                // DOA declares one three-row skinning matrix, then indexes a
+                // palette with vertex bone indices (48 bytes per matrix).
+                // Treat this declaration as an open-ended palette as well;
+                // copying only its declared 48 bytes loses every later bone.
+                // GXM bounds the upload against mapped memory/other bindings.
+                if (var_name == "gSkinningMatrices" && store_type == DataType::F32
+                    && parameter.component_count == 4 && parameter.array_size == 3)
+                    uniform_buffers[parameter.container_index].size = SCE_GXM_MAX_UB_IN_FLOAT_UNIT;
             }
             break;
         }

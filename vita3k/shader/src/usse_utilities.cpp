@@ -27,6 +27,7 @@
 #include <features/state.h>
 
 #include <bitset>
+#include <stdexcept>
 
 namespace shader::usse::utils {
 
@@ -157,6 +158,8 @@ static const SpirvVarRegBank *get_reg_bank(const shader::usse::SpirvShaderParame
         return &params.predicates;
     case RegisterBank::INDEX:
         return &params.indexes;
+    case RegisterBank::GLOBAL:
+        return params.native_global_regs ? &params.native_global_regs : nullptr;
     default:
         // LOG_WARN("Reg bank {} unsupported", static_cast<uint8_t>(reg_bank));
         return nullptr;
@@ -473,6 +476,44 @@ static spv::Function *make_f16_unpack_func(spv::Builder &b, const SpirvUtilFunct
     return f16_unpack_func;
 }
 
+// A float -> half -> float cast pair may retain float precision in Metal.
+// Guest register packing must round even when the next instruction immediately
+// unpacks it. Construct the IEEE half bits before exposing the packed word.
+static spv::Id pack_native_f16_bits(spv::Builder &b, spv::Id value) {
+    const auto u = b.makeUintType(32), u2 = b.makeVectorType(u, 2), boolean2 = b.makeVectorType(b.makeBoolType(), 2);
+    const auto c = [&](uint32_t x) {
+        const auto id = b.makeUintConstant(x);
+        return b.makeCompositeConstant(u2, {id, id});
+    };
+    const auto op = [&](spv::Op code, spv::Id a, spv::Id d) { return b.createBinOp(code, u2, a, d); };
+    const auto less = [&](spv::Id a, uint32_t d) { return b.createBinOp(spv::OpULessThan, boolean2, a, c(d)); };
+    const auto select = [&](spv::Id p, spv::Id a, spv::Id d) { return b.createOp(spv::OpSelect, u2, {p, a, d}); };
+    const auto raw = b.createUnaryOp(spv::OpBitcast, u2, value);
+    const auto magnitude = op(spv::OpBitwiseAnd, raw, c(0x7fffffff));
+    const auto sign = op(spv::OpBitwiseAnd, op(spv::OpShiftRightLogical, raw, c(16)), c(0x8000));
+    const auto odd = op(spv::OpBitwiseAnd, op(spv::OpShiftRightLogical, magnitude, c(13)), c(1));
+    const auto rounded = op(spv::OpIAdd, magnitude, op(spv::OpIAdd, c(0xfff), odd));
+    const auto normal = op(spv::OpISub, op(spv::OpShiftRightLogical, rounded, c(13)), c(0x1c000));
+    const auto normal_or_inf = select(less(normal, 0x7c00), normal, c(0x7c00));
+    // Below 2^-14, adding 0.5f rounds to the Half subnormal spacing (2^-24).
+    // The low F32 mantissa bits then hold the rounded Half mantissa, including
+    // ties to even, zero, and the carry into the minimum normal Half value.
+    // Other magnitudes are ignored by the selection below. Keep this addition
+    // at F32 precision; the native compiler uses safe math.
+    const auto f2 = b.getTypeId(value), midpoint = b.makeFloatConstant(0.5f);
+    const auto biased = b.createBinOp(spv::OpFAdd, f2, b.createUnaryOp(spv::OpBitcast, f2, magnitude),
+                                     b.makeCompositeConstant(f2, {midpoint, midpoint}));
+    const auto sub = op(spv::OpISub, b.createUnaryOp(spv::OpBitcast, u2, biased), c(0x3f000000));
+    const auto finite = select(less(magnitude, 0x38800000), sub, normal_or_inf);
+    // Preserve the high payload bits and quiet NaNs; infinity stays infinity.
+    const auto nan = op(spv::OpBitwiseOr, c(0x7e00),
+                        op(spv::OpBitwiseAnd, op(spv::OpShiftRightLogical, magnitude, c(13)), c(0x3ff)));
+    const auto special = select(less(magnitude, 0x7f800001), c(0x7c00), nan);
+    const auto bits = op(spv::OpBitwiseOr, select(less(magnitude, 0x7f800000), finite, special), sign);
+    const auto low = b.createCompositeExtract(bits, u, 0), high = b.createCompositeExtract(bits, u, 1);
+    return b.createBinOp(spv::OpBitwiseOr, u, low,
+                         b.createBinOp(spv::OpShiftLeftLogical, u, high, b.makeUintConstant(16)));
+}
 static spv::Function *make_f16_pack_func(spv::Builder &b, const SpirvUtilFunctions &utils, const FeatureState &features) {
     std::vector<std::vector<spv::Decoration>> decorations;
 
@@ -488,11 +529,13 @@ static spv::Function *make_f16_pack_func(spv::Builder &b, const SpirvUtilFunctio
         decorations, &f16_pack_func_block);
     b.setupFunctionDebugInfo(f16_pack_func, "pack2xF16", { type_f32_v2 }, { "to_pack" });
 
-    f16_pack_func->addParamPrecision(0, spv::DecorationRelaxedPrecision);
+    if (!utils.native_metal)
+        f16_pack_func->addParamPrecision(0, spv::DecorationRelaxedPrecision);
     spv::Id extracted = f16_pack_func->getParamId(0);
 
     // use packHalf2x16
-    extracted = b.createBuiltinCall(type_ui32, utils.std_builtins, GLSLstd450PackHalf2x16, { extracted });
+    extracted = utils.native_metal ? pack_native_f16_bits(b, extracted)
+        : b.createBuiltinCall(type_ui32, utils.std_builtins, GLSLstd450PackHalf2x16, { extracted });
     extracted = b.createUnaryOp(spv::OpBitcast, type_f32, extracted);
 
     b.makeReturn(false, extracted);
@@ -667,6 +710,22 @@ void buffer_address_access(spv::Builder &b, const SpirvShaderParameters &params,
     buffer_address = b.createLoad(buffer_address, spv::NoPrecision);
     // add the offset from the base address
     buffer_address = add_uvec2_uint(b, buffer_address, addr);
+
+    if (params.native_metal && is_buffer_store && component_size == sizeof(uint32_t)) {
+        // A scalar array with a 16-byte stride becomes float4 storage in MSL;
+        // SPIRV-Cross cannot form a writable scalar reference to that padding.
+        // Use actual word-sized accesses so each STR writes exactly its bytes.
+        const auto pointer_type = make_or_get_buffer_ptr(b, utils, 1, 4, true);
+        const auto pointer = b.createUnaryOp(spv::OpBitcast, pointer_type, buffer_address);
+        for (uint32_t component = 0; component < nb_components; ++component) {
+            const auto accessed = utils::create_access_chain(b, spv::StorageClassPhysicalStorageBuffer, pointer,
+                { zero, b.makeIntConstant(component) });
+            const auto value = load(b, params, utils, features, dest, 0b1, dest_offset);
+            b.createStore(value, accessed, spv::MemoryAccessAlignedMask, spv::ScopeMax, 4);
+            ++dest.num;
+        }
+        return;
+    }
 
     if (component_size == sizeof(uint32_t)) {
         int buffer_idx_vec4 = 0;
@@ -876,6 +935,33 @@ static spv::Id apply_modifiers(spv::Builder &b, const SpirvUtilFunctions &utils,
 
 spv::Id load(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunctions &utils, const FeatureState &features, Operand op, const Imm4 dest_mask, int shift_offset) {
     spv::Id type_f32 = b.makeFloatType(32);
+
+    if (params.native_metal && (op.is_global || op.bank == RegisterBank::GLOBAL)) {
+        if (shift_offset != 0)
+            throw std::runtime_error("Metal: unsupported global register context");
+        const auto global = op.num;
+        if ((global == 17 || global == 45) && params.thread_buffer) {
+            // The USC spill prologue selects (4 * CORENUMBER + PIPENUMBER)
+            // from shared hardware scratch storage. Our thread-buffer LDR/STR
+            // path uses a private array per invocation and omits that base.
+            // Its logical core/pipe is therefore zero; physical Metal execution
+            // IDs must not offset or alias these independent private arrays.
+            op.bank = RegisterBank::IMMEDIATE;
+            op.is_global = false;
+            op.num = 0;
+        } else {
+            if (!params.native_global_regs)
+                throw std::runtime_error("Metal: unsupported global register context");
+            switch (global) {
+            case 16: op.num = 3; break;
+            case 23: op.num = 0; break;
+            case 24: op.num = 1; break;
+            case 43: op.num = 2; break;
+            default: throw std::runtime_error("Metal: unsupported SGX global register " + std::to_string(global));
+            }
+            op.bank = RegisterBank::GLOBAL;
+        }
+    }
 
     if (op.bank == RegisterBank::FPCONSTANT) {
         const bool integral_unsigned = (op.type == DataType::UINT32) || (op.type == DataType::UINT16);
@@ -1283,6 +1369,8 @@ spv::Id unpack(spv::Builder &b, SpirvUtilFunctions &utils, const FeatureState &f
 
 void store(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunctions &utils, const FeatureState &features, Operand dest,
     spv::Id source, std::uint8_t dest_mask, int off) {
+    if (params.native_metal && (dest.is_global || dest.bank == RegisterBank::GLOBAL))
+        throw std::runtime_error("Metal: writing SGX global registers is unsupported");
     if (source == spv::NoResult) {
         LOG_WARN("Source invalid");
         return;

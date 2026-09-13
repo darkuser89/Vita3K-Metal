@@ -79,6 +79,9 @@ COMMAND(handle_set_screen_filter) {
     std::unique_ptr<std::string> filter(helper.pop<std::string *>());
 
     switch (renderer.current_backend) {
+    case Backend::Metal:
+        renderer.set_screen_filter(*filter);
+        break;
     case Backend::OpenGL:
         dynamic_cast<gl::GLState &>(renderer).set_screen_filter(*filter);
         break;

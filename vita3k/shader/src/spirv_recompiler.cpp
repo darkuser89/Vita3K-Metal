@@ -106,6 +106,7 @@ struct TranslationState {
     spv::Id color_attachment_raw_id = spv::NoResult;
     spv::Id mask_id = spv::NoResult;
     spv::Id frag_coord_id = spv::NoResult;
+    spv::Id native_front_facing_id = spv::NoResult;
     spv::Id render_info_id = spv::NoResult;
     std::vector<VarToReg> var_to_regs;
     std::vector<spv::Id> interfaces;
@@ -113,6 +114,7 @@ struct TranslationState {
     bool is_fragment = false;
     bool is_target_glsl = false;
     bool is_vulkan = false;
+    bool is_metal = false;
     spv::ImageFormat image_storage_format = spv::ImageFormat::ImageFormatUnknown;
     const Hints *hints = nullptr;
 };
@@ -345,7 +347,9 @@ static spv::Id create_builtin_sampler(spv::Builder &b, const FeatureState &featu
         // f_mask is always rgba8
         format = spv::ImageFormat::ImageFormatRgba8;
 
-    spv::Id image_type = b.makeImageType(sampled_type, spv::Dim2D, false, false, false, sampled, format);
+    const bool multisampled_mask = name == "f_mask" && translation_state.is_metal && translation_state.hints->metal_samples > 1;
+    if (multisampled_mask) b.addCapability(spv::CapabilityStorageImageMultisample);
+    spv::Id image_type = b.makeImageType(sampled_type, spv::Dim2D, false, false, multisampled_mask, sampled, format);
     spv::Id sampler = b.createVariable(spv::NoPrecision, spv::StorageClassUniformConstant, image_type, name.c_str());
 
     return sampler;
@@ -360,6 +364,31 @@ static spv::Id create_builtin_sampler_for_raw(spv::Builder &b, const FeatureStat
     spv::Id sampler = b.createVariable(spv::NoPrecision, spv::StorageClassUniformConstant, image_type, name.c_str());
 
     return sampler;
+}
+
+static DataType fragment_color_register_type(const SceGxmProgram &program, const TranslationState &state) {
+    auto type = std::get<0>(shader::get_parameter_type_store_and_name(program.get_fragment_output_type()));
+    // Native-color programs access packed tile words. On U8 targets the F16
+    // declaration can describe a final register move, while SOP2 operates on
+    // four packed bytes (as in Stealth Inc.'s programmable blending shaders).
+    if (state.is_metal && program.is_native_color() && type == DataType::F16
+        && state.hints->metal_output_register_size == SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT
+        && gxm::get_base_format(state.hints->color_format) == SCE_GXM_COLOR_BASE_FORMAT_U8U8U8U8)
+        return DataType::UINT8;
+    return type;
+}
+
+static bool use_metal_half_attachment(const SceGxmProgram &program, const TranslationState &state) {
+    return state.is_metal
+        && gxm::get_base_format(state.hints->color_format) == SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16
+        && fragment_color_register_type(program, state) == DataType::F16;
+}
+
+static spv::Id make_metal_half4_type(spv::Builder &b) {
+    b.addExtension("SPV_KHR_16bit_storage");
+    b.addCapability(spv::CapabilityFloat16);
+    b.addCapability(spv::CapabilityStorageInputOutput16);
+    return b.makeVectorType(b.makeFloatType(16), 4);
 }
 
 static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &parameters, utils::SpirvUtilFunctions &utils, const FeatureState &features, TranslationState &translation_state, NonDependentTextureQueryCallInfos &tex_query_infos, SamplerMap &samplers,
@@ -700,7 +729,7 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
 
         target_to_store.bank = RegisterBank::OUTPUT;
         target_to_store.num = 0;
-        target_to_store.type = std::get<0>(shader::get_parameter_type_store_and_name(program.get_fragment_output_type()));
+        target_to_store.type = fragment_color_register_type(program, translation_state);
 
         // see frag_finalize for the following cases
         if (target_to_store.type == DataType::INT32 || target_to_store.type == DataType::UINT32)
@@ -718,6 +747,12 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
 
         auto store_source_result = [&](const bool direct_store = false) {
             if (source != spv::NoResult) {
+                if (translation_state.is_metal && translation_state.hints->color_format == SCE_GXM_COLOR_FORMAT_U8_A) {
+                    // Alpha-only guest surfaces are backed by native R8.
+                    const auto alpha = b.createCompositeExtract(source, f32, 0);
+                    const auto zero = b.makeFloatConstant(0);
+                    source = b.createCompositeConstruct(v4, {zero, zero, zero, alpha});
+                }
                 if (!direct_store && !is_float_data_type(target_to_store.type)) {
                     source = utils::convert_to_int(b, utils, source, target_to_store.type, true);
                 }
@@ -730,7 +765,16 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
             // The GPU supports gl_LastFragData.
             // On Vulkan this is a subpass input, it is similar to gl_LastFragData (and should have the same speed on integrated GPUs)
             // This is not supported on OpenGL with SpirV
-            const spv::Id image_type = b.makeImageType(f32, spv::DimSubpassData, false, false, false, 2, spv::ImageFormatUnknown);
+            const bool native_half = use_metal_half_attachment(program, translation_state);
+            const spv::Id fetch_type = native_half ? make_metal_half4_type(b) : v4;
+            if (native_half) {
+                // This extension describes the half-typed image in the Metal
+                // intermediate module; it is never submitted to Vulkan.
+                b.addExtension("SPV_AMD_gpu_shader_half_float_fetch");
+                b.addCapability(spv::CapabilityFloat16ImageAMD);
+            }
+            const spv::Id image_type = b.makeImageType(native_half ? b.makeFloatType(16) : f32,
+                spv::DimSubpassData, false, false, false, 2, spv::ImageFormatUnknown);
             const spv::Id last_frag_data = b.createVariable(precision, spv::StorageClassUniformConstant, image_type, "last_frag_data");
             b.addDecoration(last_frag_data, spv::DecorationInputAttachmentIndex, 0);
             if (translation_state.is_vulkan) {
@@ -742,8 +786,18 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
             spv::Id coord_0 = b.makeIntConstant(0);
             const spv::Id ivec2 = b.makeVectorType(b.makeIntType(32), 2);
             coord_0 = b.makeCompositeConstant(ivec2, { coord_0, coord_0 });
-            source = b.createOp(spv::OpImageRead, v4, { b.createLoad(last_frag_data, spv::NoPrecision), coord_0 });
+            source = b.createOp(spv::OpImageRead, fetch_type, { b.createLoad(last_frag_data, spv::NoPrecision), coord_0 });
             b.setPrecision(source, precision);
+
+            if (native_half) {
+                // Preserve all tile bits, including NaN payloads used for
+                // packed normals, instead of half -> float -> half conversion.
+                auto raw_target = target_to_store;
+                raw_target.type = DataType::F32;
+                const auto words = b.createUnaryOp(spv::OpBitcast, b.makeVectorType(f32, 2), source);
+                utils::store(b, parameters, utils, features, raw_target, words, 0b0011, 0);
+                source = spv::NoResult;
+            }
 
             translation_state.last_frag_data_id = last_frag_data;
         } else if (features.support_shader_interlock || features.support_texture_barrier) {
@@ -872,6 +926,11 @@ static void copy_uniform_block_to_register(spv::Builder &builder, spv::Id sa_ban
 static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProgram &program, utils::SpirvUtilFunctions &utils,
     const FeatureState &features, TranslationState &translation_state, SceGxmProgramType program_type, NonDependentTextureQueryCallInfos &texture_queries) {
     SpirvShaderParameters spv_params = {};
+    spv_params.native_metal = translation_state.is_metal;
+    if (translation_state.is_metal) {
+        const auto *bias = program.is_fragment() ? translation_state.hints->metal_fragment_lod_bias : translation_state.hints->metal_vertex_lod_bias;
+        std::copy_n(bias, SCE_GXM_MAX_TEXTURE_UNITS, spv_params.native_texture_lod_bias);
+    }
     const SceGxmProgramParameter *const gxp_parameters = program.program_parameters();
 
     // Make array type. TODO: Make length configurable
@@ -1111,6 +1170,22 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
     }
 
     spv_params.render_info_id = translation_state.render_info_id;
+    if (translation_state.is_metal && translation_state.hints->metal_mip_sampling && texture_count) {
+        const auto sizes=b.makeArrayType(uvec2,b.makeUintConstant(16),0);
+        b.addDecoration(sizes,spv::DecorationArrayStride,8);
+        const auto info=b.makeStructType({b.makeVectorType(u32,4),sizes},"MetalTextureMipInfo");
+        b.addMemberName(info,0,"control");b.addMemberDecoration(info,0,spv::DecorationOffset,0);
+        b.addMemberName(info,1,"sizes");b.addMemberDecoration(info,1,spv::DecorationOffset,16);
+        const auto infos=b.makeArrayType(info,b.makeUintConstant(16),0);
+        b.addDecoration(infos,spv::DecorationArrayStride,144);
+        const auto block=b.makeStructType({infos},"MetalTextureMipBlock");
+        b.addDecoration(block,spv::DecorationBlock);b.addMemberName(block,0,"textures");
+        b.addMemberDecoration(block,0,spv::DecorationOffset,0);
+        spv_params.native_texture_info=b.createVariable(spv::NoPrecision,spv::StorageClassUniform,block,"metalTextureInfo");
+        b.addDecoration(spv_params.native_texture_info,spv::DecorationBinding,4);
+        b.addDecoration(spv_params.native_texture_info,spv::DecorationDescriptorSet,0);
+    }
+
 
     for (const auto &buffer : program_input.uniform_buffers) {
         int host_idx = convert_buffer_idx_to_host(buffer.index);
@@ -1133,7 +1208,9 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
     }
 
     const auto add_var_to_reg = [&](const Input &input, const std::string &name, std::uint16_t semantic, bool pa, bool regformat, std::int32_t location, std::uint32_t index) {
-        spv::Id param_type = get_param_type(b, input);
+        // Metal's raw register inputs get an unsigned packed type below. Do not
+        // resolve an unused scalar type first (C10 has no scalar SPIR-V type).
+        spv::Id param_type = translation_state.is_metal && regformat ? spv::NoResult : get_param_type(b, input);
         const int type_size = get_data_type_size(input.type);
         DataType input_type = input.type;
 
@@ -1431,6 +1508,45 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
     if (translation_state.is_fragment)
         create_fragment_inputs(b, spv_params, utils, features, translation_state, texture_queries, samplers, program);
 
+    if (translation_state.is_metal && translation_state.is_fragment) {
+        // SGX543 special-bank 16/23/24/43: BFCONTROL, local X/Y and TILEXY.
+        // USSE addresses are in guest pixels, independently of native upscaling.
+        // The register identities are documented in sgxusespecialbankdefs.h;
+        // the 16-pixel decomposition follows the captured buffer-store program.
+        const auto u32 = b.makeUintType(32);
+        const auto coords = b.createLoad(translation_state.frag_coord_id, spv::NoPrecision);
+        const auto scale_ptr = utils::create_access_chain(b, spv::StorageClassUniform, spv_params.render_info_id,
+            {b.makeIntConstant(FRAG_UNIFORM_res_multiplier)});
+        const auto scale = b.createLoad(scale_ptr, spv::NoPrecision);
+        const auto coordinate = [&](int component) {
+            const auto value = b.createCompositeExtract(coords, f32_type, component);
+            return b.createUnaryOp(spv::OpConvertFToU, u32, b.createBinOp(spv::OpFDiv, f32_type, value, scale));
+        };
+        const auto x = coordinate(0), y = coordinate(1);
+        const auto local_x = b.createBinOp(spv::OpBitwiseAnd, u32, x, b.makeUintConstant(15));
+        const auto local_y = b.createBinOp(spv::OpBitwiseAnd, u32, y, b.makeUintConstant(15));
+        const auto tile = [&](spv::Id value) {
+            return b.createBinOp(spv::OpBitwiseAnd, u32,
+                b.createBinOp(spv::OpShiftRightLogical, u32, value, b.makeUintConstant(4)), b.makeUintConstant(255));
+        };
+        const auto tile_xy = b.createBinOp(spv::OpBitwiseOr, u32, tile(x),
+            b.createBinOp(spv::OpShiftLeftLogical, u32, tile(y), b.makeUintConstant(8)));
+        translation_state.native_front_facing_id = b.createVariable(spv::NoPrecision, spv::StorageClassInput,
+            b.makeBoolType(), "gl_FrontFacing");
+        b.addDecoration(translation_state.native_front_facing_id, spv::DecorationBuiltIn, spv::BuiltInFrontFacing);
+        translation_state.interfaces.push_back(translation_state.native_front_facing_id);
+        const auto back_face = b.createTriOp(spv::OpSelect, u32,
+            b.createLoad(translation_state.native_front_facing_id, spv::NoPrecision), b.makeUintConstant(0), b.makeUintConstant(1));
+        const auto values = b.createCompositeConstruct(f32_v4_type, {
+            b.createUnaryOp(spv::OpBitcast, f32_type, local_x),
+            b.createUnaryOp(spv::OpBitcast, f32_type, local_y),
+            b.createUnaryOp(spv::OpBitcast, f32_type, tile_xy), b.createUnaryOp(spv::OpBitcast, f32_type, back_face)});
+        spv_params.native_global_regs = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate,
+            b.makeArrayType(f32_v4_type, b.makeIntConstant(1), 0), "sgx_fragment_globals");
+        b.createStore(values, utils::create_access_chain(b, spv::StorageClassPrivate,
+            spv_params.native_global_regs, {b.makeIntConstant(0)}));
+    }
+
     return spv_params;
 }
 
@@ -1452,14 +1568,13 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
         spv::NoPrecision, b.makeVoidType(), "frag_output_finalize", {}, {},
         decorations, &frag_fin_block);
 
-    const SceGxmParameterType param_type = program.get_fragment_output_type();
     auto vertex_varyings_ptr = program.vertex_varyings();
 
     Operand color_val_operand;
     color_val_operand.bank = program.is_native_color() ? RegisterBank::OUTPUT : RegisterBank::PRIMATTR;
     color_val_operand.num = 0;
     color_val_operand.swizzle = SWIZZLE_CHANNEL_4_DEFAULT;
-    color_val_operand.type = std::get<0>(shader::get_parameter_type_store_and_name(param_type));
+    color_val_operand.type = fragment_color_register_type(program, translate_state);
     // if the shader tries to write a INT32 or UINT32, it means the raw content
     if (color_val_operand.type == DataType::INT32 || color_val_operand.type == DataType::UINT32)
         color_val_operand.type = DataType::F32;
@@ -1530,9 +1645,23 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
             b.createNoResultOp(spv::OpImageWrite, { b.createLoad(translate_state.color_attachment_raw_id, spv::NoPrecision), translated_id, color });
         }
     } else {
-        spv::Id out = b.createVariable(precision, spv::StorageClassOutput, b.makeVectorType(b.makeFloatType(32), 4), "out_color");
+        spv::Id output_type = b.makeVectorType(b.makeFloatType(32), 4);
+        if (use_metal_half_attachment(program, translate_state)) {
+            output_type = make_metal_half4_type(b);
+            auto raw_color = color_val_operand;
+            raw_color.type = DataType::F32;
+            const auto words = utils::load(b, parameters, utils, features, raw_color, 0b0011, reg_off);
+            color = b.createUnaryOp(spv::OpBitcast, output_type, words);
+            precision = spv::NoPrecision;
+        }
+        spv::Id out = b.createVariable(precision, spv::StorageClassOutput, output_type, "out_color");
         translate_state.interfaces.push_back(out);
         b.addDecoration(out, spv::DecorationLocation, 0);
+        if (translate_state.is_metal && translate_state.hints->color_format == SCE_GXM_COLOR_FORMAT_U8_A) {
+            // Keep source alpha available for blending, while R8 stores it in R.
+            color = b.createOp(spv::OpVectorShuffle, output_type,
+                {{true, color}, {true, color}, {false, 3}, {false, 1}, {false, 2}, {false, 3}});
+        }
         b.createStore(color, out);
 
         if (features.preserve_f16_nan_as_u16) {
@@ -1558,14 +1687,34 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
 
         spv::Id sampled_type = b.makeFloatType(32);
         spv::Id v4 = b.makeVectorType(sampled_type, 4);
-        spv::Id texel = b.createOp(spv::OpImageRead, v4, { b.createLoad(translate_state.mask_id, spv::NoPrecision), current_coord });
         spv::Id rezero = b.makeFloatConstant(0.5f);
         spv::Id zero = b.makeCompositeConstant(v4, { rezero, rezero, rezero, rezero });
-        spv::Id pred = b.createOp(spv::OpFOrdLessThan, b.makeVectorType(b.makeBoolType(), 4), { texel, zero });
-        spv::Id pred2 = b.createUnaryOp(spv::OpAll, b.makeBoolType(), pred);
-        spv::Builder::If cond_builder(pred2, spv::SelectionControlMaskNone, b);
-        b.makeStatementTerminator(spv::OpKill, "discard");
-        cond_builder.makeEndIf();
+        if (translate_state.is_metal && translate_state.hints->metal_samples > 1) {
+            // Keep GXP shading at pixel frequency. The native coverage output
+            // gates color, depth and stencil independently for each mask bit.
+            spv::Id coverage = b.makeIntConstant(0);
+            for (uint32_t sample = 0; sample < translate_state.hints->metal_samples; ++sample) {
+                auto texel = b.createOp(spv::OpImageRead, v4, {
+                    {true, b.createLoad(translate_state.mask_id, spv::NoPrecision)}, {true, current_coord},
+                    {false, spv::ImageOperandsSampleMask}, {true, b.makeIntConstant(sample)} });
+                auto below = b.createBinOp(spv::OpFOrdLessThan, b.makeVectorType(b.makeBoolType(),4), texel, zero);
+                auto masked = b.createUnaryOp(spv::OpAll,b.makeBoolType(),below);
+                auto bit = b.createTriOp(spv::OpSelect,i32,masked,b.makeIntConstant(0),b.makeIntConstant(1u<<sample));
+                coverage = b.createBinOp(spv::OpBitwiseOr,i32,coverage,bit);
+            }
+            auto array = b.makeArrayType(i32,b.makeIntConstant(1),0);
+            auto output = b.createVariable(spv::NoPrecision,spv::StorageClassOutput,array,"metal_sample_mask");
+            b.addDecoration(output,spv::DecorationBuiltIn,spv::BuiltInSampleMask);
+            translate_state.interfaces.push_back(output);
+            b.createStore(b.createCompositeConstruct(array,{coverage}),output);
+        } else {
+            spv::Id texel = b.createOp(spv::OpImageRead, v4, { b.createLoad(translate_state.mask_id, spv::NoPrecision), current_coord });
+            spv::Id pred = b.createOp(spv::OpFOrdLessThan, b.makeVectorType(b.makeBoolType(), 4), { texel, zero });
+            spv::Id pred2 = b.createUnaryOp(spv::OpAll, b.makeBoolType(), pred);
+            spv::Builder::If cond_builder(pred2, spv::SelectionControlMaskNone, b);
+            b.makeStatementTerminator(spv::OpKill, "discard");
+            cond_builder.makeEndIf();
+        }
     }
 
     b.makeReturn(false);
@@ -1701,7 +1850,7 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
                 o_val2 = b.createBinOp(spv::OpFAdd, v4, o_val2, screen_offset);
 
                 // on vulkan this is done using the viewport directly
-                if (!translation_state.is_vulkan && translation_state.render_info_id != spv::NoResult) {
+                if ((!translation_state.is_vulkan || translation_state.is_metal) && translation_state.render_info_id != spv::NoResult) {
                     spv::Id flip_vec_id = utils::create_access_chain(b, spv::StorageClassUniform, translation_state.render_info_id, { b.makeIntConstant(VERT_UNIFORM_viewport_flip) });
                     flip_vec_id = b.createLoad(flip_vec_id, spv::NoPrecision);
                     o_val2 = b.createBinOp(spv::OpFMul, v4, o_val2, flip_vec_id);
@@ -1719,7 +1868,7 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
                 cond_builder.makeBeginElse();
 
                 // Apply the viewport flip if opengl
-                if (!translation_state.is_vulkan && translation_state.render_info_id != spv::NoResult) {
+                if ((!translation_state.is_vulkan || translation_state.is_metal) && translation_state.render_info_id != spv::NoResult) {
                     spv::Id flip_vec_id = utils::create_access_chain(b, spv::StorageClassUniform, translation_state.render_info_id, { b.makeIntConstant(VERT_UNIFORM_viewport_flip) });
                     flip_vec_id = b.createLoad(flip_vec_id, spv::NoPrecision);
                     o_val = b.createBinOp(spv::OpFMul, out_type, o_val, flip_vec_id);
@@ -1767,6 +1916,19 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
             }
 
             o_op.num += properties.component_count;
+        } else if (translation_state.is_metal && (translation_state.hints->metal_missing_vertex_outputs & vo)
+            && vo != SCE_GXM_VERTEX_PROGRAM_OUTPUT_POSITION && vo != SCE_GXM_VERTEX_PROGRAM_OUTPUT_PSIZE) {
+            // Some guest pairs request varyings the vertex program never
+            // exports. Metal requires a matching interface even for these
+            // unwritten values. Choose deterministic zero, consistent with
+            // the output register initialization, without consuming registers.
+            const auto &properties = vertex_properties_map.at(vo);
+            const auto type = b.makeVectorType(b.makeFloatType(32), 4);
+            const auto out = b.createVariable(spv::NoPrecision, spv::StorageClassOutput, type, properties.name.c_str());
+            b.addDecoration(out, spv::DecorationLocation, properties.location);
+            translation_state.interfaces.push_back(out);
+            const auto zero = b.makeFloatConstant(0.0f);
+            b.createStore(b.makeCompositeConstant(type, {zero, zero, zero, zero}), out);
         }
     }
 
@@ -1790,11 +1952,14 @@ static spv::Function *make_frag_initialize_function(spv::Builder &b, Translation
     spv::Id booltype = b.makeBoolType();
     spv::Id zero = b.makeFloatConstant(0.0f);
 
-    spv::Id front_facing = b.createVariable(spv::NoPrecision, spv::StorageClassInput, booltype, "gl_FrontFacing");
+    spv::Id front_facing = translate_state.native_front_facing_id;
+    if (front_facing == spv::NoResult) {
+        front_facing = b.createVariable(spv::NoPrecision, spv::StorageClassInput, booltype, "gl_FrontFacing");
+        b.addDecoration(front_facing, spv::DecorationBuiltIn, spv::BuiltInFrontFacing);
+        translate_state.interfaces.push_back(front_facing);
+    }
     spv::Id front_disabled = utils::create_access_chain(b, spv::StorageClassUniform, translate_state.render_info_id, { b.makeIntConstant(FRAG_UNIFORM_front_disabled) });
     spv::Id back_disabled = utils::create_access_chain(b, spv::StorageClassUniform, translate_state.render_info_id, { b.makeIntConstant(FRAG_UNIFORM_back_disabled) });
-    b.addDecoration(front_facing, spv::DecorationBuiltIn, spv::BuiltInFrontFacing);
-    translate_state.interfaces.push_back(front_facing);
 
     front_facing = b.createLoad(front_facing, spv::NoPrecision);
 
@@ -1861,6 +2026,7 @@ static SpirvCode convert_gxp_to_spirv_impl(const SceGxmProgram &program, const s
 
     NonDependentTextureQueryCallInfos texture_queries;
     utils::SpirvUtilFunctions utils;
+    utils.native_metal = translation_state.is_metal;
     utils.std_builtins = b.import("GLSL.std.450");
 
     std::string entry_point_name;
@@ -1923,7 +2089,7 @@ static SpirvCode convert_gxp_to_spirv_impl(const SceGxmProgram &program, const s
 
     if (!translation_state.is_maskupdate) {
         if (program.is_fragment()) {
-            if (!translation_state.is_vulkan)
+            if (!translation_state.is_vulkan || translation_state.is_metal)
                 begin_hook_func = make_frag_initialize_function(b, translation_state);
 
             end_hook_func = make_frag_finalize_function(b, parameters, program, utils, features, translation_state);
@@ -2077,7 +2243,8 @@ GeneratedShader convert_gxp(const SceGxmProgram &program, const std::string &sha
     translation_state.is_fragment = program.is_fragment();
     translation_state.is_maskupdate = maskupdate;
     translation_state.is_target_glsl = (target == Target::GLSLOpenGL);
-    translation_state.is_vulkan = (target == Target::SpirVVulkan);
+    translation_state.is_metal = (target == Target::SpirVMetal);
+    translation_state.is_vulkan = (target == Target::SpirVVulkan) || translation_state.is_metal;
     translation_state.hints = &hints;
 
     if (!features.support_unknown_format) {

@@ -42,6 +42,42 @@ static spv::Id postprocess_dot_result_for_store(spv::Builder &b, spv::Id dot_res
     return b.createCompositeConstruct(type_result, comps);
 }
 
+// VF16MAD writes a half result using truncation. Keep this separate from
+// explicit packing and texture conversion. Rounding 0.5 + 0.499755859375 to
+// 1.0 shifts Unit 13's interpolated packed-buffer coordinates into the adjacent
+// word at increased resolution; the truncated result is 0.99951171875.
+static spv::Id truncate_native_half_result(spv::Builder &b, spv::Id builtins, spv::Id value) {
+    const auto count = b.getNumComponents(value);
+    const auto f = b.getTypeId(value);
+    const auto scalar_u = b.makeUintType(32);
+    const auto u = count == 1 ? scalar_u : b.makeVectorType(scalar_u, count);
+    const auto boolean = count == 1 ? b.makeBoolType() : b.makeVectorType(b.makeBoolType(), count);
+    const auto uc = [&](uint32_t x) {
+        auto id = b.makeUintConstant(x);
+        return count == 1 ? id : b.makeCompositeConstant(u, std::vector<spv::Id>(count, id));
+    };
+    const auto fc = [&](float x) {
+        auto id = b.makeFloatConstant(x);
+        return count == 1 ? id : b.makeCompositeConstant(f, std::vector<spv::Id>(count, id));
+    };
+    const auto raw = b.createUnaryOp(spv::OpBitcast, u, value);
+    const auto magnitude = b.createBinOp(spv::OpBitwiseAnd, u, raw, uc(0x7fffffff));
+    const auto is_subnormal = b.createBinOp(spv::OpULessThan, boolean, magnitude, uc(0x38800000));
+    const auto tiny = b.createUnaryOp(spv::OpBitcast, f,
+        b.createOp(spv::OpSelect, u, {is_subnormal, magnitude, uc(0)}));
+    const auto sub = b.createBinOp(spv::OpFMul, f,
+        b.createBuiltinCall(f, builtins, GLSLstd450Floor,
+            {b.createBinOp(spv::OpFMul, f, tiny, fc(16777216.f))}), fc(0x1p-24f));
+    const auto normal = b.createBuiltinCall(u, builtins, GLSLstd450UMin,
+        {b.createBinOp(spv::OpBitwiseAnd, u, magnitude, uc(0xffffe000)), uc(0x477fe000)});
+    const auto finite = b.createOp(spv::OpSelect, u,
+        {is_subnormal, b.createUnaryOp(spv::OpBitcast, u, sub), normal});
+    const auto rounded = b.createOp(spv::OpSelect, u,
+        {b.createBinOp(spv::OpULessThan, boolean, magnitude, uc(0x7f800000)), finite, magnitude});
+    return b.createUnaryOp(spv::OpBitcast, f, b.createBinOp(spv::OpBitwiseOr, u, rounded,
+        b.createBinOp(spv::OpBitwiseAnd, u, raw, uc(0x80000000))));
+}
+
 bool USSETranslatorVisitor::vmad(
     ExtVecPredicate pred,
     Imm1 skipinv,
@@ -277,6 +313,8 @@ bool USSETranslatorVisitor::vmad2(
 
     spv::Id fma_result = m_b.createBuiltinCall(m_b.getTypeId(vsrc0), std_builtins, GLSLstd450Fma, { vsrc0, vsrc1, vsrc2 });
 
+    if (m_spirv_params.native_metal && dat_fmt && inst.opr.dest.bank != RegisterBank::FPINTERNAL)
+        fma_result = truncate_native_half_result(m_b, std_builtins, fma_result);
     store(inst.opr.dest, fma_result, dest_mask, 0);
 
     return true;
@@ -474,7 +512,8 @@ spv::Id USSETranslatorVisitor::do_alu_op(Instruction &inst, const Imm4 source_ma
     case Opcode::VF16FRC: {
         // Dest = Source1 - Floor(Source2)
         // If two source are identical, let's use the fractional function
-        if (inst.opr.src1.is_same(inst.opr.src2, source_mask)) {
+        if (inst.opr.src1.is_same(inst.opr.src2, source_mask)
+            && (!m_spirv_params.native_metal || inst.opr.src1.is_global == inst.opr.src2.is_global)) {
             result = m_b.createBuiltinCall(source_type, std_builtins, GLSLstd450Fract, { vsrc1 });
         } else {
             // We need to floor source 2
@@ -1898,7 +1937,8 @@ bool USSETranslatorVisitor::vdual(
             // If two source are identical, let's use the fractional function
             const spv::Id first = load(ops[0], write_mask_source);
             const spv::Id type = m_b.getTypeId(first);
-            if (ops[0].is_same(ops[1], write_mask_source)) {
+            if (ops[0].is_same(ops[1], write_mask_source)
+                && (!m_spirv_params.native_metal || ops[0].is_global == ops[1].is_global)) {
                 result = m_b.createBuiltinCall(type, std_builtins, GLSLstd450Fract, { first });
             } else {
                 // We need to floor source 2

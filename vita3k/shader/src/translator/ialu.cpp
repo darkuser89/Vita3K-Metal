@@ -554,6 +554,11 @@ bool USSETranslatorVisitor::i32mad2(
     inst.opr.src1.type = inst_dt;
     inst.opr.src2.type = inst_dt;
 
+    // SGX543 IMA32 step 1 is 32 x 16 + 32. In particular, VPCK may
+    // leave unrelated bits in the upper half of the second source register.
+    if (m_spirv_params.native_metal && sn == 0)
+        inst.opr.src1.type = is_signed ? DataType::INT16 : DataType::UINT16;
+
     if (negative_src1) {
         inst.opr.src1.flags |= RegisterFlags::Negative;
     }

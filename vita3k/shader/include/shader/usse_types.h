@@ -315,6 +315,8 @@ struct Operand {
     RegisterFlags flags{};
     Swizzle4 swizzle = SWIZZLE_CHANNEL_4_UNDEFINED;
     DataType type = DataType::F32;
+    // Preserve special-bank provenance across the legacy secondary-SA remap.
+    bool is_global = false;
 
     int index{ 0 };
 

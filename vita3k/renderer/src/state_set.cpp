@@ -28,6 +28,9 @@
 #include <renderer/vulkan/functions.h>
 #include <renderer/vulkan/state.h>
 #include <renderer/vulkan/types.h>
+#ifdef __APPLE__
+#include <renderer/metal/state.h>
+#endif
 
 #include <util/align.h>
 #include <util/log.h>
@@ -44,7 +47,8 @@ COMMAND_SET_STATE(region_clip) {
     uint32_t factor = 1;
     const bool has_msaa = (render_context->current_render_target && render_context->current_render_target->multisample_mode);
     const bool has_downscale = render_context->record.color_surface.downscale;
-    if (has_msaa && !has_downscale)
+    // Metal rasterizes real samples at the original pixel coordinates.
+    if (renderer.current_backend != Backend::Metal && has_msaa && !has_downscale)
         factor = 2;
     else if (!has_msaa && has_downscale)
         factor = 1;
@@ -67,6 +71,9 @@ COMMAND_SET_STATE(region_clip) {
 
     case Backend::Vulkan:
         vulkan::sync_clipping(*static_cast<vulkan::VKContext *>(render_context));
+        break;
+
+    case Backend::Metal:
         break;
 
     default:
@@ -93,6 +100,11 @@ COMMAND_SET_STATE(program) {
 
         case Backend::Vulkan:
             break;
+
+#ifdef __APPLE__
+        case Backend::Metal:
+            break;
+#endif
 
         default:
             REPORT_MISSING(renderer.current_backend);
@@ -128,6 +140,12 @@ COMMAND_SET_STATE(uniform_buffer) {
         vulkan::set_uniform_buffer(*reinterpret_cast<vulkan::VKContext *>(render_context), mem, program, is_vertex, block_num, size, data);
         break;
 
+#ifdef __APPLE__
+    case Backend::Metal:
+        metal::set_uniform_buffer(static_cast<metal::MetalContext &>(*render_context), *program, is_vertex, block_num, size, data.get(mem));
+        break;
+#endif
+
     default:
         REPORT_MISSING(renderer.current_backend);
         return;
@@ -154,7 +172,7 @@ COMMAND_SET_STATE(viewport) {
         float factor = 1.0f;
         const bool has_msaa = (render_context->current_render_target && render_context->current_render_target->multisample_mode);
         const bool has_downscale = render_context->record.color_surface.downscale;
-        if (has_msaa && !has_downscale)
+        if (renderer.current_backend != Backend::Metal && has_msaa && !has_downscale)
             factor = 2.0f;
         else if (!has_msaa && has_downscale)
             factor = 1.0f;
@@ -185,6 +203,12 @@ COMMAND_SET_STATE(viewport) {
             vulkan::sync_viewport_real(*reinterpret_cast<vulkan::VKContext *>(render_context), xOffset, yOffset, zOffset, xScale, yScale, zScale);
             break;
 
+#ifdef __APPLE__
+        case Backend::Metal:
+            metal::set_viewport(static_cast<metal::MetalContext &>(*render_context), xOffset, yOffset, xScale, yScale);
+            break;
+#endif
+
         default:
             REPORT_MISSING(renderer.current_backend);
             break;
@@ -206,6 +230,9 @@ COMMAND_SET_STATE(viewport) {
             vulkan::sync_viewport_flat(*reinterpret_cast<vulkan::VKContext *>(render_context));
             break;
 
+        case Backend::Metal:
+            break;
+
         default:
             REPORT_MISSING(renderer.current_backend);
             break;
@@ -223,6 +250,9 @@ COMMAND_SET_STATE(viewport) {
         case Backend::Vulkan:
             // We need to sync again state that uses the flip
             vulkan::sync_clipping(*reinterpret_cast<vulkan::VKContext *>(render_context));
+            break;
+
+        case Backend::Metal:
             break;
 
         default:
@@ -252,6 +282,9 @@ COMMAND_SET_STATE(depth_bias) {
             vulkan::sync_depth_bias(*reinterpret_cast<vulkan::VKContext *>(render_context));
         break;
 
+    case Backend::Metal:
+        break;
+
     default:
         REPORT_MISSING(renderer.current_backend);
         break;
@@ -276,6 +309,9 @@ COMMAND_SET_STATE(depth_func) {
 
     case Backend::Vulkan:
         vulkan::refresh_pipeline(*reinterpret_cast<vulkan::VKContext *>(render_context));
+        break;
+
+    case Backend::Metal:
         break;
 
     default:
@@ -303,6 +339,9 @@ COMMAND_SET_STATE(depth_write_enable) {
         vulkan::refresh_pipeline(*reinterpret_cast<vulkan::VKContext *>(render_context));
         break;
 
+    case Backend::Metal:
+        break;
+
     default:
         REPORT_MISSING(renderer.current_backend);
         break;
@@ -327,6 +366,9 @@ COMMAND_SET_STATE(polygon_mode) {
         vulkan::refresh_pipeline(*reinterpret_cast<vulkan::VKContext *>(render_context));
         break;
 
+    case Backend::Metal:
+        break;
+
     default:
         REPORT_MISSING(renderer.current_backend);
         break;
@@ -347,6 +389,9 @@ COMMAND_SET_STATE(point_line_width) {
 
     case Backend::Vulkan:
         vulkan::sync_point_line_width(*reinterpret_cast<vulkan::VKContext *>(render_context), is_front);
+        break;
+
+    case Backend::Metal:
         break;
 
     default:
@@ -390,6 +435,9 @@ COMMAND_SET_STATE(stencil_func) {
         vulkan::sync_stencil_func(dynamic_cast<vulkan::VKContext &>(*render_context), !is_front);
         break;
 
+    case Backend::Metal:
+        break;
+
     default:
         REPORT_MISSING(renderer.current_backend);
         break;
@@ -415,6 +463,9 @@ COMMAND_SET_STATE(stencil_ref) {
         vulkan::sync_stencil_func(dynamic_cast<vulkan::VKContext &>(*render_context), !is_front);
         break;
 
+    case Backend::Metal:
+        break;
+
     default:
         REPORT_MISSING(renderer.current_backend);
         break;
@@ -436,6 +487,12 @@ COMMAND_SET_STATE(texture) {
         vulkan::sync_texture(*reinterpret_cast<vulkan::VKContext *>(render_context), mem, texture_index, texture,
             config);
         break;
+
+#ifdef __APPLE__
+    case Backend::Metal:
+        static_cast<metal::MetalContext &>(*render_context).textures.at(texture_index) = texture;
+        break;
+#endif
 
     default:
         REPORT_MISSING(renderer.current_backend);
@@ -460,6 +517,9 @@ COMMAND_SET_STATE(two_sided) {
         vulkan::sync_stencil_func(dynamic_cast<vulkan::VKContext &>(*render_context), true);
         break;
 
+    case Backend::Metal:
+        break;
+
     default:
         REPORT_MISSING(renderer.current_backend);
         break;
@@ -477,6 +537,9 @@ COMMAND_SET_STATE(cull_mode) {
 
     case Backend::Vulkan:
         vulkan::refresh_pipeline(*reinterpret_cast<vulkan::VKContext *>(render_context));
+        break;
+
+    case Backend::Metal:
         break;
 
     default:

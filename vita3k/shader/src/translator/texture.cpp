@@ -24,6 +24,8 @@
 
 #include <gxm/functions.h>
 #include <util/log.h>
+#include <cmath>
+#include <functional>
 
 #include <SPIRV/GLSL.std.450.h>
 #include <SPIRV/SpvBuilder.h>
@@ -33,7 +35,8 @@ using namespace usse;
 
 // Return the uv coefficients (a v4f32), each in [0,1]
 // coords are the normalized coordinates in the sampled image
-static spv::Id get_uv_coeffs(spv::Builder &b, const spv::Id std_builtins, spv::Id sampled_image, spv::Id coords, spv::Id lod = spv::NoResult) {
+static spv::Id get_uv_coeffs(spv::Builder &b, const spv::Id std_builtins, spv::Id sampled_image, spv::Id coords,
+    spv::Id lod = spv::NoResult, spv::Id native_info = spv::NoResult, uint32_t slot = 0) {
     // https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#textures-texel-filtering
     const spv::Id f32 = b.makeFloatType(32);
     const spv::Id v2f32 = b.makeVectorType(f32, 2);
@@ -54,6 +57,19 @@ static spv::Id get_uv_coeffs(spv::Builder &b, const spv::Id std_builtins, spv::I
     spv::Id image_size = b.createOp(spv::OpImageQuerySizeLod, v2i32, { image, layer });
     image_size = b.createUnaryOp(spv::OpConvertSToF, v2f32, image_size);
 
+    if (native_info) {
+        // Native gather reads base-mip texels. Its weights must describe the
+        // original grid, including RAM levels replicated into a larger image.
+        const auto load = [&](std::vector<spv::Id> indices) {
+            return b.createLoad(utils::create_access_chain(b, spv::StorageClassUniform, native_info, indices), spv::NoPrecision);
+        };
+        const auto enabled = load({b.makeIntConstant(0), b.makeIntConstant(slot), b.makeIntConstant(0), b.makeIntConstant(0)});
+        const auto size = load({b.makeIntConstant(0), b.makeIntConstant(slot), b.makeIntConstant(1), b.makeIntConstant(0)});
+        const auto use_original = b.createBinOp(spv::OpINotEqual, b.makeBoolType(), enabled, b.makeUintConstant(0));
+        image_size = b.createOp(spv::OpSelect, v2f32,
+            {use_original, b.createUnaryOp(spv::OpConvertUToF, v2f32, size), image_size});
+    }
+
     // un-normalize the coordinates
     coords = b.createBinOp(spv::OpFMul, v2f32, coords, image_size);
 
@@ -63,19 +79,218 @@ static spv::Id get_uv_coeffs(spv::Builder &b, const spv::Id std_builtins, spv::I
     coords = b.createBinOp(spv::OpFSub, v2f32, coords, v2half);
 
     // the uv coefficients are the fractional values
-    return b.setPrecision(b.createBuiltinCall(v2f32, std_builtins, GLSLstd450Fract, { coords }), spv::DecorationRelaxedPrecision);
+    return b.setPrecision(b.createBuiltinCall(v2f32, std_builtins, GLSLstd450Fract, {coords}),
+                          spv::DecorationRelaxedPrecision);
 }
 
-spv::Id shader::usse::USSETranslatorVisitor::do_fetch_texture(const spv::Id tex, int texture_index, const int dim, const Coord &coord, const DataType dest_type, const int lod_mode, const spv::Id extra1, const spv::Id extra2, const int gather4_comp) {
+// Match the native sampler's supported wrap modes for explicit texel reads.
+static spv::Id address_native_texel(spv::Builder &b, spv::Id builtins, spv::Id coordinate, spv::Id size, spv::Id mode) {
+    const auto u = b.makeUintType(32), i = b.makeIntType(32), boolean = b.makeBoolType();
+    const auto ui = [&](uint32_t value) { return b.makeUintConstant(value); };
+
+    const auto n = b.createUnaryOp(spv::OpBitcast, i, size);
+    const auto end = b.createBinOp(spv::OpISub, i, n, b.makeIntConstant(1));
+    const auto repeat = b.createBinOp(spv::OpSMod, i, coordinate, n);
+    const auto period = b.createBinOp(spv::OpIMul, i, n, b.makeIntConstant(2));
+    const auto phase = b.createBinOp(spv::OpSMod, i, coordinate, period);
+    const auto reflected =
+        b.createBinOp(spv::OpISub, i, b.createBinOp(spv::OpISub, i, period, b.makeIntConstant(1)), phase);
+    const auto mirror =
+        b.createOp(spv::OpSelect, i, {b.createBinOp(spv::OpSLessThan, boolean, phase, n), phase, reflected});
+    const auto clamp = b.createBuiltinCall(i, builtins, GLSLstd450SClamp, {coordinate, b.makeIntConstant(0), end});
+    return b.createOp(
+        spv::OpSelect, i,
+        {b.createBinOp(spv::OpIEqual, boolean, mode, ui(SCE_GXM_TEXTURE_ADDR_REPEAT)), repeat,
+         b.createOp(spv::OpSelect, i,
+                    {b.createBinOp(spv::OpIEqual, boolean, mode, ui(SCE_GXM_TEXTURE_ADDR_MIRROR)), mirror, clamp})});
+}
+
+// Gather is four unfiltered base-mip texels, independent of sampler min/mag
+// filters and anisotropy. Read their original centers in reconstructed images.
+static spv::Id gather_native_grid(spv::Builder &b, spv::Id builtins, spv::Id info, uint32_t slot, spv::Id tex,
+                                  spv::Id uv, unsigned component, const std::function<spv::Id()> &ordinary) {
+    b.addCapability(spv::CapabilityImageQuery);
+    const auto f = b.makeFloatType(32), u = b.makeUintType(32), i = b.makeIntType(32), boolean = b.makeBoolType();
+    const auto f2 = b.makeVectorType(f, 2), f4 = b.makeVectorType(f, 4);
+    const auto u2 = b.makeVectorType(u, 2), i2 = b.makeVectorType(i, 2);
+    const auto ui = [&](uint32_t value) { return b.makeUintConstant(value); };
+    const auto load = [&](std::vector<spv::Id> indices) {
+        return b.createLoad(utils::create_access_chain(b, spv::StorageClassUniform, info, indices), spv::NoPrecision);
+    };
+    const auto extract = [&](spv::Id value, unsigned c) {
+        return b.createCompositeExtract(value, b.getScalarTypeId(b.getTypeId(value)), c);
+    };
+    const auto control = load({b.makeIntConstant(0), b.makeIntConstant(slot), b.makeIntConstant(0)});
+    const auto enabled = b.createBinOp(spv::OpINotEqual, boolean, extract(control, 0), ui(0));
+    const auto result = b.createVariable(spv::NoPrecision, spv::StorageClassFunction, f4, "native_gather_result");
+    spv::Builder::If correction(enabled, spv::SelectionControlMaskNone, b);
+    const auto size = load({b.makeIntConstant(0), b.makeIntConstant(slot), b.makeIntConstant(1), b.makeIntConstant(0)});
+    const auto image_type = b.makeImageType(f, spv::Dim2D, false, false, false, 1, spv::ImageFormatUnknown);
+    const auto image = b.createUnaryOp(spv::OpImage, image_type, tex);
+    const auto physical = b.createOp(spv::OpImageQuerySizeLod, u2, {image, ui(0)});
+    const auto half = b.makeFloatConstant(.5f);
+    const auto pos = b.createBinOp(spv::OpFSub, f2,
+                                   b.createBinOp(spv::OpFMul, f2, uv, b.createUnaryOp(spv::OpConvertUToF, f2, size)),
+                                   b.makeCompositeConstant(f2, {half, half}));
+    const auto base =
+        b.createUnaryOp(spv::OpConvertFToS, i2, b.createBuiltinCall(f2, builtins, GLSLstd450Floor, {pos}));
+    const auto field = [&](unsigned shift) {
+        return b.createBinOp(spv::OpBitwiseAnd, u,
+                             b.createBinOp(spv::OpShiftRightLogical, u, extract(control, 1), ui(shift)), ui(7));
+    };
+    const auto address = [&](spv::Id coordinate, spv::Id size, spv::Id mode) {
+        return address_native_texel(b, builtins, coordinate, size, mode);
+    };
+    const auto fetch = [&](int dx, int dy) {
+        const auto x =
+            address(b.createBinOp(spv::OpIAdd, i, extract(base, 0), b.makeIntConstant(dx)), extract(size, 0), field(3));
+        const auto y =
+            address(b.createBinOp(spv::OpIAdd, i, extract(base, 1), b.makeIntConstant(dy)), extract(size, 1), field(6));
+        const auto logical = b.createUnaryOp(spv::OpBitcast, u2, b.createCompositeConstruct(i2, {x, y}));
+        const auto two = b.makeCompositeConstant(u2, {ui(2), ui(2)}), one = b.makeCompositeConstant(u2, {ui(1), ui(1)});
+        const auto numerator =
+            b.createBinOp(spv::OpIMul, u2,
+                          b.createBinOp(spv::OpIAdd, u2, b.createBinOp(spv::OpIMul, u2, logical, two), one), physical);
+        const auto point = b.createBinOp(spv::OpUDiv, u2, numerator, b.createBinOp(spv::OpIMul, u2, size, two));
+        return extract(b.createOp(spv::OpImageFetch, f4, {image, point, spv::ImageOperandsLodMask, ui(0)}), component);
+    };
+    // SPIR-V gather component order; guest coefficient order is reversed later.
+    b.createStore(b.createCompositeConstruct(f4, {fetch(0, 1), fetch(1, 1), fetch(1, 0), fetch(0, 0)}), result);
+    correction.makeBeginElse();
+    b.createStore(ordinary(), result);
+    correction.makeEndIf();
+    return b.createLoad(result, spv::NoPrecision);
+}
+// Keep each reconstructed mip's original sampling grid. The Metal texture may
+// contain duplicated/resampled pixels to share one native mip-chain allocation.
+static spv::Id sample_native_mips(spv::Builder &b, spv::Id builtins, spv::Id info, spv::Id tex, uint32_t slot,
+                                  spv::Id uv, const std::function<spv::Id()> &get_lod,
+                                  const std::function<spv::Id()> &ordinary) {
+    const auto f = b.makeFloatType(32), u = b.makeUintType(32), i = b.makeIntType(32), boolean = b.makeBoolType();
+    const auto f2 = b.makeVectorType(f, 2), f4 = b.makeVectorType(f, 4), u2 = b.makeVectorType(u, 2),
+               i2 = b.makeVectorType(i, 2);
+    const auto ui = [&](uint32_t x) { return b.makeUintConstant(x); };
+    const auto fi = [&](float x) { return b.makeFloatConstant(x); };
+    const auto extract = [&](spv::Id value, unsigned c) {
+        return b.createCompositeExtract(value, b.getScalarTypeId(b.getTypeId(value)), c);
+    };
+    const auto load = [&](std::vector<spv::Id> indices) {
+        return b.createLoad(utils::create_access_chain(b, spv::StorageClassUniform, info, indices), spv::NoPrecision);
+    };
+    const auto control = load({b.makeIntConstant(0), b.makeIntConstant(slot), b.makeIntConstant(0)});
+    const auto enabled = b.createBinOp(spv::OpINotEqual, boolean, extract(control, 0), ui(0));
+    // Anisotropic footprints require separate integration; preserve the existing
+    // hardware path for those instead of silently replacing it by isotropic taps.
+    const auto isotropic = b.createBinOp(spv::OpULessThanEqual, boolean, extract(control, 2), ui(1));
+    const auto result = b.createVariable(spv::NoPrecision, spv::StorageClassFunction, f4, "native_mip_result");
+    spv::Builder::If correction(b.createBinOp(spv::OpLogicalAnd, boolean, enabled, isotropic),
+                                spv::SelectionControlMaskNone, b);
+    b.addCapability(spv::CapabilityImageQuery);
+    const auto image_type = b.makeImageType(f, spv::Dim2D, false, false, false, 1, spv::ImageFormatUnknown);
+    const auto image = b.createUnaryOp(spv::OpImage, image_type, tex);
+    const auto levels = b.createUnaryOp(spv::OpImageQueryLevels, u, image);
+    const auto last = b.createBinOp(spv::OpISub, u, levels, ui(1));
+    const auto flags = extract(control, 1);
+    const auto field = [&](unsigned shift, unsigned mask) {
+        return b.createBinOp(spv::OpBitwiseAnd, u, b.createBinOp(spv::OpShiftRightLogical, u, flags, ui(shift)),
+                             ui(mask));
+    };
+    const auto lod = get_lod();
+    const auto mip_linear = b.createBinOp(spv::OpINotEqual, boolean, field(2, 1), ui(0));
+    const auto min_lod = b.createUnaryOp(spv::OpConvertUToF, f, field(9, 15));
+    const auto max_lod = b.createUnaryOp(spv::OpConvertUToF, f, last);
+    // Sampler LOD clamping precedes minification/magnification selection.
+    // A positive minimum LOD must use min_filter even for magnifying UVs.
+    const auto sampler_lod = b.createBuiltinCall(f, builtins, GLSLstd450FMax, {lod, min_lod});
+    const auto minifying = b.createBinOp(spv::OpFOrdGreaterThan, boolean, sampler_lod, fi(0));
+    const auto filter = b.createOp(spv::OpSelect, u, {minifying, field(0, 1), field(1, 1)});
+    const auto linear = b.createBinOp(spv::OpINotEqual, boolean, filter, ui(0));
+    const auto clamped = b.createBuiltinCall(f, builtins, GLSLstd450FMin, {max_lod, sampler_lod});
+    const auto nearest =
+        b.createBuiltinCall(f, builtins, GLSLstd450Floor, {b.createBinOp(spv::OpFAdd, f, clamped, fi(.5f))});
+    const auto lower = b.createBuiltinCall(f, builtins, GLSLstd450Floor, {clamped});
+    const auto level =
+        b.createUnaryOp(spv::OpConvertFToU, u, b.createOp(spv::OpSelect, f, {mip_linear, lower, nearest}));
+    const auto upper =
+        b.createBuiltinCall(u, builtins, GLSLstd450UMin, {b.createBinOp(spv::OpIAdd, u, level, ui(1)), last});
+    const auto weight =
+        b.createOp(spv::OpSelect, f, {mip_linear, b.createBinOp(spv::OpFSub, f, clamped, lower), fi(0)});
+    const auto address = [&](spv::Id coordinate, spv::Id size, spv::Id mode) {
+        return address_native_texel(b,builtins,coordinate,size,mode);
+    };
+    const auto sample_level = [&](spv::Id mip) {
+        const auto size = load({b.makeIntConstant(0), b.makeIntConstant(slot), b.makeIntConstant(1), mip});
+        const auto size_f = b.createUnaryOp(spv::OpConvertUToF, f2, size);
+        const auto physical = b.createOp(spv::OpImageQuerySizeLod, u2, {image, mip});
+        const auto half = b.createOp(spv::OpSelect, f, {linear, fi(.5f), fi(0)});
+        const auto pos = b.createBinOp(spv::OpFSub, f2, b.createBinOp(spv::OpFMul, f2, uv, size_f),
+                                       b.createCompositeConstruct(f2, {half, half}));
+        const auto base =
+            b.createUnaryOp(spv::OpConvertFToS, i2, b.createBuiltinCall(f2, builtins, GLSLstd450Floor, {pos}));
+        const auto fractions = b.createBuiltinCall(f2, builtins, GLSLstd450Fract, {pos});
+        const auto mix_factor = b.createOp(spv::OpSelect, f, {linear, fi(1), fi(0)});
+        const auto weights = b.createBinOp(spv::OpVectorTimesScalar, f2, fractions, mix_factor);
+        const auto fetch = [&](int dx, int dy) {
+            const auto x = address(b.createBinOp(spv::OpIAdd, i, extract(base, 0), b.makeIntConstant(dx)),
+                                   extract(size, 0), field(3, 7));
+            const auto y = address(b.createBinOp(spv::OpIAdd, i, extract(base, 1), b.makeIntConstant(dy)),
+                                   extract(size, 1), field(6, 7));
+            const auto logical = b.createUnaryOp(spv::OpBitcast, u2, b.createCompositeConstruct(i2, {x, y}));
+            const auto two = b.makeCompositeConstant(u2, {ui(2), ui(2)}),
+                       one = b.makeCompositeConstant(u2, {ui(1), ui(1)});
+            const auto numerator = b.createBinOp(
+                spv::OpIMul, u2, b.createBinOp(spv::OpIAdd, u2, b.createBinOp(spv::OpIMul, u2, logical, two), one),
+                physical);
+            const auto point = b.createBinOp(spv::OpUDiv, u2, numerator, b.createBinOp(spv::OpIMul, u2, size, two));
+            return b.createOp(spv::OpImageFetch, f4, {image, point, spv::ImageOperandsLodMask, mip});
+        };
+        const auto mix = [&](spv::Id a, spv::Id c, spv::Id t) {
+            return b.createBinOp(spv::OpFAdd, f4, a,
+                                 b.createBinOp(spv::OpVectorTimesScalar, f4, b.createBinOp(spv::OpFSub, f4, c, a), t));
+        };
+        const auto value = b.createVariable(spv::NoPrecision, spv::StorageClassFunction, f4, "native_mip_level");
+        const auto a = fetch(0, 0);
+        spv::Builder::If bilinear(linear, spv::SelectionControlMaskNone, b);
+        const auto c = fetch(1, 0), d = fetch(0, 1), e = fetch(1, 1);
+        b.createStore(mix(mix(a, c, extract(weights, 0)), mix(d, e, extract(weights, 0)), extract(weights, 1)), value);
+        bilinear.makeBeginElse();
+        b.createStore(a, value);
+        bilinear.makeEndIf();
+        return b.createLoad(value, spv::NoPrecision);
+    };
+    const auto a = sample_level(level);
+    spv::Builder::If trilinear(b.createBinOp(spv::OpFOrdGreaterThan, boolean, weight, fi(0)),
+                               spv::SelectionControlMaskNone, b);
+    const auto c = sample_level(upper);
+    b.createStore(
+        b.createBinOp(spv::OpFAdd, f4, a,
+                      b.createBinOp(spv::OpVectorTimesScalar, f4, b.createBinOp(spv::OpFSub, f4, c, a), weight)),
+        result);
+    trilinear.makeBeginElse();
+    b.createStore(a, result);
+    trilinear.makeEndIf();
+    correction.makeBeginElse();
+    b.createStore(ordinary(), result);
+    correction.makeEndIf();
+    return b.createLoad(result, spv::NoPrecision);
+}
+
+spv::Id shader::usse::USSETranslatorVisitor::do_fetch_texture(const spv::Id tex, int texture_index, const int dim,
+                                                              const Coord &coord, const DataType dest_type,
+                                                              const int lod_mode, const spv::Id extra1,
+                                                              const spv::Id extra2, const int gather4_comp,
+                                                              const bool gather_uv) {
     auto coord_id = coord.first;
 
     if (coord.second != static_cast<int>(DataType::F32)) {
-        coord_id = m_b.createOp(spv::OpVectorExtractDynamic, type_f32, { m_b.createLoad(coord_id, spv::NoPrecision), m_b.makeIntConstant(0) });
+        coord_id = m_b.createOp(spv::OpVectorExtractDynamic, type_f32,
+                                {m_b.createLoad(coord_id, spv::NoPrecision), m_b.makeIntConstant(0)});
         coord_id = utils::unpack_one(m_b, m_util_funcs, m_features, coord_id, static_cast<DataType>(coord.second));
 
         // Shuffle if number of components is larger than 2
         if (m_b.getNumComponents(coord_id) > 2) {
-            coord_id = m_b.createOp(spv::OpVectorShuffle, type_f32_v[2], { { true, coord_id }, { true, coord_id }, { false, 0 }, { false, 1 } });
+            coord_id = m_b.createOp(spv::OpVectorShuffle, type_f32_v[2],
+                                    {{true, coord_id}, {true, coord_id}, {false, 0}, {false, 1}});
         }
     }
 
@@ -89,9 +304,13 @@ spv::Id shader::usse::USSETranslatorVisitor::do_fetch_texture(const spv::Id tex,
     // also for the time being ignore sampleProj ops
     if (m_features.use_texture_viewport && dim == 2) {
         // coord = coord * viewport_ratio + viewport_offset
-        spv::Id viewport_ratio = utils::create_access_chain(m_b, spv::StorageClassUniform, m_spirv_params.render_info_id, { m_b.makeIntConstant(m_spirv_params.viewport_ratio_id), m_b.makeIntConstant(texture_index) });
+        spv::Id viewport_ratio = utils::create_access_chain(
+            m_b, spv::StorageClassUniform, m_spirv_params.render_info_id,
+            {m_b.makeIntConstant(m_spirv_params.viewport_ratio_id), m_b.makeIntConstant(texture_index)});
         viewport_ratio = m_b.createLoad(viewport_ratio, spv::NoPrecision);
-        spv::Id viewport_offset = utils::create_access_chain(m_b, spv::StorageClassUniform, m_spirv_params.render_info_id, { m_b.makeIntConstant(m_spirv_params.viewport_offset_id), m_b.makeIntConstant(texture_index) });
+        spv::Id viewport_offset = utils::create_access_chain(
+            m_b, spv::StorageClassUniform, m_spirv_params.render_info_id,
+            {m_b.makeIntConstant(m_spirv_params.viewport_offset_id), m_b.makeIntConstant(texture_index)});
         viewport_offset = m_b.createLoad(viewport_offset, spv::NoPrecision);
 
         if (extra1 != spv::NoResult || lod_mode != 4) {
@@ -115,9 +334,27 @@ spv::Id shader::usse::USSETranslatorVisitor::do_fetch_texture(const spv::Id tex,
         }
     }
 
+    const auto original_gather_coords = coord_id;
+    if (m_spirv_params.native_metal && gather4_comp != -1 && gather_uv && dim == 2) {
+        // Keep gather's selected texels consistent with the full-float UV weights.
+        // Near a texel boundary the texture unit can select the adjacent cell;
+        // sampling inside the cell chosen by floor avoids that disagreement.
+        // Native gather currently reads the base mip, as does get_uv_coeffs below.
+        const spv::Id image_type = m_b.makeImageType(type_f32, spv::Dim2D, false, false, false, 1, spv::ImageFormatUnknown);
+        const spv::Id image = m_b.createUnaryOp(spv::OpImage, image_type, tex);
+        const spv::Id size_i = m_b.createOp(spv::OpImageQuerySizeLod, m_b.makeVectorType(m_b.makeIntType(32), 2), { image, m_b.makeIntConstant(0) });
+        const spv::Id size = m_b.createUnaryOp(spv::OpConvertSToF, type_f32_v[2], size_i);
+        const spv::Id half = m_b.makeFloatConstant(0.5f);
+        const spv::Id one = m_b.makeFloatConstant(1.f);
+        const spv::Id p = m_b.createBinOp(spv::OpFSub, type_f32_v[2], m_b.createBinOp(spv::OpFMul, type_f32_v[2], coord_id, size), m_b.makeCompositeConstant(type_f32_v[2], { half, half }));
+        const spv::Id cell = m_b.createBuiltinCall(type_f32_v[2], std_builtins, GLSLstd450Floor, { p });
+        coord_id = m_b.createBinOp(spv::OpFDiv, type_f32_v[2], m_b.createBinOp(spv::OpFAdd, type_f32_v[2], cell, m_b.makeCompositeConstant(type_f32_v[2], { one, one })), size);
+    }
+
     spv::Id image_sample = spv::NoResult;
     spv::Op op;
     std::vector<spv::Id> params = { tex, coord_id };
+    const float native_bias = m_spirv_params.native_metal ? m_spirv_params.native_texture_lod_bias[texture_index] : 0.f;
     if (gather4_comp != -1) {
         // The gpx support gather with a grad but I don't think this is possible with spirV
         op = spv::OpImageGather;
@@ -127,29 +364,91 @@ spv::Id shader::usse::USSETranslatorVisitor::do_fetch_texture(const spv::Id tex,
             op = spv::OpImageSampleProjImplicitLod;
         else
             op = spv::OpImageSampleImplicitLod;
+        if (native_bias != 0.f) {
+            if (m_program.is_fragment()) {
+                params.push_back(spv::ImageOperandsBiasMask);
+            } else {
+                // Vertex sampling has no derivatives; its base LOD is zero.
+                op = lod_mode == 4 ? spv::OpImageSampleProjExplicitLod : spv::OpImageSampleExplicitLod;
+                params.push_back(spv::ImageOperandsLodMask);
+            }
+            params.push_back(m_b.makeFloatConstant(native_bias));
+        }
     } else {
         op = spv::OpImageSampleExplicitLod;
         switch (lod_mode) {
         case 1:
             op = spv::OpImageSampleImplicitLod;
             params.push_back(spv::ImageOperandsBiasMask);
-            params.push_back(extra1);
+            params.push_back(native_bias == 0.f ? extra1 : m_b.createBinOp(spv::OpFAdd, type_f32, extra1, m_b.makeFloatConstant(native_bias)));
             break;
         case 2:
             params.push_back(spv::ImageOperandsLodMask);
-            params.push_back(extra1);
+            params.push_back(native_bias == 0.f ? extra1 : m_b.createBinOp(spv::OpFAdd, type_f32, extra1, m_b.makeFloatConstant(native_bias)));
             break;
         case 3:
             params.push_back(spv::ImageOperandsGradMask);
-            params.push_back(extra1);
-            params.push_back(extra2);
+            // Scaling both gradients shifts log2(footprint) by the bias
+            // while preserving their ratio and anisotropic direction.
+            if (native_bias != 0.f) {
+                const spv::Id scale = m_b.makeFloatConstant(std::exp2(native_bias));
+                params.push_back(m_b.createBinOp(spv::OpVectorTimesScalar, m_b.getTypeId(extra1), extra1, scale));
+                params.push_back(m_b.createBinOp(spv::OpVectorTimesScalar, m_b.getTypeId(extra2), extra2, scale));
+            } else {
+                params.push_back(extra1);
+                params.push_back(extra2);
+            }
             break;
         default:
             break;
         }
     }
 
-    image_sample = m_b.createOp(op, type_f32_v[4], params);
+    const auto ordinary=[&]{return m_b.createOp(op,type_f32_v[4],params);};
+    if (m_spirv_params.native_texture_info && dim == 2 && gather4_comp == -1) {
+        auto uv = coord_id;
+        if (lod_mode == 4 && extra1 == spv::NoResult) {
+            const auto xy = m_b.createOp(spv::OpVectorShuffle, type_f32_v[2],
+                                         {{true, coord_id}, {true, coord_id}, {false, 0}, {false, 1}});
+            const auto q = m_b.createCompositeExtract(coord_id, type_f32, 2);
+            uv = m_b.createBinOp(spv::OpFDiv, type_f32_v[2], xy, m_b.createCompositeConstruct(type_f32_v[2], {q, q}));
+        }
+        const auto get_lod = [&]() {
+            spv::Id lod;
+            if (extra1 != spv::NoResult && lod_mode == 2)
+                lod = extra1;
+            else if (extra1 != spv::NoResult && lod_mode == 3) {
+                const auto image_type =
+                    m_b.makeImageType(type_f32, spv::Dim2D, false, false, false, 1, spv::ImageFormatUnknown);
+                const auto image = m_b.createUnaryOp(spv::OpImage, image_type, tex);
+                auto size = m_b.createOp(spv::OpImageQuerySizeLod, m_b.makeVectorType(m_b.makeUintType(32), 2),
+                                         {image, m_b.makeIntConstant(0)});
+                size = m_b.createUnaryOp(spv::OpConvertUToF, type_f32_v[2], size);
+                const auto x = m_b.createBuiltinCall(type_f32, std_builtins, GLSLstd450Length,
+                                                     {m_b.createBinOp(spv::OpFMul, type_f32_v[2], extra1, size)});
+                const auto y = m_b.createBuiltinCall(type_f32, std_builtins, GLSLstd450Length,
+                                                     {m_b.createBinOp(spv::OpFMul, type_f32_v[2], extra2, size)});
+                lod = m_b.createBuiltinCall(type_f32, std_builtins, GLSLstd450Log2,
+                                            {m_b.createBuiltinCall(type_f32, std_builtins, GLSLstd450FMax, {x, y})});
+            } else if (m_program.is_fragment()) {
+                const auto queried = m_b.createOp(spv::OpImageQueryLod, type_f32_v[2], {tex, uv});
+                lod = m_b.createCompositeExtract(queried, type_f32, 1);
+            } else
+                lod = m_b.makeFloatConstant(0);
+            if (extra1 != spv::NoResult && lod_mode == 1)
+                lod = m_b.createBinOp(spv::OpFAdd, type_f32, lod, extra1);
+            if (native_bias != 0.f)
+                lod = m_b.createBinOp(spv::OpFAdd, type_f32, lod, m_b.makeFloatConstant(native_bias));
+            return lod;
+        };
+        image_sample = sample_native_mips(m_b, std_builtins, m_spirv_params.native_texture_info, tex, texture_index, uv,
+                                          get_lod, ordinary);
+    } else if (m_spirv_params.native_texture_info && dim == 2 && gather4_comp != -1)
+        image_sample = gather_native_grid(m_b, std_builtins, m_spirv_params.native_texture_info, texture_index,
+            tex, original_gather_coords, gather4_comp, ordinary);
+    else
+        image_sample = ordinary();
+
 
     if (get_data_type_size(dest_type) < 4 && dest_type != DataType::UINT16 && dest_type != DataType::INT16)
         m_b.setPrecision(image_sample, spv::DecorationRelaxedPrecision);
@@ -431,7 +730,7 @@ bool USSETranslatorVisitor::smp(
             std::vector<spv::Id> g4_comps;
             g4_comps.reserve(sampler.component_count);
             for (int comp = 0; comp < sampler.component_count; comp++) {
-                g4_comps.push_back(do_fetch_texture(image_sampler, sampler.index, dim, { coords, static_cast<int>(DataType::F32) }, inst.opr.dest.type, lod_mode, extra1, extra2, comp));
+                g4_comps.push_back(do_fetch_texture(image_sampler, sampler.index, dim, { coords, static_cast<int>(DataType::F32) }, inst.opr.dest.type, lod_mode, extra1, extra2, comp, sb_mode == 3));
             }
 
             if (sampler.component_count == 1) {
@@ -464,7 +763,26 @@ bool USSETranslatorVisitor::smp(
 
             if (sb_mode == 3) {
                 // compute and save bilinear coefficients
-                const spv::Id uv = get_uv_coeffs(m_b, std_builtins, image_sampler, coords);
+                spv::Id coefficient_coords = coords;
+                if (m_spirv_params.native_metal && m_features.use_texture_viewport && dim == 2) {
+                    // do_fetch_texture samples a subrectangle of the native
+                    // surface. Its weights must use the same mapped position,
+                    // in texel space. Keep other backends unchanged until
+                    // separately validated.
+                    const spv::Id ratio = m_b.createLoad(utils::create_access_chain(m_b, spv::StorageClassUniform,
+                        m_spirv_params.render_info_id, { m_b.makeIntConstant(m_spirv_params.viewport_ratio_id), m_b.makeIntConstant(sampler.index) }), spv::NoPrecision);
+                    const spv::Id offset = m_b.createLoad(utils::create_access_chain(m_b, spv::StorageClassUniform,
+                        m_spirv_params.render_info_id, { m_b.makeIntConstant(m_spirv_params.viewport_offset_id), m_b.makeIntConstant(sampler.index) }), spv::NoPrecision);
+                    coefficient_coords = m_b.createBuiltinCall(type_f32_v[2], std_builtins, GLSLstd450Fma, { coords, ratio, offset });
+                }
+                // OpImageGather currently emitted by do_fetch_texture reads
+                // the base mip. An implicit sample-LOD query can select a
+                // different mip size and give weights for unrelated texels.
+                // This makes native weights consistent with that gather;
+                // SGX raw-sample explicit/bias/gradient LOD remains separate.
+                const spv::Id coefficient_lod = m_spirv_params.native_metal ? m_b.makeFloatConstant(0.0f) : spv::NoResult;
+                const spv::Id uv = get_uv_coeffs(m_b, std_builtins, image_sampler, coefficient_coords, coefficient_lod,
+                    dim == 2 ? m_spirv_params.native_texture_info : spv::NoResult, sampler.index);
                 // the pixels returned by gather4 are in the following order : (0,1) (1,1) (1,0) (0,0)
                 // so at the end we want (1-u)v uv u(1-v) (1-u)(1-v)
                 // however, looking at the generated shader code in some games, it looks like the coefficients are

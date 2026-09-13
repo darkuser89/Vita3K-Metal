@@ -172,6 +172,10 @@ struct KernelState {
     static constexpr int EXCEPTION_HANDLER_MAX = 3;
     std::atomic<Address> exception_handlers[EXCEPTION_HANDLER_MAX]{};
     std::condition_variable thread_deleted_cond;
+    // Guarded by mutex. A removed guest thread may still be destroying its
+    // CPU, stack and TLS on the detached host thread.
+    size_t active_host_threads = 0;
+    bool process_exiting = false;
 
     SceUID get_next_uid() {
         return next_uid++;

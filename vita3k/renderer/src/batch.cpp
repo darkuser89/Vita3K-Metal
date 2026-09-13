@@ -22,6 +22,9 @@
 #include <renderer/types.h>
 
 #include <renderer/vulkan/types.h>
+#ifdef __APPLE__
+#include <renderer/metal/state.h>
+#endif
 
 #include <config/state.h>
 #include <display/state.h>
@@ -113,6 +116,14 @@ static void process_batch(renderer::State &state, const FeatureState &features, 
         if (handler == handlers.end()) {
             LOG_ERROR("Unimplemented command opcode {}", static_cast<int>(cmd->opcode));
         } else {
+#ifdef __APPLE__
+            // Metal may queue snapshot-backed read-only draws. Publish GPU work
+            // before notifications, transfers, frees and all other CPU-visible
+            // commands; state updates and further draws can stay in the batch.
+            if(state.current_backend==Backend::Metal && state.context
+                && cmd->opcode!=CommandOpcode::Draw && cmd->opcode!=CommandOpcode::SetState)
+                static_cast<metal::MetalState &>(state).finish(*static_cast<metal::MetalContext *>(state.context));
+#endif
             CommandHelper helper(cmd);
             handler->second(state, mem, config, helper, features, command_list.context);
         }

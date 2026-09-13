@@ -33,6 +33,7 @@
 #include <SDL3/SDL_timer.h>
 
 #include <mutex>
+#include <cstdlib>
 
 #ifdef __ANDROID__
 #include <ime/keyboard.h>
@@ -42,6 +43,24 @@
 TRACY_MODULE_NAME(SceCommonDialog);
 
 namespace {
+bool trace_message_dialog_enabled() {
+    static const bool enabled = std::getenv("VITA3K_TRACE_MESSAGE_DIALOG") != nullptr;
+    return enabled;
+}
+
+void trace_message_dialog(DialogState &dialog, const char *event) {
+    if (!trace_message_dialog_enabled())
+        return;
+    std::lock_guard<std::recursive_mutex> lock(dialog.mutex);
+    if (dialog.type != MESSAGE_DIALOG) {
+        LOG_INFO("Message dialog {}: type={} status={}", event, int(dialog.type), int(dialog.status));
+        return;
+    }
+    LOG_INFO("Message dialog {}: type={} status={} result={} mode={} button={} text={}",
+        event, int(dialog.type), int(dialog.status), int(dialog.result), int(dialog.msg.mode),
+        int(dialog.msg.status), dialog.msg.message);
+}
+
 void complete_trophy_setup_dialog(DialogState &dialog) {
     std::lock_guard<std::recursive_mutex> lock(dialog.mutex);
     if (dialog.type != TROPHY_SETUP_DIALOG || dialog.status != SCE_COMMON_DIALOG_STATUS_RUNNING)
@@ -281,6 +300,7 @@ EXPORT(int, sceImeDialogTerm) {
 
 EXPORT(int, sceMsgDialogAbort) {
     TRACY_FUNC(sceMsgDialogAbort);
+    trace_message_dialog(emuenv.common_dialog, "Abort");
     if (emuenv.common_dialog.type != MESSAGE_DIALOG)
         return RET_ERROR(SCE_COMMON_DIALOG_ERROR_NOT_IN_USE);
 
@@ -292,6 +312,7 @@ EXPORT(int, sceMsgDialogAbort) {
 
 EXPORT(int, sceMsgDialogClose) {
     TRACY_FUNC(sceMsgDialogClose);
+    trace_message_dialog(emuenv.common_dialog, "Close");
     if (emuenv.common_dialog.type != MESSAGE_DIALOG || emuenv.common_dialog.status != SCE_COMMON_DIALOG_STATUS_RUNNING)
         return RET_ERROR(SCE_COMMON_DIALOG_ERROR_NOT_RUNNING);
 
@@ -303,6 +324,7 @@ EXPORT(int, sceMsgDialogClose) {
 
 EXPORT(int, sceMsgDialogGetResult, SceMsgDialogResult *result) {
     TRACY_FUNC(sceMsgDialogGetResult, result);
+    trace_message_dialog(emuenv.common_dialog, "GetResult");
     if (emuenv.common_dialog.type != MESSAGE_DIALOG || emuenv.common_dialog.status != SCE_COMMON_DIALOG_STATUS_FINISHED)
         return RET_ERROR(SCE_COMMON_DIALOG_ERROR_NOT_FINISHED);
 
@@ -314,6 +336,15 @@ EXPORT(int, sceMsgDialogGetResult, SceMsgDialogResult *result) {
 
 EXPORT(int, sceMsgDialogGetStatus) {
     TRACY_FUNC(sceMsgDialogGetStatus);
+    if (trace_message_dialog_enabled()) {
+        std::lock_guard<std::recursive_mutex> lock(emuenv.common_dialog.mutex);
+        static thread_local int last_state = -1;
+        const int current = (int(emuenv.common_dialog.type) << 16) | int(emuenv.common_dialog.status);
+        if (current != last_state) {
+            trace_message_dialog(emuenv.common_dialog, "GetStatus changed");
+            last_state = current;
+        }
+    }
     if (emuenv.common_dialog.type != MESSAGE_DIALOG)
         return SCE_COMMON_DIALOG_STATUS_NONE;
 
@@ -322,6 +353,7 @@ EXPORT(int, sceMsgDialogGetStatus) {
 
 EXPORT(int, sceMsgDialogInit, const Ptr<SceMsgDialogParam> param) {
     TRACY_FUNC(sceMsgDialogInit, param);
+    trace_message_dialog(emuenv.common_dialog, "Init requested");
     if (emuenv.common_dialog.type != NO_DIALOG)
         return RET_ERROR(SCE_COMMON_DIALOG_ERROR_BUSY);
 
@@ -486,6 +518,7 @@ EXPORT(int, sceMsgDialogInit, const Ptr<SceMsgDialogParam> param) {
         break;
     }
 
+    trace_message_dialog(emuenv.common_dialog, "Init completed");
     return 0;
 }
 
@@ -536,6 +569,7 @@ EXPORT(int, sceMsgDialogProgressBarSetValue, SceMsgDialogProgressBarTarget targe
 
 EXPORT(int, sceMsgDialogTerm) {
     TRACY_FUNC(sceMsgDialogTerm);
+    trace_message_dialog(emuenv.common_dialog, "Term");
     if (emuenv.common_dialog.type != MESSAGE_DIALOG)
         return RET_ERROR(SCE_COMMON_DIALOG_ERROR_NOT_IN_USE);
 

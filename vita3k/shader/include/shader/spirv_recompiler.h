@@ -40,7 +40,8 @@ static constexpr uint32_t GAMMA_CORRECTION_SPECIALIZATION_ID = 0;
 enum struct Target {
     GLSLOpenGL,
     SpirVOpenGL,
-    SpirVVulkan
+    SpirVVulkan,
+    SpirVMetal
 };
 
 // Hints given while compiling the shader
@@ -59,6 +60,19 @@ struct Hints {
     // - when sampling, we need to know the component count of a texture
     SceGxmTextureFormat vertex_textures[SCE_GXM_MAX_TEXTURE_UNITS];
     SceGxmTextureFormat fragment_textures[SCE_GXM_MAX_TEXTURE_UNITS];
+    // Native Metal mask attachment sample count; ignored by other targets.
+    uint32_t metal_samples = 1;
+    // Missing varyings requested by the paired fragment program. Choose zero
+    // for unwritten values; declared outputs retain their register layout.
+    uint32_t metal_missing_vertex_outputs = 0;
+    bool metal_mip_sampling = false;
+    // Tile register width is independent of the stored surface format. Keep
+    // the declared shader type when no native draw descriptor is available.
+    uint32_t metal_output_register_size = SCE_GXM_OUTPUT_REGISTER_SIZE_64BIT;
+    // Metal samplers have no descriptor LOD-bias field. Native translation
+    // applies these values to sampling operations; other targets ignore them.
+    float metal_vertex_lod_bias[SCE_GXM_MAX_TEXTURE_UNITS] = {};
+    float metal_fragment_lod_bias[SCE_GXM_MAX_TEXTURE_UNITS] = {};
 };
 
 struct GeneratedShader {

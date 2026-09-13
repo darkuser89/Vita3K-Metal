@@ -360,6 +360,8 @@ static void finalize_register(Operand &reg, bool is_double_regs, uint8_t reg_bit
     if (reg.bank == RegisterBank::SPECIAL)
         fixup_reg_special(reg);
 
+    reg.is_global = reg.bank == RegisterBank::GLOBAL;
+
     // In secondary program, data are computed and stored as SA, internal register stay the same.
     // TODO: Constant ?
     if (reg.bank != RegisterBank::FPINTERNAL && reg.bank != RegisterBank::FPCONSTANT

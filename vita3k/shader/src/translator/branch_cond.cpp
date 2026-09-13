@@ -546,6 +546,10 @@ bool USSETranslatorVisitor::br(
     Imm1 any_inst,
     Imm1 all_inst,
     uint32_t br_off) {
+    // The analyzer leaves branches to the next instruction in code blocks:
+    // both outcomes fall through, so they require no emitted control flow.
+    if (br_off == 1)
+        return true;
     assert(false && "Unreachable");
 
     LOG_ERROR("Branch instruction should not be recompiled here!");

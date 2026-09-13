@@ -188,6 +188,27 @@ bool USSETranslatorVisitor::vmov(
 
     LOG_DISASM("{}", disasm_str);
 
+    // A full F16 register move copies two packed words. Expanding each half
+    // into F32 and packing it again is unnecessary and can canonicalize NaN
+    // payloads which native-color shaders use as color/normal bits.
+    const auto packed_bank = [](RegisterBank bank) {
+        return bank == RegisterBank::TEMP || bank == RegisterBank::PRIMATTR
+            || bank == RegisterBank::SECATTR || bank == RegisterBank::OUTPUT;
+    };
+    if (m_spirv_params.native_metal && !is_conditional && move_data_type == DataType::F16
+        && dest_mask == 0xF && inst.opr.src1.swizzle == (Swizzle4 SWIZZLE_CHANNEL_4_DEFAULT)
+        && inst.opr.src1.flags == 0 && inst.opr.dest.flags == 0
+        && packed_bank(inst.opr.src1.bank) && packed_bank(inst.opr.dest.bank)) {
+        auto source = inst.opr.src1;
+        auto destination = inst.opr.dest;
+        source.type = destination.type = DataType::F32;
+        const auto words = load(source, 0b0011, src1_repeat_offset);
+        if (words == spv::NoResult)
+            return false;
+        store(destination, words, 0b0011, dest_repeat_offset);
+        continue;
+    }
+
     spv::Id source_to_compare_with_0 = spv::NoResult;
     spv::Id source_1 = load(inst.opr.src1, dest_mask, src1_repeat_offset);
     spv::Id source_2 = spv::NoResult;
@@ -701,6 +722,30 @@ bool USSETranslatorVisitor::vldst(
 
     // are we using the sa register containing the thread buffer address ?
     const bool is_thread_buffer_access = inst.opr.src0.bank == RegisterBank::SECATTR && inst.opr.src0.num == m_spirv_params.thread_buffer_sa_offset;
+
+    if (m_spirv_params.native_metal && is_thread_buffer_access && addr_mode == 1) {
+        // SGX LOCAL register offsets encode stride in bits 31:16 and a byte
+        // offset in bits 15:0. The stride selects a hardware instance inside
+        // shared scratch storage; our private array already isolates instances.
+        // Immediate offsets instead contain a four-bit offset in element units
+        // (src1 has already been scaled to bytes above).
+        if (mode != 0 || mask_count != 0 || to_store.type != DataType::F32)
+            throw std::runtime_error("Metal: unsupported private LOCAL load/store mode");
+        const auto i32 = m_b.makeIntType(32);
+        const uint32_t offset_mask = inst.opr.src1.bank == RegisterBank::IMMEDIATE ? 15 * sizeof(float) : 0xffff;
+        auto offset = m_b.createBinOp(spv::OpBitwiseAnd, i32, source_1, m_b.makeIntConstant(offset_mask));
+        if (!is_store)
+            offset = m_b.createBinOp(spv::OpIAdd, i32, offset, load(inst.opr.src2, 0b1, src2_offset));
+        if (m_spirv_params.thread_buffer_base)
+            offset = m_b.createBinOp(spv::OpIAdd, i32, offset, m_b.makeIntConstant(m_spirv_params.thread_buffer_base));
+        const auto index = m_b.createBinOp(spv::OpShiftRightLogical, i32, offset, m_b.makeUintConstant(2));
+        const auto ptr = utils::create_access_chain(m_b, spv::StorageClassPrivate, m_spirv_params.thread_buffer, { index });
+        if (is_store)
+            m_b.createStore(load(to_store, 0b1), ptr);
+        else
+            store(to_store, m_b.createLoad(ptr, spv::NoPrecision), 0b1);
+        continue;
+    }
 
     // Seems that if it's indexed by register, offset is in bytes and based on 0x10000?
     // Maybe that's just how the memory map operates. I'm not sure. However the literals on all shader so far is that

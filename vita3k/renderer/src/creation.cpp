@@ -25,6 +25,9 @@
 #include <renderer/gl/state.h>
 #include <renderer/vulkan/functions.h>
 #include <renderer/vulkan/state.h>
+#ifdef __APPLE__
+#include <renderer/metal/state.h>
+#endif
 
 #include <gxm/functions.h>
 #include <renderer/functions.h>
@@ -61,6 +64,13 @@ COMMAND(handle_create_context) {
         break;
     }
 
+#ifdef __APPLE__
+    case Backend::Metal: {
+        *ctx = std::make_unique<metal::MetalContext>();
+        result = true;
+        break;
+    }
+#endif
     case Backend::Vulkan: {
         result = vulkan::create(dynamic_cast<vulkan::VKState &>(renderer), *ctx, mem);
         break;
@@ -89,6 +99,10 @@ COMMAND(handle_destroy_context) {
     TRACY_FUNC_COMMANDS(handle_destroy_context);
     std::unique_ptr<Context> *ctx = helper.pop<std::unique_ptr<Context> *>();
 
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal && *ctx)
+        static_cast<metal::MetalState &>(renderer).finish(static_cast<metal::MetalContext &>(**ctx));
+#endif
     ctx->reset();
     renderer.context = nullptr;
 
@@ -107,6 +121,18 @@ COMMAND(handle_create_render_target) {
         result = gl::create(dynamic_cast<gl::GLState &>(renderer), *render_target, *params, features);
         break;
 
+#ifdef __APPLE__
+    case Backend::Metal: {
+        auto rt = std::make_unique<metal::MetalRenderTarget>();
+        rt->width = static_cast<uint32_t>(params->width * renderer.res_multiplier);
+        rt->height = static_cast<uint32_t>(params->height * renderer.res_multiplier);
+        rt->custom_multisample_locations = (params->flags & SCE_GXM_RENDER_TARGET_CUSTOM_MULTISAMPLE_LOCATIONS) != 0;
+        rt->multisample_locations = rt->custom_multisample_locations ? params->multisampleLocations : 0;
+        *render_target = std::move(rt);
+        result = true;
+        break;
+    }
+#endif
     case Backend::Vulkan:
         result = vulkan::create(dynamic_cast<vulkan::VKState &>(renderer), *render_target, *params, features);
         break;
@@ -115,6 +141,7 @@ COMMAND(handle_create_render_target) {
         REPORT_MISSING(renderer.current_backend);
         break;
     }
+    if (!result || !*render_target) { complete_command(renderer, helper, false); return; }
     (*render_target)->multisample_mode = params->multisampleMode;
     (*render_target)->has_macroblock_sync = (params->flags & SCE_GXM_RENDER_TARGET_MACROTILE_SYNC);
     if ((*render_target)->has_macroblock_sync) {
@@ -135,6 +162,7 @@ COMMAND(handle_destroy_render_target) {
     std::unique_ptr<RenderTarget> *render_target = helper.pop<std::unique_ptr<RenderTarget> *>();
 
     switch (renderer.current_backend) {
+    case Backend::Metal:
     case Backend::OpenGL:
         break;
 
@@ -183,6 +211,22 @@ bool create(std::unique_ptr<FragmentProgram> &fp, State &state, const SceGxmProg
         gl::create(fp, dynamic_cast<gl::GLState &>(state), program, blend);
         break;
 
+#ifdef __APPLE__
+    case Backend::Metal: {
+        auto result = std::make_unique<metal::MetalFragmentProgram>();
+        if (blend) result->blend = *blend;
+        else {
+            result->blend.colorMask = SCE_GXM_COLOR_MASK_ALL;
+            result->blend.colorSrc = result->blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
+        }
+        // Buffer-store and depth-only programs still need to execute, but their
+        // undefined color output must not overwrite the render target.
+        if (program.program_flags & SCE_GXM_PROGRAM_FLAG_OUTPUT_UNDEFINED)
+            result->blend.colorMask = SCE_GXM_COLOR_MASK_NONE;
+        fp = std::move(result);
+        break;
+    }
+#endif
     case Backend::Vulkan:
         vulkan::create(fp, dynamic_cast<vulkan::VKState &>(state), program, blend);
         break;
@@ -210,6 +254,11 @@ bool create(std::unique_ptr<VertexProgram> &vp, State &state, const SceGxmProgra
         gl::create(vp, dynamic_cast<gl::GLState &>(state), program);
         break;
 
+#ifdef __APPLE__
+    case Backend::Metal:
+        vp = std::make_unique<VertexProgram>();
+        break;
+#endif
     case Backend::Vulkan:
         vulkan::create(vp, dynamic_cast<vulkan::VKState &>(state), program);
         break;
@@ -263,6 +312,14 @@ bool init(FrameHost &frame, std::unique_ptr<State> &state, Backend backend, cons
             return false;
         break;
 
+#ifdef __APPLE__
+    case Backend::Metal:
+        state = std::make_unique<metal::MetalState>();
+        state->frame = &frame;
+        state->init_paths(root_paths);
+        if (!state->init()) return false;
+        break;
+#endif
     case Backend::Vulkan:
         state = std::make_unique<vulkan::VKState>(config.current_config.gpu_idx);
         state->frame = &frame;

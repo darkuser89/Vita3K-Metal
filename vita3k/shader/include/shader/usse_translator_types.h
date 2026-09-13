@@ -18,6 +18,7 @@
 #pragma once
 
 #include <shader/usse_types.h>
+#include <gxm/types.h>
 
 #include <map>
 #include <vector>
@@ -47,6 +48,11 @@ struct SamplerInfo {
 using SamplerMap = std::map<uint32_t, SamplerInfo>;
 
 struct SpirvShaderParameters {
+    bool native_metal = false;
+    spv::Id native_texture_info = 0;
+    float native_texture_lod_bias[SCE_GXM_MAX_TEXTURE_UNITS] = {};
+    // Native fragment emulation of SGX global registers 16, 23, 24 and 43.
+    spv::Id native_global_regs = 0;
     // Mapped to 'pa' (primary attribute) USSE registers
     // for vertex: vertex inputs (vertex attributes)
     // for fragment: fragment inputs (linkage from vertex stage)

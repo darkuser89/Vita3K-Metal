@@ -345,6 +345,11 @@ void analyze(USSEBlockNode &root, USSEOffset end_offset, const AnalyzeReadFuncti
         std::int32_t br_off = 0;
 
         if (is_branch(inst, pred, br_off)) {
+            // A branch to the following instruction has the same successor
+            // whether its predicate is true or false. Treat it as fallthrough;
+            // otherwise the if/else search mistakes the branch for its own else.
+            if (br_off == 1)
+                continue;
             const std::uint32_t dest = baddr + br_off;
             BranchInfo info = { baddr, dest, pred };
 
