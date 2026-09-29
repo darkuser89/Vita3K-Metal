@@ -2190,6 +2190,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                   & ~uint32_t(gxp::get_vertex_outputs(*vp->program.get(mem))) & 0x3ffeu)
             : 0;
         ctx.shader_hints.metal_mip_sampling = true;
+        ctx.shader_hints.metal_float_cube_filter = !impl->device->native_device().supports32BitFloatFiltering;
         ctx.shader_hints.attributes = &vp->attributes;
         ctx.shader_hints.color_format = record.color_surface.colorFormat;
         ctx.shader_hints.metal_red_alpha_shader_blend = false;
@@ -2229,6 +2230,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             append(key, vertex);
             if (vertex) append(key, ctx.shader_hints.metal_missing_vertex_outputs);
             append(key, ctx.shader_hints.metal_mip_sampling);
+            append(key, ctx.shader_hints.metal_float_cube_filter);
             append(key, get_features_mask());
             append(key, ctx.shader_hints.color_format);
             if (!vertex) {
@@ -3617,15 +3619,15 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             mip_info.control[1]=sampler_metadata_flags(texture);
             mip_info.control[2]=effective_sampler_anisotropy(texture,texture_cache.anisotropic_filtering);
             const bool software_float_filter = !impl->device->native_device().supports32BitFloatFiltering
-                && native.textureType == MTLTextureType2D
+                && (native.textureType == MTLTextureType2D || native.textureType == MTLTextureTypeCube)
                 && (native.pixelFormat == MTLPixelFormatR32Float
                     || native.pixelFormat == MTLPixelFormatRG32Float
                     || native.pixelFormat == MTLPixelFormatRGBA32Float);
             auto sampling_texture = texture;
             if (software_float_filter) {
                 // Apple7/8 can read 32-bit float textures but cannot filter
-                // them. The existing native-mip shader path reads texels and
-                // applies the guest's min/mag/mip filters in float precision.
+                // them. The native-mip shader path applies the guest's
+                // min/mag/mip filters in float precision for 2D and cubes.
                 // Keep a point sampler for LOD queries and Metal validation.
                 mip_info.control[0] = 1;
                 mip_info.control[2] = 1;

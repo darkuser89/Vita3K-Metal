@@ -81,6 +81,8 @@ struct Hints {
     // different buffer offset per sparse guest index to avoid a huge buffer.
     bool metal_capture_vertex_outputs_compact = false;
     bool metal_mip_sampling = false;
+    // Generate software Cube filtering only on devices that lack F32 filtering.
+    bool metal_float_cube_filter = false;
     // Tile register width is independent of the stored surface format. Keep
     // the declared shader type when no native draw descriptor is available.
     uint32_t metal_output_register_size = SCE_GXM_OUTPUT_REGISTER_SIZE_64BIT;

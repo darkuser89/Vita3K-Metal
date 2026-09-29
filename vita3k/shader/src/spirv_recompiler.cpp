@@ -1044,6 +1044,7 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
     const FeatureState &features, TranslationState &translation_state, SceGxmProgramType program_type, NonDependentTextureQueryCallInfos &texture_queries) {
     SpirvShaderParameters spv_params = {};
     spv_params.native_metal = translation_state.is_metal;
+    spv_params.native_cube_float_filter = translation_state.is_metal && translation_state.hints->metal_float_cube_filter;
     if (translation_state.is_metal) {
         const auto *bias = program.is_fragment() ? translation_state.hints->metal_fragment_lod_bias : translation_state.hints->metal_vertex_lod_bias;
         std::copy_n(bias, SCE_GXM_MAX_TEXTURE_UNITS, spv_params.native_texture_lod_bias);

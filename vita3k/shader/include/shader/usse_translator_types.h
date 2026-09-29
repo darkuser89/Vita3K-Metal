@@ -49,6 +49,7 @@ using SamplerMap = std::map<uint32_t, SamplerInfo>;
 
 struct SpirvShaderParameters {
     bool native_metal = false;
+    bool native_cube_float_filter = false;
     spv::Id native_texture_info = 0;
     float native_texture_lod_bias[SCE_GXM_MAX_TEXTURE_UNITS] = {};
     // Native fragment emulation of SGX global registers 16, 23, 24 and 43.

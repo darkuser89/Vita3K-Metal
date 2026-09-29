@@ -188,11 +188,136 @@ static spv::Id gather_native_grid(spv::Builder &b, spv::Id builtins, spv::Id inf
     correction.makeEndIf();
     return b.createLoad(result, spv::NoPrecision);
 }
+struct CubeCoordinates {
+    spv::Id face;
+    spv::Id st;
+};
+static spv::Id cube_st_on_face(spv::Builder &b, spv::Id builtins, spv::Id d, spv::Id face) {
+    const auto f=b.makeFloatType(32),f2=b.makeVectorType(f,2),boolean=b.makeBoolType();
+    const auto at=[&](unsigned c) { return b.createCompositeExtract(d,f,c); };
+    const auto is=[&](unsigned value) { return b.createBinOp(spv::OpIEqual,boolean,face,b.makeUintConstant(value)); };
+    const auto choose=[&](spv::Id condition,spv::Id yes,spv::Id no) {
+        return b.createOp(spv::OpSelect,f,{condition,yes,no});
+    };
+    const auto x=at(0),y=at(1),z=at(2);
+    const auto minus=[&](spv::Id value) { return b.createUnaryOp(spv::OpFNegate,f,value); };
+    const auto x_face=b.createBinOp(spv::OpULessThan,boolean,face,b.makeUintConstant(2));
+    const auto y_face=b.createBinOp(spv::OpULessThan,boolean,face,b.makeUintConstant(4));
+    const auto ax=b.createBuiltinCall(f,builtins,GLSLstd450FAbs,{x});
+    const auto ay=b.createBuiltinCall(f,builtins,GLSLstd450FAbs,{y});
+    const auto az=b.createBuiltinCall(f,builtins,GLSLstd450FAbs,{z});
+    const auto denominator=b.createBuiltinCall(f,builtins,GLSLstd450FMax,
+        {choose(x_face,ax,choose(y_face,ay,az)),b.makeFloatConstant(1e-20f)});
+    const auto s=choose(is(0),minus(z),choose(is(1),z,choose(is(5),minus(x),x)));
+    const auto t=choose(x_face,minus(y),choose(is(2),z,choose(is(3),minus(z),minus(y))));
+    return b.createBinOp(spv::OpFDiv,f2,b.createCompositeConstruct(f2,{s,t}),
+        b.createCompositeConstruct(f2,{denominator,denominator}));
+}
+static CubeCoordinates cube_coordinates(spv::Builder &b, spv::Id builtins, spv::Id d) {
+    const auto f=b.makeFloatType(32),u=b.makeUintType(32),boolean=b.makeBoolType();
+    const auto at=[&](unsigned c) { return b.createCompositeExtract(d,f,c); };
+    const auto x=at(0),y=at(1),z=at(2);
+    const auto ax=b.createBuiltinCall(f,builtins,GLSLstd450FAbs,{x});
+    const auto ay=b.createBuiltinCall(f,builtins,GLSLstd450FAbs,{y});
+    const auto az=b.createBuiltinCall(f,builtins,GLSLstd450FAbs,{z});
+    const auto x_major=b.createBinOp(spv::OpLogicalAnd,boolean,
+        b.createBinOp(spv::OpFOrdGreaterThanEqual,boolean,ax,ay),
+        b.createBinOp(spv::OpFOrdGreaterThanEqual,boolean,ax,az));
+    const auto y_major=b.createBinOp(spv::OpFOrdGreaterThanEqual,boolean,ay,az);
+    const auto positive=[&](spv::Id value) {
+        return b.createBinOp(spv::OpFOrdGreaterThanEqual,boolean,value,b.makeFloatConstant(0));
+    };
+    const auto faces=[&](spv::Id value,unsigned a,unsigned c) {
+        return b.createOp(spv::OpSelect,u,{positive(value),b.makeUintConstant(a),b.makeUintConstant(c)});
+    };
+    const auto face=b.createOp(spv::OpSelect,u,{x_major,faces(x,0,1),
+        b.createOp(spv::OpSelect,u,{y_major,faces(y,2,3),faces(z,4,5)})});
+    return {face,cube_st_on_face(b,builtins,d,face)};
+}
+static spv::Id cube_direction(spv::Builder &b,spv::Id face,spv::Id st) {
+    const auto f=b.makeFloatType(32),f3=b.makeVectorType(f,3),boolean=b.makeBoolType();
+    const auto is=[&](unsigned value) {return b.createBinOp(spv::OpIEqual,boolean,face,b.makeUintConstant(value));};
+    const auto choose=[&](spv::Id condition,spv::Id yes,spv::Id no) {
+        return b.createOp(spv::OpSelect,f,{condition,yes,no});
+    };
+    const auto s=b.createCompositeExtract(st,f,0),t=b.createCompositeExtract(st,f,1);
+    const auto negative=[&](spv::Id value) {return b.createUnaryOp(spv::OpFNegate,f,value);};
+    const auto one=b.makeFloatConstant(1),minus_one=b.makeFloatConstant(-1);
+    const auto x=choose(is(0),one,choose(is(1),minus_one,choose(is(5),negative(s),s)));
+    const auto y=choose(is(2),one,choose(is(3),minus_one,negative(t)));
+    const auto z=choose(is(0),negative(s),choose(is(1),s,
+        choose(is(2),t,choose(is(3),negative(t),choose(is(4),one,minus_one)))));
+    return b.createCompositeConstruct(f3,{x,y,z});
+}
+static spv::Id sample_native_cube_level(spv::Builder &b,spv::Id builtins,spv::Id tex,spv::Id direction,
+    spv::Id mip,spv::Id size,spv::Id linear) {
+    const auto f=b.makeFloatType(32),u=b.makeUintType(32),f2=b.makeVectorType(f,2),f3=b.makeVectorType(f,3),
+        f4=b.makeVectorType(f,4),boolean=b.makeBoolType();
+    const auto fi=[&](float value) {return b.makeFloatConstant(value);};
+    const auto extract=[&](spv::Id value,unsigned c) {
+        return b.createCompositeExtract(value,b.getScalarTypeId(b.getTypeId(value)),c);
+    };
+    const auto projected=cube_coordinates(b,builtins,direction);
+    const auto size_f=b.createUnaryOp(spv::OpConvertUToF,f2,size);
+    const auto half=b.createOp(spv::OpSelect,f,{linear,fi(.5f),fi(0)});
+    const auto st=b.createBinOp(spv::OpFMul,f2,
+        b.createBinOp(spv::OpFAdd,f2,projected.st,b.makeCompositeConstant(f2,{fi(1),fi(1)})),
+        b.makeCompositeConstant(f2,{fi(.5f),fi(.5f)}));
+    const auto pos=b.createBinOp(spv::OpFSub,f2,b.createBinOp(spv::OpFMul,f2,st,size_f),
+        b.createCompositeConstruct(f2,{half,half}));
+    const auto base=b.createBuiltinCall(f2,builtins,GLSLstd450Floor,{pos});
+    const auto fractions=b.createBuiltinCall(f2,builtins,GLSLstd450Fract,{pos});
+    const auto mip_f=b.createUnaryOp(spv::OpConvertUToF,f,mip);
+    const auto fetch=[&](int dx,int dy) {
+        const auto cell=b.createBinOp(spv::OpFAdd,f2,base,
+            b.makeCompositeConstant(f2,{fi(float(dx)),fi(float(dy))}));
+        const auto tap_st=b.createBinOp(spv::OpFSub,f2,
+            b.createBinOp(spv::OpFDiv,f2,
+                b.createBinOp(spv::OpVectorTimesScalar,f2,
+                    b.createBinOp(spv::OpFAdd,f2,cell,b.makeCompositeConstant(f2,{fi(.5f),fi(.5f)})),fi(2)),
+                size_f),b.makeCompositeConstant(f2,{fi(1),fi(1)}));
+        auto tap_direction=cube_direction(b,projected.face,tap_st);
+        const auto x_low=b.createBinOp(spv::OpFOrdLessThan,boolean,extract(cell,0),fi(0));
+        const auto y_low=b.createBinOp(spv::OpFOrdLessThan,boolean,extract(cell,1),fi(0));
+        const auto x_out=b.createBinOp(spv::OpLogicalOr,boolean,x_low,
+            b.createBinOp(spv::OpFOrdGreaterThanEqual,boolean,extract(cell,0),extract(size_f,0)));
+        const auto y_out=b.createBinOp(spv::OpLogicalOr,boolean,y_low,
+            b.createBinOp(spv::OpFOrdGreaterThanEqual,boolean,extract(cell,1),extract(size_f,1)));
+        const auto corner=b.createBinOp(spv::OpLogicalAnd,boolean,x_out,y_out);
+        const auto corner_st=b.createCompositeConstruct(f2,{
+            b.createOp(spv::OpSelect,f,{x_low,fi(-1),fi(1)}),
+            b.createOp(spv::OpSelect,f,{y_low,fi(-1),fi(1)})});
+        const auto vertex=cube_direction(b,projected.face,corner_st);
+        // Metal assigns a shared three-face cube corner to the X face. Edge
+        // taps still cross into their neighboring face normally.
+        const auto corner_direction=b.createCompositeConstruct(f3,{
+            b.createBinOp(spv::OpFMul,f,extract(vertex,0),fi(1.01f)),
+            extract(vertex,1),extract(vertex,2)});
+        tap_direction=b.createOp(spv::OpSelect,f3,{corner,corner_direction,tap_direction});
+        return b.createOp(spv::OpImageSampleExplicitLod,f4,
+            {tex,tap_direction,spv::ImageOperandsLodMask,mip_f});
+    };
+    const auto direct=b.createOp(spv::OpImageSampleExplicitLod,f4,
+        {tex,direction,spv::ImageOperandsLodMask,mip_f});
+    const auto result=b.createVariable(spv::NoPrecision,spv::StorageClassFunction,f4,"native_cube_level");
+    spv::Builder::If bilinear(linear,spv::SelectionControlMaskNone,b);
+    const auto a=fetch(0,0),c=fetch(1,0),d=fetch(0,1),e=fetch(1,1);
+    const auto mix=[&](spv::Id left,spv::Id right,spv::Id amount) {
+        return b.createBinOp(spv::OpFAdd,f4,left,
+            b.createBinOp(spv::OpVectorTimesScalar,f4,b.createBinOp(spv::OpFSub,f4,right,left),amount));
+    };
+    b.createStore(mix(mix(a,c,extract(fractions,0)),mix(d,e,extract(fractions,0)),
+        extract(fractions,1)),result);
+    bilinear.makeBeginElse();
+    b.createStore(direct,result);
+    bilinear.makeEndIf();
+    return b.createLoad(result,spv::NoPrecision);
+}
 // Keep each reconstructed mip's original sampling grid. The Metal texture may
 // contain duplicated/resampled pixels to share one native mip-chain allocation.
 static spv::Id sample_native_mips(spv::Builder &b, spv::Id builtins, spv::Id info, spv::Id tex, uint32_t slot,
                                   spv::Id uv, const std::function<spv::Id()> &get_lod,
-                                  const std::function<spv::Id()> &ordinary) {
+                                  const std::function<spv::Id()> &ordinary, bool cube = false) {
     const auto f = b.makeFloatType(32), u = b.makeUintType(32), i = b.makeIntType(32), boolean = b.makeBoolType();
     const auto f2 = b.makeVectorType(f, 2), f4 = b.makeVectorType(f, 4), u2 = b.makeVectorType(u, 2),
                i2 = b.makeVectorType(i, 2);
@@ -213,7 +338,8 @@ static spv::Id sample_native_mips(spv::Builder &b, spv::Id builtins, spv::Id inf
     spv::Builder::If correction(b.createBinOp(spv::OpLogicalAnd, boolean, enabled, isotropic),
                                 spv::SelectionControlMaskNone, b);
     b.addCapability(spv::CapabilityImageQuery);
-    const auto image_type = b.makeImageType(f, spv::Dim2D, false, false, false, 1, spv::ImageFormatUnknown);
+    const auto image_type = b.makeImageType(f, cube ? spv::DimCube : spv::Dim2D,
+        false, false, false, 1, spv::ImageFormatUnknown);
     const auto image = b.createUnaryOp(spv::OpImage, image_type, tex);
     const auto levels = b.createUnaryOp(spv::OpImageQueryLevels, u, image);
     const auto last = b.createBinOp(spv::OpISub, u, levels, ui(1));
@@ -247,6 +373,7 @@ static spv::Id sample_native_mips(spv::Builder &b, spv::Id builtins, spv::Id inf
     };
     const auto sample_level = [&](spv::Id mip) {
         const auto size = load({b.makeIntConstant(0), b.makeIntConstant(slot), b.makeIntConstant(1), mip});
+        if (cube) return sample_native_cube_level(b,builtins,tex,uv,mip,size,linear);
         const auto size_f = b.createUnaryOp(spv::OpConvertUToF, f2, size);
         const auto physical = b.createOp(spv::OpImageQuerySizeLod, u2, {image, mip});
         const auto half = b.createOp(spv::OpSelect, f, {linear, fi(.5f), fi(0)});
@@ -448,9 +575,10 @@ spv::Id shader::usse::USSETranslatorVisitor::do_fetch_texture(const spv::Id tex,
     }
 
     const auto ordinary=[&]{return m_b.createOp(op,type_f32_v[4],params);};
-    if (m_spirv_params.native_texture_info && dim == 2 && gather4_comp == -1) {
+    if (m_spirv_params.native_texture_info
+        && (dim == 2 || (dim == 3 && m_spirv_params.native_cube_float_filter)) && gather4_comp == -1) {
         auto uv = coord_id;
-        if (lod_mode == 4 && extra1 == spv::NoResult) {
+        if (dim == 2 && lod_mode == 4 && extra1 == spv::NoResult) {
             const auto xy = m_b.createOp(spv::OpVectorShuffle, type_f32_v[2],
                                          {{true, coord_id}, {true, coord_id}, {false, 0}, {false, 1}});
             const auto q = m_b.createCompositeExtract(coord_id, type_f32, 2);
@@ -462,15 +590,30 @@ spv::Id shader::usse::USSETranslatorVisitor::do_fetch_texture(const spv::Id tex,
                 lod = extra1;
             else if (extra1 != spv::NoResult && lod_mode == 3) {
                 const auto image_type =
-                    m_b.makeImageType(type_f32, spv::Dim2D, false, false, false, 1, spv::ImageFormatUnknown);
+                    m_b.makeImageType(type_f32, dim == 3 ? spv::DimCube : spv::Dim2D,
+                        false, false, false, 1, spv::ImageFormatUnknown);
                 const auto image = m_b.createUnaryOp(spv::OpImage, image_type, tex);
                 auto size = m_b.createOp(spv::OpImageQuerySizeLod, m_b.makeVectorType(m_b.makeUintType(32), 2),
                                          {image, m_b.makeIntConstant(0)});
                 size = m_b.createUnaryOp(spv::OpConvertUToF, type_f32_v[2], size);
-                const auto x = m_b.createBuiltinCall(type_f32, std_builtins, GLSLstd450Length,
-                                                     {m_b.createBinOp(spv::OpFMul, type_f32_v[2], extra1, size)});
-                const auto y = m_b.createBuiltinCall(type_f32, std_builtins, GLSLstd450Length,
-                                                     {m_b.createBinOp(spv::OpFMul, type_f32_v[2], extra2, size)});
+                spv::Id dx,dy;
+                if (dim == 3) {
+                    const auto projected=cube_coordinates(m_b,std_builtins,uv);
+                    const auto footprint=[&](spv::Id gradient) {
+                        const auto next=m_b.createBinOp(spv::OpFAdd,type_f32_v[3],uv,gradient);
+                        const auto st=cube_st_on_face(m_b,std_builtins,next,projected.face);
+                        const auto difference=m_b.createBinOp(spv::OpFSub,type_f32_v[2],st,projected.st);
+                        return m_b.createBinOp(spv::OpVectorTimesScalar,type_f32_v[2],
+                            m_b.createBinOp(spv::OpFMul,type_f32_v[2],difference,size),
+                            m_b.makeFloatConstant(.5f));
+                    };
+                    dx=footprint(extra1);dy=footprint(extra2);
+                } else {
+                    dx=m_b.createBinOp(spv::OpFMul,type_f32_v[2],extra1,size);
+                    dy=m_b.createBinOp(spv::OpFMul,type_f32_v[2],extra2,size);
+                }
+                const auto x = m_b.createBuiltinCall(type_f32, std_builtins, GLSLstd450Length, {dx});
+                const auto y = m_b.createBuiltinCall(type_f32, std_builtins, GLSLstd450Length, {dy});
                 lod = m_b.createBuiltinCall(type_f32, std_builtins, GLSLstd450Log2,
                                             {m_b.createBuiltinCall(type_f32, std_builtins, GLSLstd450FMax, {x, y})});
             } else if (m_program.is_fragment()) {
@@ -485,7 +628,7 @@ spv::Id shader::usse::USSETranslatorVisitor::do_fetch_texture(const spv::Id tex,
             return lod;
         };
         image_sample = sample_native_mips(m_b, std_builtins, m_spirv_params.native_texture_info, tex, texture_index, uv,
-                                          get_lod, ordinary);
+                                          get_lod, ordinary, dim == 3);
     } else if (m_spirv_params.native_texture_info && dim == 2 && gather4_comp != -1)
         image_sample = gather_native_grid(m_b, std_builtins, m_spirv_params.native_texture_info, texture_index,
             tex, original_gather_coords, gather4_comp, ordinary);
