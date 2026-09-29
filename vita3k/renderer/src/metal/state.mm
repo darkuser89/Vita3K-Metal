@@ -54,6 +54,15 @@ void append(std::string &key, uint32_t value) {
         static_cast<char>(value >> 16), static_cast<char>(value >> 24)};
     key.append(bytes, sizeof(bytes));
 }
+bool surface_texture_format_matches(SceGxmColorFormat color, SceGxmTextureFormat texture) {
+    SceGxmTextureFormat mapped{};
+    if (!gxm::convert_color_format_to_texture_format(color,mapped)
+        || gxm::get_base_format(mapped)!=gxm::get_base_format(texture)) return false;
+    // X8S8S8U8 decodes its two byte orders differently. A direct GPU view is
+    // valid only for the matching color order; other views need a byte cast.
+    return gxm::get_base_format(mapped)!=SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8
+        || mapped==texture;
+}
 shader::metal::Program depth_only_program(uint32_t samples) {
     // Disabling the guest fragment program leaves raster depth/stencil active.
     // A small native function retains GXM's separate mask test, including each
@@ -2419,13 +2428,11 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 && texture_address==source->first
                 && texture_address!=ctx.impl->guest_color.data.address()
                 && source->second.color!=ctx.impl->color) {
-                SceGxmTextureFormat source_format{};
                 const auto rect=surface_subrectangle(source->second.guest,texture);
                 direct_precise_surface=rect && !rect->x && !rect->y
                     && rect->width==source->second.guest.width
                     && rect->height==source->second.guest.height
-                    && gxm::convert_color_format_to_texture_format(source->second.guest.colorFormat,source_format)
-                    && gxm::get_base_format(source_format)==texture_base;
+                    && surface_texture_format_matches(source->second.guest.colorFormat,gxm::get_format(texture));
             }
             if (!cube && single_mip && !incompatible_alias
                 && (features.use_texture_viewport || direct_precise_surface)) continue;
@@ -2472,9 +2479,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             const float scale=res_multiplier;
             for (auto *surface:overlaps) {
                 bool matched=false;
-                SceGxmTextureFormat surface_texture_format{};
-                const bool same_format=gxm::convert_color_format_to_texture_format(surface->guest.colorFormat,surface_texture_format)
-                    && gxm::get_base_format(surface_texture_format)==base_format;
+                const bool same_format=surface_texture_format_matches(surface->guest.colorFormat,gxm::get_format(upload));
                 const bool can_cast=surface_format_cast_supported(surface->guest.colorFormat,base_format,upload.swizzle_format);
                 if ((same_format || can_cast) && !gxm::is_block_compressed_format(base_format)
                     && gxm::bits_per_pixel(gxm::get_base_format(surface->guest.colorFormat))==bits) {
@@ -2605,9 +2610,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             if (found==impl->surfaces.end()) continue;
             auto &entry=found->second; const auto rect=*surface_subrectangle(entry.guest,texture);
             const bool cropped=rect.x || rect.y || rect.width!=entry.guest.width || rect.height!=entry.guest.height;
-            SceGxmTextureFormat source_format{};
-            const bool same_format=gxm::convert_color_format_to_texture_format(entry.guest.colorFormat,source_format)
-                && gxm::get_base_format(source_format)==gxm::get_base_format(gxm::get_format(texture));
+            const bool same_format=surface_texture_format_matches(entry.guest.colorFormat,gxm::get_format(texture));
             const auto texture_base=gxm::get_base_format(gxm::get_format(texture));
             const bool gpu_cast=!same_format && !texture.gamma_mode
                 && surface_format_cast_enqueueable(entry.guest.colorFormat,texture_base,texture.swizzle_format);
@@ -2671,7 +2674,6 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     && uint64_t(address)==uint64_t(ctx.impl->guest_color.data.address())+4;
                 if (address==ctx.impl->guest_color.data.address() || word_alias) {
                     needs_feedback=true;
-                    SceGxmTextureFormat source_format{};
                     const auto active=impl->surfaces.find(ctx.impl->guest_color.data.address());
                     const bool packed_rg32=ctx.impl->color.pixelFormat==MTLPixelFormatRG32Float
                         && (base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8 || base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)
@@ -2679,8 +2681,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                         && rg32_linear_alias(active->second,texture,address)
                         && !texture.gamma_mode && impl->dump_surface_dir.empty();
                     const bool same_format=!word_alias
-                        && gxm::convert_color_format_to_texture_format(ctx.impl->guest_color.colorFormat,source_format)
-                        && gxm::get_base_format(source_format)==base;
+                        && surface_texture_format_matches(ctx.impl->guest_color.colorFormat,gxm::get_format(texture));
                     const bool gpu_cast=!word_alias && !texture.gamma_mode
                         && active!=impl->surfaces.end() && active->second.color==ctx.impl->color
                         && surface_subrectangle(active->second.guest,texture).has_value()
@@ -2717,10 +2718,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                             res_multiplier<1 ? active->second.guest.height : 0,ctx.impl->commands);
                         continue;
                     }
-                    SceGxmTextureFormat source_format{};
-                    const bool same_format=gxm::convert_color_format_to_texture_format(
-                        ctx.impl->guest_color.colorFormat,source_format)
-                        && gxm::get_base_format(source_format)==base;
+                    const bool same_format=surface_texture_format_matches(
+                        ctx.impl->guest_color.colorFormat,gxm::get_format(texture));
                     if (address==ctx.impl->guest_color.data.address() && !same_format
                         && surface_format_cast_enqueueable(ctx.impl->guest_color.colorFormat,base,texture.swizzle_format)) {
                         inline_cast_images[index]=impl->caster->surface_format_cast(color_feedback,
@@ -3535,9 +3534,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             }
             bool cast_memory=false;
             if (rendered_format) {
-                SceGxmTextureFormat source_format{};
-                const bool same_format=gxm::convert_color_format_to_texture_format(*rendered_format,source_format)
-                    && gxm::get_base_format(source_format)==texture_base;
+                const bool same_format=surface_texture_format_matches(*rendered_format,gxm::get_format(texture));
                 if (!same_format && surface_format_cast_supported(*rendered_format,texture_base,texture.swizzle_format)) {
                     const auto &entry = surface->second;
                     require(surface_subrectangle(surface->second.guest,texture).has_value(),

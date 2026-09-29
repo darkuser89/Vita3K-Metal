@@ -53,9 +53,11 @@ Map texture_mapping(SceGxmTextureFormat format) {
     // These CPU decoders already return logical RGB(A) channels.
     if (base == SCE_GXM_TEXTURE_BASE_FORMAT_YUV420P2 || base == SCE_GXM_TEXTURE_BASE_FORMAT_YUV420P3
         || base == SCE_GXM_TEXTURE_BASE_FORMAT_YUV422 || base == SCE_GXM_TEXTURE_BASE_FORMAT_U8U3U3U2
-        || base == SCE_GXM_TEXTURE_BASE_FORMAT_S5S5U6
-        || base == SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8)
+        || base == SCE_GXM_TEXTURE_BASE_FORMAT_S5S5U6)
         return identity;
+    // X8S8S8U8 is decoded to logical RGB, but its alpha is always one.
+    if (base == SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8)
+        return {R,G,B,O};
     switch (gxm::get_num_components(base)) {
     case 1: {
         constexpr Map one[] = {{R,Z,Z,O}, {R,Z,Z,Z}, {R,O,O,O}, {R,R,R,R},
@@ -215,6 +217,8 @@ SurfaceComponents texture_components(SceGxmTextureBaseFormat format) {
     COMPONENTS(SE5M9M9M9, 1, 4, RGB9E5Float);
     COMPONENTS(U2U10U10U10, 1, 4, BGR10A2Unorm);
     COMPONENTS(U1U5U5U5, 1, 2, BGR5A1Unorm);
+    // The guest word is four bytes, while the decoded sample is RGBA16F.
+    COMPONENTS(X8S8S8U8, 1, 4, RGBA16Float);
 #undef COMPONENTS
     default: return {};
     }
@@ -1186,13 +1190,15 @@ static bool packed_texture_cast_target(SceGxmTextureBaseFormat texture) {
         || texture == SCE_GXM_TEXTURE_BASE_FORMAT_F11F11F10
         || texture == SCE_GXM_TEXTURE_BASE_FORMAT_SE5M9M9M9
         || texture == SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10
-        || texture == SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5;
+        || texture == SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5
+        || texture == SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8;
 }
 bool surface_format_cast_supported(SceGxmColorFormat color, SceGxmTextureBaseFormat texture,
     uint32_t texture_swizzle) {
     const bool packed_source=packed_color_cast_source(gxm::get_base_format(color));
     // Cross-casts to 5:5:5:1 need the full texture mode to choose the alpha-bit layout.
     if (texture == SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5 && texture_swizzle >= 8) return false;
+    if (texture == SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8 && texture_swizzle >= 2) return false;
     const auto source=surface_components(color), target=texture_components(texture);
     if (!source.count || !target.count || source.count*source.bytes != target.count*target.bytes) return false;
     try {
@@ -1768,6 +1774,17 @@ id<MTLTexture> SurfaceCaster::surface_format_cast(id<MTLTexture> source, SceGxmC
                 std::memcpy(bytes.data()+offset,&native,4);
             }
         }
+        std::vector<uint16_t> decoded;
+        const void *upload_bytes=bytes.data();
+        size_t upload_pitch=pitch;
+        if (texture == SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8) {
+            decoded.resize(size_t(source.width)*source.height*4);
+            const auto format=static_cast<SceGxmTextureFormat>(uint32_t(texture) | (texture_swizzle<<12));
+            renderer::texture::convert_x8s8s8u8_to_f16f16f16f16(decoded.data(),bytes.data(),
+                uint32_t(source.width),uint32_t(source.height),format);
+            upload_bytes=decoded.data();
+            upload_pitch=size_t(source.width)*8;
+        }
         auto desc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:output.native
             width:source.width height:source.height mipmapped:NO];
         desc.storageMode=MTLStorageModeShared;
@@ -1775,7 +1792,7 @@ id<MTLTexture> SurfaceCaster::surface_format_cast(id<MTLTexture> source, SceGxmC
         auto result=[device.native_device() newTextureWithDescriptor:desc];
         if (!result) return nil;
         [result replaceRegion:MTLRegionMake2D(0,0,source.width,source.height)
-            mipmapLevel:0 withBytes:bytes.data() bytesPerRow:pitch];
+            mipmapLevel:0 withBytes:upload_bytes bytesPerRow:upload_pitch];
         return result;
     }
     const auto mapping=surface_memory_mapping(color);
