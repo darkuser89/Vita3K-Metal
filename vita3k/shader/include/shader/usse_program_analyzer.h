@@ -200,6 +200,7 @@ struct AttributeInformation {
     uint16_t location;
     SceGxmParameterType gxm_type;
     uint8_t component_count;
+    uint32_t array_size;
     // this is needed for Vulkan as it doesn't implicitly convert between integers and floats and between signed and unsigned
     bool is_integer;
     // only meaningful is is_integer is true
@@ -210,15 +211,17 @@ struct AttributeInformation {
         : location(0)
         , gxm_type(static_cast<SceGxmParameterType>(0))
         , component_count(0)
+        , array_size(1)
         , is_integer(false)
         , is_signed(false)
         , regformat(false) {
     }
 
-    explicit AttributeInformation(uint16_t loc, SceGxmParameterType type, uint8_t count, bool is_integer, bool is_signed, bool regformat)
+    explicit AttributeInformation(uint16_t loc, SceGxmParameterType type, uint8_t count, bool is_integer, bool is_signed, bool regformat, uint32_t array_size = 1)
         : location(loc)
         , gxm_type(type)
         , component_count(count)
+        , array_size(array_size)
         , is_integer(is_integer)
         , is_signed(is_signed)
         , regformat(regformat) {

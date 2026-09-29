@@ -3111,7 +3111,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             uint32_t components = a.componentCount;
             auto f = a.format;
             if (info.regformat) {
-                components = info.component_count;
+                // Match the packed array of uint4 inputs emitted by the shader
+                // recompiler for matrices and other register-format arrays.
+                components = info.component_count * info.array_size;
                 switch (info.gxm_type) {
                 case SCE_GXM_PARAMETER_TYPE_U8: case SCE_GXM_PARAMETER_TYPE_S8: f = SCE_GXM_ATTRIBUTE_FORMAT_U8; break;
                 case SCE_GXM_PARAMETER_TYPE_C10: f = SCE_GXM_ATTRIBUTE_FORMAT_U8; components = (components * 10 + 7) / 8; break;
