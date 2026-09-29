@@ -1452,6 +1452,28 @@ fragment uint4 seed_fs_uint(float4 position [[position]], uint sample [[sample_i
             seed_axis(native.y,config.w,source.get_height(),config.y,extent.y,sample/extent.x).x);
     }
     return source.read(p);
+}
+fragment uint4 restore_clip_uint(float4 position [[position]], uint sample [[sample_id]],
+    texture2d_ms<uint,access::read> source [[texture(0)]],
+    constant uint4 &clip [[buffer(0)]], constant uint2 &guest_size [[buffer(1)]]) {
+    const uint2 native=uint2(position.xy);
+    const uint sx=source.get_num_samples()/2;
+    const uint2 guest=uint2(
+        seed_axis(native.x,source.get_width(),source.get_width(),guest_size.x,sx,sample%sx).y,
+        seed_axis(native.y,source.get_height(),source.get_height(),guest_size.y,2,sample/sx).y);
+    if (all(guest>=clip.xy) && all(guest<=clip.zw)) discard_fragment();
+    return source.read(native,sample);
+}
+fragment float4 restore_clip_float(float4 position [[position]], uint sample [[sample_id]],
+    texture2d_ms<float,access::read> source [[texture(0)]],
+    constant uint4 &clip [[buffer(0)]], constant uint2 &guest_size [[buffer(1)]]) {
+    const uint2 native=uint2(position.xy);
+    const uint sx=source.get_num_samples()/2;
+    const uint2 guest=uint2(
+        seed_axis(native.x,source.get_width(),source.get_width(),guest_size.x,sx,sample%sx).y,
+        seed_axis(native.y,source.get_height(),source.get_height(),guest_size.y,2,sample/sx).y);
+    if (all(guest>=clip.xy) && all(guest<=clip.zw)) discard_fragment();
+    return source.read(native,sample);
 })";
     NSError *error = nil;
     auto library = [device.native_device() newLibraryWithSource:source options:nil error:&error];
@@ -1550,6 +1572,54 @@ void SurfaceCaster::seed_multisample(id<MTLTexture> source, id<MTLTexture> desti
     [encoder setFragmentBytes:mode length:sizeof(mode) atIndex:1];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [encoder endEncoding];
     if(!device.submit_and_wait(commands,error)) throw std::runtime_error(error);
+}
+void SurfaceCaster::restore_clipped_multisample(id<MTLTexture> source, id<MTLTexture> destination,
+    const SceGxmColorSurface &surface, id<MTLCommandBuffer> commands,
+    const MTLSamplePosition *sample_positions) {
+    if (!source || !destination || !commands
+        || source.textureType != MTLTextureType2DMultisample
+        || destination.textureType != MTLTextureType2DMultisample
+        || source.sampleCount != destination.sampleCount
+        || (source.sampleCount != 2 && source.sampleCount != 4)
+        || source.width != destination.width || source.height != destination.height
+        || source.pixelFormat != destination.pixelFormat
+        || commands.status != MTLCommandBufferStatusNotEnqueued)
+        throw std::runtime_error("Metal: invalid samplewise color clip restoration");
+    const MTLPixelFormat bits = sample_bits_format(source.pixelFormat);
+    if (bits != MTLPixelFormatInvalid) {
+        source = [source newTextureViewWithPixelFormat:bits];
+        destination = [destination newTextureViewWithPixelFormat:bits];
+        if (!source || !destination)
+            throw std::runtime_error("Metal: cannot view clipped multisample color bits");
+    }
+    auto &pipeline = clip_pipelines[{uint32_t(destination.pixelFormat), uint32_t(destination.sampleCount)}];
+    if (!pipeline) {
+        auto descriptor = [MTLRenderPipelineDescriptor new];
+        descriptor.vertexFunction = [multisample_library newFunctionWithName:@"seed_vs"];
+        descriptor.fragmentFunction = [multisample_library newFunctionWithName:
+            bits == MTLPixelFormatInvalid ? @"restore_clip_float" : @"restore_clip_uint"];
+        descriptor.colorAttachments[0].pixelFormat = destination.pixelFormat;
+        descriptor.rasterSampleCount = destination.sampleCount;
+        std::string error;
+        pipeline = device.create_pipeline(descriptor, error);
+        if (!pipeline) throw std::runtime_error(error);
+    }
+    auto pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = destination;
+    pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    if (sample_positions) [pass setSamplePositions:sample_positions count:destination.sampleCount];
+    auto encoder = [commands renderCommandEncoderWithDescriptor:pass];
+    if (!encoder) throw std::runtime_error("Metal: cannot encode samplewise color clip restoration");
+    const uint32_t clip[] = {surface.clip_x_min, surface.clip_y_min,
+        surface.clip_x_max, surface.clip_y_max};
+    const uint32_t guest_size[] = {surface.width, surface.height};
+    [encoder setRenderPipelineState:pipeline];
+    [encoder setFragmentTexture:source atIndex:0];
+    [encoder setFragmentBytes:clip length:sizeof(clip) atIndex:0];
+    [encoder setFragmentBytes:guest_size length:sizeof(guest_size) atIndex:1];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [encoder endEncoding];
 }
 bool SurfaceCaster::patch_multisample(id<MTLTexture> texture, const SceGxmColorSurface &surface, float scale,
     std::span<const uint8_t> source, std::span<const SurfaceMemoryRange> ranges) {

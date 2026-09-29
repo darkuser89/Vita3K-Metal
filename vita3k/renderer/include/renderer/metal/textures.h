@@ -83,6 +83,7 @@ class SurfaceCaster {
     id<MTLComputePipelineState> multisample_integer_pipeline;
     id<MTLLibrary> multisample_library;
     std::map<std::pair<uint32_t,uint32_t>,id<MTLRenderPipelineState>> seed_pipelines;
+    std::map<std::pair<uint32_t,uint32_t>,id<MTLRenderPipelineState>> clip_pipelines;
 public:
     explicit SurfaceCaster(Device &device);
     id<MTLTexture> rgba8_from_rg32(id<MTLTexture> source, bool swap_words,
@@ -112,6 +113,9 @@ public:
         uint32_t guest_width = 0, uint32_t guest_height = 0, id<MTLCommandBuffer> pending_commands = nil);
     void seed_multisample(id<MTLTexture> source, id<MTLTexture> destination, float scale, bool expanded,
         uint32_t guest_width = 0, uint32_t guest_height = 0);
+    void restore_clipped_multisample(id<MTLTexture> source, id<MTLTexture> destination,
+        const SceGxmColorSurface &surface, id<MTLCommandBuffer> commands,
+        const MTLSamplePosition *sample_positions = nullptr);
     bool patch_multisample(id<MTLTexture> texture, const SceGxmColorSurface &, float scale,
         std::span<const uint8_t> source, std::span<const SurfaceMemoryRange> ranges);
     // Diagnostic canonical RGBA values after the texture view's swizzle.

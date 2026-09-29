@@ -285,6 +285,9 @@ struct MetalContext::Impl {
     id<MTLTexture> transient_depth;
     id<MTLTexture> transient_color;
     id<MTLTexture> render_color;
+    id<MTLTexture> color_clip_snapshot;
+    bool color_clip_restore_pending = false;
+    bool color_clip_samplewise = false;
     uint32_t samples = 1;
     float sample_scale = 1;
     bool expanded_color = false, custom_samples = false;
@@ -374,6 +377,64 @@ static void begin_pass(MetalContext &ctx, bool mask, bool clear_depth = false) {
     ctx.impl->mask_pass = mask;
     ctx.impl->depth_written |= clear_depth;
     require(ctx.impl->encoder != nil, "Metal: cannot begin GXM render pass");
+}
+
+static void restore_color_outside_clip(MetalContext &ctx, SurfaceCaster *caster) {
+    if (!ctx.impl->color_clip_snapshot || !ctx.impl->color_clip_restore_pending)
+        return;
+    const auto &surface = ctx.impl->guest_color;
+    if (ctx.impl->color_clip_samplewise) {
+        require(caster != nullptr, "Metal: samplewise color clip has no surface caster");
+        caster->restore_clipped_multisample(ctx.impl->color_clip_snapshot,
+            ctx.impl->render_color, surface, ctx.impl->commands,
+            ctx.impl->custom_samples ? ctx.impl->sample_positions.data() : nullptr);
+        ctx.impl->color_clip_restore_pending = false;
+        return;
+    }
+    const uint32_t width = uint32_t(ctx.impl->render_color.width);
+    const uint32_t height = uint32_t(ctx.impl->render_color.height);
+    const double x_scale = double(ctx.impl->sample_scale)
+        / (ctx.impl->expanded_color ? ctx.impl->samples / 2 : 1);
+    const double y_scale = double(ctx.impl->sample_scale)
+        / (ctx.impl->expanded_color ? 2 : 1);
+    const auto edge = [](uint32_t coordinate, uint32_t limit, double scale) {
+        return uint32_t(std::clamp(std::floor(double(coordinate) * scale), 0.0, double(limit)));
+    };
+    const uint32_t x0 = edge(surface.clip_x_min, width, x_scale);
+    const uint32_t y0 = edge(surface.clip_y_min, height, y_scale);
+    const uint32_t x1 = edge(uint32_t(surface.clip_x_max) + 1, width, x_scale);
+    const uint32_t y1 = edge(uint32_t(surface.clip_y_max) + 1, height, y_scale);
+    require(ctx.impl->commands != nil, "Metal: color clip restoration has no command buffer");
+    auto blit = [ctx.impl->commands blitCommandEncoder];
+    require(blit != nil, "Metal: cannot restore clipped color samples");
+    const auto copy = [&](uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+        if (!w || !h) return;
+        [blit copyFromTexture:ctx.impl->color_clip_snapshot sourceSlice:0 sourceLevel:0
+            sourceOrigin:MTLOriginMake(x, y, 0) sourceSize:MTLSizeMake(w, h, 1)
+            toTexture:ctx.impl->render_color destinationSlice:0 destinationLevel:0
+            destinationOrigin:MTLOriginMake(x, y, 0)];
+    };
+    if (x1 <= x0 || y1 <= y0) copy(0, 0, width, height);
+    else {
+        copy(0, 0, width, y0);
+        copy(0, y1, width, height - y1);
+        copy(0, y0, x0, y1 - y0);
+        copy(x1, y0, width - x1, y1 - y0);
+    }
+    [blit endEncoding];
+    // The ordinary render pass resolved before the outside samples were
+    // restored. Resolve them once more so guest publication sees the clip.
+    if (ctx.impl->samples > 1 && !ctx.impl->expanded_color && ctx.impl->color) {
+        auto pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = ctx.impl->render_color;
+        pass.colorAttachments[0].resolveTexture = ctx.impl->color;
+        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+        auto encoder = [ctx.impl->commands renderCommandEncoderWithDescriptor:pass];
+        require(encoder != nil, "Metal: cannot resolve clipped color samples");
+        [encoder endEncoding];
+    }
+    ctx.impl->color_clip_restore_pending = false;
 }
 struct MetalState::Impl {
     struct PipelineResult {
@@ -764,6 +825,9 @@ void MetalState::set_async_compilation(bool enable) {
 bool MetalState::finish(MetalContext &ctx, bool publish_color) {
     bool published_color = false;
     if (ctx.impl->encoder) { [ctx.impl->encoder endEncoding]; ctx.impl->encoder = nil; }
+    if (ctx.impl->color_clip_samplewise && ctx.impl->color_clip_restore_pending && !impl->caster)
+        impl->caster = std::make_unique<SurfaceCaster>(*impl->device);
+    restore_color_outside_clip(ctx, impl->caster.get());
     const auto wait_pending_batch = [&](bool recycle_uploads) {
         auto batch = std::move(ctx.impl->pending_batches.front());
         ctx.impl->pending_batches.pop_front();
@@ -988,6 +1052,9 @@ void MetalState::mid_scene_flush(MetalContext &ctx, bool wait_for_completion) {
         [ctx.impl->encoder endEncoding];
         ctx.impl->encoder = nil;
         ctx.impl->pass_visibility_active = false;
+        if (ctx.impl->color_clip_samplewise && ctx.impl->color_clip_restore_pending && !impl->caster)
+            impl->caster = std::make_unique<SurfaceCaster>(*impl->device);
+        restore_color_outside_clip(ctx, impl->caster.get());
     }
 }
 static std::pair<std::span<uint8_t>,std::span<uint8_t>> depth_memory_spans(MemState &mem,
@@ -1512,6 +1579,9 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
         context = &ctx; ctx.impl->mem = &mem;
         ctx.impl->color_guest_current = false;
         ctx.impl->color_guest_dirty = false;
+        ctx.impl->color_clip_snapshot = nil;
+        ctx.impl->color_clip_restore_pending = false;
+        ctx.impl->color_clip_samplewise = false;
         ctx.impl->depth_scene_written = false;
         ctx.impl->direct_guest_memory_used = false;
         auto *target = static_cast<MetalRenderTarget *>(ctx.current_render_target);
@@ -1711,6 +1781,35 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
         } else ctx.impl->transient_depth = selected;
         ctx.impl->depth = selected;
         ctx.impl->commands = scene_command_buffer(*impl->device);
+        // Treat the descriptor's clip as a color-output boundary. Preserve
+        // samples outside its inclusive rectangle before any scene draws;
+        // restoring them leaves depth, stencil and visibility untouched.
+        const bool clipped_color = surface.data && surface.clip_enabled
+            && (surface.clip_x_min || surface.clip_y_min
+                || uint32_t(surface.clip_x_max) + 1 < surface.width
+                || uint32_t(surface.clip_y_max) + 1 < surface.height);
+        const uint32_t x_group = samples / 2;
+        const bool grouped_clip = !ctx.impl->expanded_color
+            || (ctx.impl->sample_scale == 1.f
+                && !(surface.clip_x_min % x_group)
+                && !((uint32_t(surface.clip_x_max) + 1) % x_group)
+                && !(surface.clip_y_min % 2)
+                && !((uint32_t(surface.clip_y_max) + 1) % 2));
+        if (clipped_color) {
+            ctx.impl->color_clip_samplewise = !grouped_clip;
+            ctx.impl->color_clip_snapshot = make_texture(*impl->device,
+                ctx.impl->render_color.pixelFormat, uint32_t(ctx.impl->render_color.width),
+                uint32_t(ctx.impl->render_color.height),
+                MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView, samples);
+            auto blit = [ctx.impl->commands blitCommandEncoder];
+            require(blit != nil, "Metal: cannot capture color clip samples");
+            [blit copyFromTexture:ctx.impl->render_color sourceSlice:0 sourceLevel:0
+                sourceOrigin:MTLOriginMake(0, 0, 0)
+                sourceSize:MTLSizeMake(ctx.impl->render_color.width, ctx.impl->render_color.height, 1)
+                toTexture:ctx.impl->color_clip_snapshot destinationSlice:0 destinationLevel:0
+                destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [blit endEncoding];
+        }
         bool loaded_depth=false;
         if(backed_depth && ds.force_load && ctx.impl->depth_layout) {
             const auto &layout=*ctx.impl->depth_layout;
@@ -4318,8 +4417,10 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             : red_alpha_target ? (SCE_GXM_COLOR_MASK_R | SCE_GXM_COLOR_MASK_A)
             : rgb_target ? (SCE_GXM_COLOR_MASK_R | SCE_GXM_COLOR_MASK_G | SCE_GXM_COLOR_MASK_B)
             : SCE_GXM_COLOR_MASK_ALL;
-        ctx.impl->pending_color_writes |= !record.is_maskupdate && !fragment_disabled
+        const bool wrote_color = !record.is_maskupdate && !fragment_disabled
             && (blend.colorMask & writable_color);
+        ctx.impl->pending_color_writes |= wrote_color;
+        ctx.impl->color_clip_restore_pending |= wrote_color && bool(ctx.impl->color_clip_snapshot);
         const size_t index_upload_bytes=native_count*index_size;
         ctx.impl->pending_upload_bytes+=draw_upload_bytes+index_upload_bytes;
         if (impl->trace_batches) {
