@@ -1798,7 +1798,14 @@ DECL_EXPORT(int, sceGxmTextureSetGammaMode, SceGxmTexture *texture, SceGxmTextur
 EXPORT(void, sceGxmColorSurfaceGetClip, const SceGxmColorSurface *surface, uint32_t *xMin, uint32_t *yMin, uint32_t *xMax, uint32_t *yMax) {
     TRACY_FUNC(sceGxmColorSurfaceGetClip, surface, xMin, yMin, xMax, yMax);
     assert(surface);
-    UNIMPLEMENTED();
+    if (xMin)
+        *xMin = surface->clip_enabled ? surface->clip_x_min : 0;
+    if (yMin)
+        *yMin = surface->clip_enabled ? surface->clip_y_min : 0;
+    if (xMax)
+        *xMax = surface->clip_enabled ? surface->clip_x_max : (surface->width ? surface->width - 1 : 0);
+    if (yMax)
+        *yMax = surface->clip_enabled ? surface->clip_y_max : (surface->height ? surface->height - 1 : 0);
 }
 
 EXPORT(Ptr<void>, sceGxmColorSurfaceGetData, const SceGxmColorSurface *surface) {
@@ -1916,7 +1923,11 @@ EXPORT(bool, sceGxmColorSurfaceIsEnabled, const SceGxmColorSurface *surface) {
 EXPORT(void, sceGxmColorSurfaceSetClip, SceGxmColorSurface *surface, uint32_t xMin, uint32_t yMin, uint32_t xMax, uint32_t yMax) {
     TRACY_FUNC(sceGxmColorSurfaceSetClip, surface, xMin, yMin, xMax, yMax);
     assert(surface);
-    UNIMPLEMENTED();
+    surface->clip_x_min = std::min(xMin, 4095u);
+    surface->clip_y_min = std::min(yMin, 4095u);
+    surface->clip_x_max = std::min(xMax, 4095u);
+    surface->clip_y_max = std::min(yMax, 4095u);
+    surface->clip_enabled = 1;
 }
 
 EXPORT(int, sceGxmColorSurfaceSetData, SceGxmColorSurface *surface, Ptr<void> data) {
