@@ -1234,6 +1234,15 @@ static MTLPixelFormat sample_bits_format(MTLPixelFormat format) {
     case MTLPixelFormatR32Float: return MTLPixelFormatR32Uint;
     case MTLPixelFormatRG32Float: return MTLPixelFormatRG32Uint;
     case MTLPixelFormatRGBA32Float: return MTLPixelFormatRGBA32Uint;
+    // Packed attachments must keep their storage words through MSAA seed,
+    // expansion and clipped-sample restoration. Float reads canonicalize
+    // NaN payloads in RG11B10Float before the color clip even draws.
+    case MTLPixelFormatB5G6R5Unorm: case MTLPixelFormatABGR4Unorm:
+    case MTLPixelFormatBGR5A1Unorm: case MTLPixelFormatA1BGR5Unorm:
+        return MTLPixelFormatR16Uint;
+    case MTLPixelFormatRG11B10Float: case MTLPixelFormatRGB9E5Float:
+    case MTLPixelFormatBGR10A2Unorm:
+        return MTLPixelFormatR32Uint;
     default: return MTLPixelFormatInvalid;
     }
 }
