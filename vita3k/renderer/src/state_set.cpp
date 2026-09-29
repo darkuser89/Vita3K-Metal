@@ -624,6 +624,23 @@ COMMAND_SET_STATE(visibility_index) {
 #endif
 }
 
+COMMAND_SET_STATE(visibility_back_index) {
+    TRACY_FUNC_COMMANDS_SET_STATE(visibility_back_index);
+    const uint32_t index = helper.pop<uint32_t>();
+    const bool enable = helper.pop<bool>();
+    const bool is_increment = helper.pop<bool>();
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal) {
+        static_cast<metal::MetalState &>(renderer).set_back_visibility_index(
+            *static_cast<metal::MetalContext *>(render_context), enable, index, is_increment);
+    }
+#else
+    (void)index;
+    (void)enable;
+    (void)is_increment;
+#endif
+}
+
 COMMAND(handle_set_state) {
     // TRACY_FUNC_COMMANDS(handle_set_state); All set state commands have tracy so kinda redundant
     renderer::GXMState gxm_state_to_set = helper.pop<renderer::GXMState>();
@@ -648,7 +665,8 @@ COMMAND(handle_set_state) {
         { GXMState::UniformBuffer, cmd_set_state_uniform_buffer },
         { GXMState::FragmentProgramEnable, cmd_set_state_fragment_program_enable },
         { GXMState::VisibilityBuffer, cmd_set_state_visibility_buffer },
-        { GXMState::VisibilityIndex, cmd_set_state_visibility_index }
+        { GXMState::VisibilityIndex, cmd_set_state_visibility_index },
+        { GXMState::VisibilityBackIndex, cmd_set_state_visibility_back_index }
     };
 
     auto result = handlers.find(gxm_state_to_set);

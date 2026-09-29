@@ -366,4 +366,8 @@ void set_visibility_index(State &state, Context *ctx, bool enable, uint32_t inde
     renderer::add_state_set_command(ctx, renderer::GXMState::VisibilityIndex, index, enable, is_increment);
 }
 
+void set_back_visibility_index(State &state, Context *ctx, bool enable, uint32_t index, bool is_increment) {
+    renderer::add_state_set_command(ctx, renderer::GXMState::VisibilityBackIndex, index, enable, is_increment);
+}
+
 } // namespace renderer

@@ -89,6 +89,7 @@ struct MetalState : renderer::State {
     bool end_scene(MetalContext &, bool allow_deferred = false);
     void set_visibility_buffer(MetalContext &, Ptr<uint32_t> buffer, uint32_t stride);
     void set_visibility_index(MetalContext &, bool enable, uint32_t index, bool increment);
+    void set_back_visibility_index(MetalContext &, bool enable, uint32_t index, bool increment);
     bool sync_surface(MemState &, const SceGxmColorSurface &);
     bool transfer_fill(MemState &, const SceGxmTransferImage &, uint32_t color);
     bool transfer_copy(MemState &, const SceGxmTransferImage &source, const SceGxmTransferImage &destination,

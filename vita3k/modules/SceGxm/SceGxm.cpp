@@ -1605,6 +1605,8 @@ static void gxmContextStateRestore(renderer::State &state, SceGxmContext *contex
     if (state.current_backend == renderer::Backend::Metal) {
         renderer::set_visibility_index(state, context->renderer.get(), context->state.visibility_enable,
             context->state.visibility_index, context->state.visibility_is_increment);
+        renderer::set_back_visibility_index(state, context->renderer.get(), context->state.back_visibility_enable,
+            context->state.back_visibility_index, context->state.back_visibility_is_increment);
     } else if (state.features.enable_memory_mapping) {
         context->state.visibility_enable = false;
         context->state.visibility_index = 0;
@@ -3847,17 +3849,35 @@ EXPORT(void, sceGxmSetBackStencilRef, SceGxmContext *context, uint8_t sref) {
 
 EXPORT(void, sceGxmSetBackVisibilityTestEnable, SceGxmContext *context, SceGxmVisibilityTestMode enable) {
     TRACY_FUNC(sceGxmSetBackVisibilityTestEnable, context, enable);
-    UNIMPLEMENTED();
+    if (emuenv.renderer->current_backend != renderer::Backend::Metal) {
+        UNIMPLEMENTED();
+        return;
+    }
+    context->state.back_visibility_enable = enable != SCE_GXM_VISIBILITY_TEST_DISABLED;
+    renderer::set_back_visibility_index(*emuenv.renderer, context->renderer.get(), context->state.back_visibility_enable,
+        context->state.back_visibility_index, context->state.back_visibility_is_increment);
 }
 
 EXPORT(void, sceGxmSetBackVisibilityTestIndex, SceGxmContext *context, uint32_t index) {
     TRACY_FUNC(sceGxmSetBackVisibilityTestIndex, context, index);
-    UNIMPLEMENTED();
+    if (emuenv.renderer->current_backend != renderer::Backend::Metal) {
+        UNIMPLEMENTED();
+        return;
+    }
+    context->state.back_visibility_index = index;
+    renderer::set_back_visibility_index(*emuenv.renderer, context->renderer.get(), context->state.back_visibility_enable,
+        context->state.back_visibility_index, context->state.back_visibility_is_increment);
 }
 
 EXPORT(void, sceGxmSetBackVisibilityTestOp, SceGxmContext *context, SceGxmVisibilityTestOp op) {
     TRACY_FUNC(sceGxmSetBackVisibilityTestOp, context, op);
-    UNIMPLEMENTED();
+    if (emuenv.renderer->current_backend != renderer::Backend::Metal) {
+        UNIMPLEMENTED();
+        return;
+    }
+    context->state.back_visibility_is_increment = op == SCE_GXM_VISIBILITY_TEST_OP_INCREMENT;
+    renderer::set_back_visibility_index(*emuenv.renderer, context->renderer.get(), context->state.back_visibility_enable,
+        context->state.back_visibility_index, context->state.back_visibility_is_increment);
 }
 
 EXPORT(void, sceGxmSetCullMode, SceGxmContext *context, SceGxmCullMode mode) {

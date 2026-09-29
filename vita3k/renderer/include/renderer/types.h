@@ -72,6 +72,7 @@ enum class GXMState : std::uint16_t {
     FragmentProgramEnable,
     VisibilityBuffer,
     VisibilityIndex,
+    VisibilityBackIndex,
     TotalState
 };
 

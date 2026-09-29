@@ -275,6 +275,7 @@ struct MetalContext::Impl {
         Address address;
         uint32_t index;
         bool increment;
+        uint64_t group;
     };
     MemState *mem = nullptr;
     id<MTLCommandBuffer> commands;
@@ -321,14 +322,20 @@ struct MetalContext::Impl {
     bool visibility_enabled = false;
     uint32_t visibility_index = 0;
     bool visibility_increment = false;
+    bool back_visibility_enabled = false;
+    uint32_t back_visibility_index = 0;
+    bool back_visibility_increment = false;
     id<MTLBuffer> pass_visibility_buffer;
     Address pass_visibility_address{};
     uint32_t pass_visibility_stride = 0;
     uint32_t pass_visibility_offset = 0;
+    size_t visibility_buffer_capacity = 4096;
     bool pass_visibility_active = false;
     uint32_t pass_visibility_index = 0;
     bool pass_visibility_increment = false;
     std::vector<VisibilityResult> visibility_results;
+    uint64_t visibility_epoch = 1;
+    std::map<std::array<uint64_t, 3>, bool> published_set_results;
 };
 
 static void begin_pass(MetalContext &ctx, bool mask, bool clear_depth = false) {
@@ -359,7 +366,7 @@ static void begin_pass(MetalContext &ctx, bool mask, bool clear_depth = false) {
         // Each draw uses a fresh eight-byte result. Metal allows an offset only
         // once per encoder; separate passes must not reset earlier results.
         ctx.impl->pass_visibility_buffer = [ctx.impl->commands.device
-            newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+            newBufferWithLength:ctx.impl->visibility_buffer_capacity options:MTLResourceStorageModeShared];
         require(ctx.impl->pass_visibility_buffer != nil, "Metal: visibility result buffer allocation failed");
         pass.visibilityResultBuffer = ctx.impl->pass_visibility_buffer;
     }
@@ -803,7 +810,25 @@ bool MetalState::finish(MetalContext &ctx, bool publish_color) {
         ctx.impl->commands = nil;
         if (deferred && ctx.impl->pending_batches.size() >= 3)
             wait_pending_batch(true);
-        if (ctx.impl->mem) for (const auto &result : ctx.impl->visibility_results) {
+        // Face routing can switch the Metal query between front and back
+        // several times. SET retains visibility across draws while the guest
+        // query state is unchanged, so combine its Boolean segments first.
+        std::map<std::array<uint64_t, 3>, std::pair<bool, size_t>> grouped_set_results;
+        for (size_t i = 0; i < ctx.impl->visibility_results.size(); ++i) {
+            const auto &result = ctx.impl->visibility_results[i];
+            if (!result.group || result.increment) continue;
+            uint64_t samples = 0;
+            std::memcpy(&samples, static_cast<const uint8_t *>(result.buffer.contents) + result.offset, sizeof(samples));
+            const std::array<uint64_t, 3> key{result.group, uint64_t(result.address), result.index};
+            auto &combined = grouped_set_results[key];
+            if (const auto prior = ctx.impl->published_set_results.find(key);
+                prior != ctx.impl->published_set_results.end())
+                combined.first |= prior->second;
+            combined.first |= samples != 0;
+            combined.second = i;
+        }
+        if (ctx.impl->mem) for (size_t i = 0; i < ctx.impl->visibility_results.size(); ++i) {
+            const auto &result = ctx.impl->visibility_results[i];
             const uint64_t guest_address = uint64_t(result.address) + uint64_t(result.index) * sizeof(uint32_t);
             if (guest_address + sizeof(uint32_t) > uint64_t(UINT32_MAX) - 4095
                 || !is_valid_addr_range(*ctx.impl->mem, Address(guest_address), Address(guest_address + sizeof(uint32_t)))) {
@@ -812,6 +837,13 @@ bool MetalState::finish(MetalContext &ctx, bool publish_color) {
             }
             uint64_t samples = 0;
             std::memcpy(&samples, static_cast<const uint8_t *>(result.buffer.contents) + result.offset, sizeof(samples));
+            if (result.group && !result.increment) {
+                const std::array<uint64_t, 3> key{result.group, uint64_t(result.address), result.index};
+                const auto &combined = grouped_set_results.at(key);
+                if (combined.second != i) continue;
+                samples = combined.first;
+                ctx.impl->published_set_results[key] = combined.first;
+            }
             auto *guest = Ptr<uint32_t>(Address(guest_address)).get(*ctx.impl->mem);
             *guest = result.increment ? *guest + uint32_t(samples) : uint32_t(samples != 0);
         }
@@ -1105,6 +1137,8 @@ bool MetalState::end_scene(MetalContext &ctx, bool allow_deferred) {
     }
 }
 void MetalState::set_visibility_buffer(MetalContext &ctx, Ptr<uint32_t> buffer, uint32_t stride) {
+    if (ctx.impl->visibility_address != buffer.address() || ctx.impl->visibility_stride != stride)
+        ++ctx.impl->visibility_epoch;
     if (ctx.impl->encoder && ctx.impl->pass_visibility_active
         && (ctx.impl->visibility_address != buffer.address() || ctx.impl->visibility_stride != stride)) {
         [ctx.impl->encoder setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
@@ -1114,6 +1148,9 @@ void MetalState::set_visibility_buffer(MetalContext &ctx, Ptr<uint32_t> buffer, 
     ctx.impl->visibility_stride = stride;
 }
 void MetalState::set_visibility_index(MetalContext &ctx, bool enable, uint32_t index, bool increment) {
+    if (ctx.impl->visibility_enabled != enable || ctx.impl->visibility_index != index
+        || ctx.impl->visibility_increment != increment)
+        ++ctx.impl->visibility_epoch;
     if (ctx.impl->encoder && ctx.impl->pass_visibility_active
         && (!enable || ctx.impl->visibility_index != index || ctx.impl->visibility_increment != increment)) {
         [ctx.impl->encoder setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
@@ -1122,6 +1159,14 @@ void MetalState::set_visibility_index(MetalContext &ctx, bool enable, uint32_t i
     ctx.impl->visibility_enabled = enable;
     ctx.impl->visibility_index = index;
     ctx.impl->visibility_increment = increment;
+}
+void MetalState::set_back_visibility_index(MetalContext &ctx, bool enable, uint32_t index, bool increment) {
+    if (ctx.impl->back_visibility_enabled != enable || ctx.impl->back_visibility_index != index
+        || ctx.impl->back_visibility_increment != increment)
+        ++ctx.impl->visibility_epoch;
+    ctx.impl->back_visibility_enabled = enable;
+    ctx.impl->back_visibility_index = index;
+    ctx.impl->back_visibility_increment = increment;
 }
 bool MetalState::sync_surface(MemState &mem, const SceGxmColorSurface &surface) {
     if (context) finish(*static_cast<MetalContext *>(context));
@@ -1463,6 +1508,7 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
     @autoreleasepool {
         if (context && context != &ctx) end_scene(*static_cast<MetalContext *>(context));
         end_scene(ctx);
+        ctx.impl->published_set_results.clear();
         context = &ctx; ctx.impl->mem = &mem;
         ctx.impl->color_guest_current = false;
         ctx.impl->color_guest_dirty = false;
@@ -2037,27 +2083,39 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             || record.front_polygon_mode == SCE_GXM_POLYGON_MODE_TRIANGLE_POINT);
         const bool shader_point_size = point_polygon
             && (gxp::get_vertex_outputs(*vp->program.get(mem)) & SCE_GXM_VERTEX_PROGRAM_OUTPUT_PSIZE);
-        const auto preserve_active_set_query = [&] {
-            return ctx.impl->pass_visibility_active
-                && ctx.impl->pass_visibility_address == ctx.impl->visibility_address
-                && ctx.impl->pass_visibility_index == ctx.impl->visibility_index
-                && !ctx.impl->pass_visibility_increment && !ctx.impl->visibility_increment;
-        };
-        const auto empty_visibility_draw = [&](bool preserve_prior_set_query) {
-            if (!ctx.impl->visibility_enabled || !ctx.impl->visibility_address
-                || ctx.impl->visibility_increment || preserve_prior_set_query) return;
+        const auto empty_visibility_draw = [&](bool preserve_front, bool preserve_back) {
+            if (!ctx.impl->visibility_address) return;
             const uint32_t entries = ctx.impl->visibility_stride / sizeof(uint32_t);
-            const uint32_t query_index = ctx.impl->visibility_index < entries
-                ? ctx.impl->visibility_index : 0;
-            const uint64_t guest_address = uint64_t(ctx.impl->visibility_address)
-                + uint64_t(query_index) * sizeof(uint32_t);
-            if (entries && guest_address + sizeof(uint32_t) <= uint64_t(UINT32_MAX) - 4095
-                && is_valid_addr_range(mem, Address(guest_address), Address(guest_address + sizeof(uint32_t))))
-                *Ptr<uint32_t>(Address(guest_address)).get(mem) = 0;
+            if (!entries) return;
+            for (bool front : {true, false}) {
+                const bool enabled = front ? ctx.impl->visibility_enabled : ctx.impl->back_visibility_enabled;
+                const bool increment = front ? ctx.impl->visibility_increment : ctx.impl->back_visibility_increment;
+                const uint32_t index = front ? ctx.impl->visibility_index : ctx.impl->back_visibility_index;
+                const bool preserve = front ? preserve_front : preserve_back;
+                if (!enabled || increment || preserve) continue;
+                const uint32_t query_index = index < entries ? index : 0;
+                const uint64_t guest_address = uint64_t(ctx.impl->visibility_address)
+                    + uint64_t(query_index) * sizeof(uint32_t);
+                if (guest_address + sizeof(uint32_t) <= uint64_t(UINT32_MAX) - 4095
+                    && is_valid_addr_range(mem, Address(guest_address), Address(guest_address + sizeof(uint32_t))))
+                    *Ptr<uint32_t>(Address(guest_address)).get(mem) = 0;
+            }
+        };
+        const auto preserve_active_set_query = [&](bool front) {
+            const uint32_t entries = ctx.impl->visibility_stride / sizeof(uint32_t);
+            const uint32_t index = front ? ctx.impl->visibility_index : ctx.impl->back_visibility_index;
+            const uint32_t query_index = index < entries ? index : 0;
+            const bool published = entries && ctx.impl->published_set_results.contains(
+                {ctx.impl->visibility_epoch, uint64_t(ctx.impl->visibility_address), query_index});
+            return published || (ctx.impl->pass_visibility_active
+                && ctx.impl->pass_visibility_address == ctx.impl->visibility_address
+                && ctx.impl->pass_visibility_index == query_index
+                && !ctx.impl->pass_visibility_increment
+                && !(front ? ctx.impl->visibility_increment : ctx.impl->back_visibility_increment));
         };
         if (!count || !instances || (primitive == SCE_GXM_PRIMITIVE_LINES && count < 2)
             || ((primitive == SCE_GXM_PRIMITIVE_TRIANGLE_FAN || point_polygon) && count < 3)) {
-            empty_visibility_draw(preserve_active_set_query());
+            empty_visibility_draw(preserve_active_set_query(true), preserve_active_set_query(false));
             return;
         }
         std::vector<uint32_t> point_capture_unique_indices;
@@ -2303,6 +2361,22 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         const bool routed_point_polygon = point_polygon;
         const bool routed_wide_line = wide_line;
         const bool routed_geometry = routed_point_polygon || routed_wide_line;
+        const bool visibility_faces_differ = ctx.impl->visibility_enabled != ctx.impl->back_visibility_enabled
+            || (ctx.impl->visibility_enabled && ctx.impl->back_visibility_enabled
+                && (ctx.impl->visibility_index != ctx.impl->back_visibility_index
+                    || ctx.impl->visibility_increment != ctx.impl->back_visibility_increment));
+        const bool many_face_queries = ctx.impl->visibility_address && triangles && !cull_front && !cull_back
+            && visibility_faces_differ;
+        const uint64_t max_query_capacity = impl->device->native_device().maxBufferLength;
+        uint64_t query_capacity = 4096;
+        if (many_face_queries) {
+            const uint64_t bytes_per_index = uint64_t(instances) * std::max<size_t>(1, clip.size()) * 16;
+            require(max_query_capacity >= 4096 && bytes_per_index
+                    && count <= (max_query_capacity - 8) / bytes_per_index,
+                "Metal: face visibility query buffer exceeds native maximum length");
+            query_capacity = std::max<uint64_t>(4096, uint64_t(count) * bytes_per_index + 8);
+        }
+        ctx.impl->visibility_buffer_capacity = size_t(query_capacity);
         if (impl->cache_enabled && impl->known_shader_pairs.emplace(fp->renderer_data->hash, vp->renderer_data->hash).second) {
             shaders_cache_hashs.push_back({fp->renderer_data->hash, vp->renderer_data->hash});
             renderer::save_shaders_cache_hashs(*this, shaders_cache_hashs);
@@ -2882,9 +2956,12 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             begin_pass(ctx, record.is_maskupdate);
         }
         if (ctx.impl->mask_pass != record.is_maskupdate) begin_pass(ctx, record.is_maskupdate);
-        if (ctx.impl->visibility_enabled && ctx.impl->visibility_address
+        if ((ctx.impl->visibility_enabled || ctx.impl->back_visibility_enabled) && ctx.impl->visibility_address
             && (ctx.impl->pass_visibility_address != ctx.impl->visibility_address
                 || ctx.impl->pass_visibility_stride != ctx.impl->visibility_stride))
+            begin_pass(ctx, record.is_maskupdate);
+        if (many_face_queries && ctx.impl->pass_visibility_buffer
+            && uint64_t(ctx.impl->pass_visibility_offset) + query_capacity > ctx.impl->pass_visibility_buffer.length)
             begin_pass(ctx, record.is_maskupdate);
         if (capture_draw) {
             std::filesystem::create_directories(impl->dump_draw_dir);
@@ -3142,9 +3219,12 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 || record.front_depth_write_mode != record.back_depth_write_mode
                 || record.depth_bias_unit != record.back_depth_bias_unit
                 || record.depth_bias_slope != record.back_depth_bias_slope);
+        const bool split_face_visibility = triangles && !cull_front && !cull_back
+            && ctx.impl->visibility_address && visibility_faces_differ;
+        const bool split_face_draw = split_face_depth || (split_face_visibility && !routed_geometry);
         // The two face draws must not execute a memory-writing GXP vertex
         // shader twice. Capture its outputs once, then split only the replay.
-        const bool capture_split_depth = split_face_depth && vs.writes_guest_memory && !routed_geometry;
+        const bool capture_split_faces = split_face_draw && vs.writes_guest_memory && !routed_geometry;
         const bool back_depth = two_sided && cull_front;
         const auto depth_func = back_depth ? record.back_depth_func : record.front_depth_func;
         const auto depth_write_mode = back_depth ? record.back_depth_write_mode : record.front_depth_write_mode;
@@ -3668,8 +3748,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         [encoder setFragmentBytes:fragment_bytes.data() length:fragment_bytes.size() atIndex:shader::metal::RENDER_INFO_BUFFER];
         id<MTLRenderPipelineState> point_capture_pipeline = nil;
         id<MTLRenderPipelineState> point_replay_pipeline = nil;
-        if (routed_geometry || capture_split_depth) {
-            const bool compact_capture = compact_point_capture || capture_split_depth;
+        if (routed_geometry || capture_split_faces) {
+            const bool compact_capture = compact_point_capture || capture_split_faces;
             const std::string capture_suffix = compact_capture ? "-polygon-capture-compact" : "-polygon-capture";
             const std::string capture_key = vertex_key + capture_suffix;
             auto &capture_shader = impl->shaders[capture_key];
@@ -3762,7 +3842,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         std::vector<uint32_t> split_capture_source_indices;
         size_t native_count = count;
         auto index_size = index_format == SCE_GXM_INDEX_FORMAT_U16 ? 2u : 4u;
-        if (capture_split_depth) {
+        if (capture_split_faces) {
             const uint32_t used_count = primitive == SCE_GXM_PRIMITIVE_TRIANGLES
                 || primitive == SCE_GXM_PRIMITIVE_TRIANGLE_EDGES ? count / 3 * 3 : count;
             split_capture_source_indices.reserve(used_count);
@@ -3811,13 +3891,13 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 indices = converted_indices.data();
                 index_size = 4;
             }
-        } else if (split_face_depth && !routed_geometry && primitive == SCE_GXM_PRIMITIVE_TRIANGLE_STRIP) {
+        } else if (split_face_draw && !routed_geometry && primitive == SCE_GXM_PRIMITIVE_TRIANGLE_STRIP) {
             // Each split draw starts a new primitive. Preserve strip parity by
             // converting odd triangles with their first two indices swapped.
             type = MTLPrimitiveTypeTriangle;
             native_count = count < 3 ? 0 : size_t(count - 2) * 3;
             converted_indices.reserve(native_count);
-            if (capture_split_depth) converted_ordinals.reserve(native_count);
+            if (capture_split_faces) converted_ordinals.reserve(native_count);
             const auto at = [&](uint32_t i) -> uint32_t {
                 return index_size == 2 ? static_cast<const uint16_t *>(indices)[i] : static_cast<const uint32_t *>(indices)[i];
             };
@@ -3825,20 +3905,20 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 if (i & 1) {
                     converted_indices.push_back(at(i - 1));
                     converted_indices.push_back(at(i - 2));
-                    if (capture_split_depth) {
+                    if (capture_split_faces) {
                         converted_ordinals.push_back(i - 1);
                         converted_ordinals.push_back(i - 2);
                     }
                 } else {
                     converted_indices.push_back(at(i - 2));
                     converted_indices.push_back(at(i - 1));
-                    if (capture_split_depth) {
+                    if (capture_split_faces) {
                         converted_ordinals.push_back(i - 2);
                         converted_ordinals.push_back(i - 1);
                     }
                 }
                 converted_indices.push_back(at(i));
-                if (capture_split_depth) converted_ordinals.push_back(i);
+                if (capture_split_faces) converted_ordinals.push_back(i);
             }
             indices = converted_indices.data();
             index_size = 4;
@@ -3862,7 +3942,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             type = MTLPrimitiveTypeTriangle;
             native_count = size_t(count - 2) * 3;
             converted_indices.reserve(native_count);
-            if (capture_per_occurrence || capture_split_depth) converted_ordinals.reserve(native_count);
+            if (capture_per_occurrence || capture_split_faces) converted_ordinals.reserve(native_count);
             const auto at = [&](uint32_t i) -> uint32_t {
                 return index_size == 2 ? static_cast<const uint16_t *>(indices)[i] : static_cast<const uint32_t *>(indices)[i];
             };
@@ -3871,7 +3951,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 converted_indices.push_back(anchor);
                 converted_indices.push_back(at(i - 1));
                 converted_indices.push_back(at(i));
-                if (capture_per_occurrence || capture_split_depth) {
+                if (capture_per_occurrence || capture_split_faces) {
                     converted_ordinals.push_back(0);
                     converted_ordinals.push_back(i - 1);
                     converted_ordinals.push_back(i);
@@ -3883,10 +3963,10 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         }
         default: throw std::runtime_error("Metal: primitive conversion required");
         }
-        if (split_face_depth && type == MTLPrimitiveTypeTriangle)
+        if (split_face_draw && type == MTLPrimitiveTypeTriangle)
             native_count = (native_count / 3) * 3;
         if (!native_count) {
-            empty_visibility_draw(preserve_active_set_query());
+            empty_visibility_draw(preserve_active_set_query(true), preserve_active_set_query(false));
             return;
         }
         const auto index_buffer = ctx.impl->uploads.allocate(*impl->device, native_count * index_size);
@@ -3922,7 +4002,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             [encoder setCullMode:MTLCullModeNone];
             [encoder setTriangleFillMode:MTLTriangleFillModeFill];
             [encoder setScissorRect:MTLScissorRect{0, 0, ctx.impl->width, ctx.impl->height}];
-            const bool preserve_prior_set_query = preserve_active_set_query();
+            const bool preserve_prior_front_set_query = preserve_active_set_query(true);
+            const bool preserve_prior_back_set_query = preserve_active_set_query(false);
             [encoder setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
             ctx.impl->pass_visibility_active = false;
             for (uint32_t instance = 0; instance < instances; ++instance) {
@@ -3993,7 +4074,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 }
             }
             if (routed_polygons.empty() && routed_lines.empty()) {
-                empty_visibility_draw(preserve_prior_set_query);
+                empty_visibility_draw(preserve_prior_front_set_query, preserve_prior_back_set_query);
                 return;
             }
             ctx.impl->commands = scene_command_buffer(*impl->device);
@@ -4021,16 +4102,16 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             }
             [encoder setFragmentBytes:texture_mip_info.data() length:sizeof(shader::metal::TextureMipInfos)
                 atIndex:shader::metal::TEXTURE_INFO_BUFFER];
-        } else if (capture_split_depth) {
+        } else if (capture_split_faces) {
             require(type == MTLPrimitiveTypeTriangle && !split_capture_source_indices.empty(),
-                "Metal: two-sided depth capture requires complete triangles");
+                "Metal: face-routed capture requires complete triangles");
             const auto capture_indices = ctx.impl->uploads.allocate(*impl->device,
                 split_capture_source_indices.size() * sizeof(uint32_t));
             std::memcpy(static_cast<uint8_t *>(capture_indices.buffer.contents) + capture_indices.offset,
                 split_capture_source_indices.data(), split_capture_source_indices.size() * sizeof(uint32_t));
             constexpr size_t vertex_bytes = sizeof(CapturedVertexOutputs);
             require(split_capture_source_indices.size() <= impl->device->native_device().maxBufferLength / vertex_bytes,
-                "Metal: two-sided depth capture exceeds maximum native buffer length");
+                "Metal: face-routed capture exceeds maximum native buffer length");
             split_captured_instances.reserve(instances);
             DepthKey capture_depth{};
             capture_depth[0] = MTLCompareFunctionAlways;
@@ -4045,7 +4126,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 id<MTLBuffer> captured = [impl->device->native_device()
                     newBufferWithLength:split_capture_source_indices.size() * vertex_bytes
                     options:MTLResourceStorageModeShared];
-                require(captured != nil, "Metal: two-sided depth capture buffer allocation failed");
+                require(captured != nil, "Metal: face-routed capture buffer allocation failed");
                 split_captured_instances.push_back(captured);
                 for (size_t ordinal = 0; ordinal < split_capture_source_indices.size(); ++ordinal) {
                     [encoder setVertexBuffer:captured offset:ordinal * vertex_bytes
@@ -4061,14 +4142,14 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 std::iota(converted_ordinals.begin(), converted_ordinals.end(), 0);
             }
             require(converted_ordinals.size() == native_count,
-                "Metal: two-sided depth occurrence remapping size mismatch");
+                "Metal: face-routed occurrence remapping size mismatch");
             const bool replay_depth_written = ctx.impl->depth_written;
             // A pass boundary makes all capture writes visible to the replay.
             finish(ctx);
             split_replay_indices = [impl->device->native_device()
                 newBufferWithBytes:converted_ordinals.data() length:converted_ordinals.size() * sizeof(uint32_t)
                 options:MTLResourceStorageModeShared];
-            require(split_replay_indices != nil, "Metal: two-sided depth replay index allocation failed");
+            require(split_replay_indices != nil, "Metal: face-routed replay index allocation failed");
             ctx.impl->commands = scene_command_buffer(*impl->device);
             begin_pass(ctx, record.is_maskupdate);
             encoder = ctx.impl->encoder;
@@ -4104,36 +4185,50 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             LOG_INFO("Metal vertex draw saved: {}",impl->dump_draw_dir.string());
         }
         const uint32_t visibility_entries = ctx.impl->visibility_stride / sizeof(uint32_t);
-        if (ctx.impl->visibility_enabled && ctx.impl->pass_visibility_buffer && visibility_entries) {
-            uint32_t query_index = ctx.impl->visibility_index;
-            if (query_index >= visibility_entries) {
-                LOG_WARN_ONCE("Metal: visibility index {} exceeds buffer entry count {}", query_index, visibility_entries);
-                query_index = 0;
-            }
-            if (!ctx.impl->pass_visibility_active || ctx.impl->pass_visibility_index != query_index
-                || ctx.impl->pass_visibility_increment != ctx.impl->visibility_increment) {
-                require(ctx.impl->pass_visibility_offset + sizeof(uint64_t) <= ctx.impl->pass_visibility_buffer.length,
-                    "Metal: visibility query capacity exhausted before batch submit");
-                const uint32_t offset = ctx.impl->pass_visibility_offset;
-                ctx.impl->pass_visibility_offset += sizeof(uint64_t);
-                [encoder setVisibilityResultMode:ctx.impl->visibility_increment
-                    ? MTLVisibilityResultModeCounting : MTLVisibilityResultModeBoolean offset:offset];
-                ctx.impl->visibility_results.push_back({ctx.impl->pass_visibility_buffer, offset,
-                    ctx.impl->visibility_address, query_index, ctx.impl->visibility_increment});
-                ctx.impl->pass_visibility_active = true;
-                ctx.impl->pass_visibility_index = query_index;
-                ctx.impl->pass_visibility_increment = ctx.impl->visibility_increment;
-            }
-        } else if (ctx.impl->pass_visibility_active) {
+        const uint64_t visibility_group = ctx.impl->visibility_address && visibility_faces_differ
+            ? ctx.impl->visibility_epoch : 0;
+        if (visibility_group && ctx.impl->pass_visibility_active) {
             [encoder setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
             ctx.impl->pass_visibility_active = false;
         }
+        const auto select_visibility = [&](bool front) {
+            const bool enabled = front ? ctx.impl->visibility_enabled : ctx.impl->back_visibility_enabled;
+            const uint32_t index = front ? ctx.impl->visibility_index : ctx.impl->back_visibility_index;
+            const bool increment = front ? ctx.impl->visibility_increment : ctx.impl->back_visibility_increment;
+            if (enabled && ctx.impl->pass_visibility_buffer && visibility_entries) {
+                uint32_t query_index = index;
+                if (query_index >= visibility_entries) {
+                    LOG_WARN_ONCE("Metal: visibility index {} exceeds buffer entry count {}", query_index, visibility_entries);
+                    query_index = 0;
+                }
+                if (!ctx.impl->pass_visibility_active || ctx.impl->pass_visibility_index != query_index
+                    || ctx.impl->pass_visibility_increment != increment) {
+                    require(ctx.impl->pass_visibility_offset + sizeof(uint64_t) <= ctx.impl->pass_visibility_buffer.length,
+                        "Metal: visibility query capacity exhausted before batch submit");
+                    const uint32_t offset = ctx.impl->pass_visibility_offset;
+                    ctx.impl->pass_visibility_offset += sizeof(uint64_t);
+                    [encoder setVisibilityResultMode:increment
+                        ? MTLVisibilityResultModeCounting : MTLVisibilityResultModeBoolean offset:offset];
+                    ctx.impl->visibility_results.push_back({ctx.impl->pass_visibility_buffer, offset,
+                        ctx.impl->visibility_address, query_index, increment, visibility_group});
+                    ctx.impl->pass_visibility_active = true;
+                    ctx.impl->pass_visibility_index = query_index;
+                    ctx.impl->pass_visibility_increment = increment;
+                }
+            } else if (ctx.impl->pass_visibility_active) {
+                [encoder setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
+                ctx.impl->pass_visibility_active = false;
+            }
+        };
+        if (!routed_geometry && !split_face_draw)
+            select_visibility(!cull_front);
         for (const auto &rect : clip) {
             [encoder setScissorRect:rect];
             const auto metal_index_type = index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
             if (routed_point_polygon) {
                 for (auto &polygon : routed_polygons) {
                     const bool front = polygon.face == PolygonFace::Front;
+                    select_visibility(front);
                     [encoder setDepthBias:(front || !two_sided) ? record.depth_bias_unit : record.back_depth_bias_unit
                         slopeScale:(front || !two_sided) ? record.depth_bias_slope : record.back_depth_bias_slope clamp:0];
                     // The capture shader supplies the front GXM width only when
@@ -4165,6 +4260,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             } else if (routed_wide_line) {
                 for (const auto &line : routed_lines) {
                     const bool front = line.face != PolygonFace::Back;
+                    select_visibility(front);
                     [encoder setDepthBias:(front || !two_sided) ? record.depth_bias_unit : record.back_depth_bias_unit
                         slopeScale:(front || !two_sided) ? record.depth_bias_slope : record.back_depth_bias_slope clamp:0];
                     fragment_info.base_block.point_replay_face = front ? 1.0f : -1.0f;
@@ -4179,30 +4275,32 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                         atIndex:shader::metal::VERTEX_STREAM_BUFFER_BASE];
                     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
                 }
-            } else if (split_face_depth) {
+            } else if (split_face_draw) {
                 // Keep guest instance and primitive order: depth and stencil
                 // writes from an earlier triangle affect every later triangle.
                 for (uint32_t instance = 0; instance < instances; ++instance) {
-                    if (capture_split_depth)
+                    if (capture_split_faces)
                         [encoder setVertexBuffer:split_captured_instances[instance] offset:0
                             atIndex:shader::metal::VERTEX_STREAM_BUFFER_BASE];
                     for (size_t first = 0; first < native_count; first += 3) {
-                        const auto offset = capture_split_depth ? first * sizeof(uint32_t)
+                        const auto offset = capture_split_faces ? first * sizeof(uint32_t)
                             : index_buffer.offset + first * index_size;
-                        id<MTLBuffer> draw_indices = capture_split_depth ? split_replay_indices : index_buffer.buffer;
-                        const auto draw_index_type = capture_split_depth ? MTLIndexTypeUInt32 : metal_index_type;
+                        id<MTLBuffer> draw_indices = capture_split_faces ? split_replay_indices : index_buffer.buffer;
+                        const auto draw_index_type = capture_split_faces ? MTLIndexTypeUInt32 : metal_index_type;
+                        select_visibility(true);
                         [encoder setDepthStencilState:front_depth_state];
                         [encoder setDepthBias:record.depth_bias_unit slopeScale:record.depth_bias_slope clamp:0];
                         [encoder setCullMode:MTLCullModeBack];
                         [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:3 indexType:draw_index_type
                             indexBuffer:draw_indices indexBufferOffset:offset instanceCount:1 baseVertex:0
-                            baseInstance:capture_split_depth ? 0 : instance];
+                            baseInstance:capture_split_faces ? 0 : instance];
+                        select_visibility(false);
                         [encoder setDepthStencilState:back_depth_state];
                         [encoder setDepthBias:record.back_depth_bias_unit slopeScale:record.back_depth_bias_slope clamp:0];
                         [encoder setCullMode:MTLCullModeFront];
                         [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:3 indexType:draw_index_type
                             indexBuffer:draw_indices indexBufferOffset:offset instanceCount:1 baseVertex:0
-                            baseInstance:capture_split_depth ? 0 : instance];
+                            baseInstance:capture_split_faces ? 0 : instance];
                     }
                 }
             } else {
