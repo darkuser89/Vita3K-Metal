@@ -28,6 +28,9 @@
 #include <util/float_to_half.h>
 #include <util/log.h>
 
+#define BCDEC_IMPLEMENTATION
+#include "bcdec.h"
+
 namespace renderer::texture {
 
 bool convert_base_texture_format_to_base_color_format(SceGxmTextureBaseFormat format, SceGxmColorBaseFormat &color_format) {
@@ -71,6 +74,9 @@ bool convert_base_texture_format_to_base_color_format(SceGxmTextureBaseFormat fo
 
 SceGxmTextureBaseFormat get_matching_decompressed_format(SceGxmTextureBaseFormat fmt) {
     switch (fmt) {
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC6H:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_SBC6H:
+        return SCE_GXM_TEXTURE_BASE_FORMAT_F16F16F16F16;
     case SCE_GXM_TEXTURE_BASE_FORMAT_UBC4:
         return SCE_GXM_TEXTURE_BASE_FORMAT_U8;
     case SCE_GXM_TEXTURE_BASE_FORMAT_SBC4:
@@ -119,6 +125,36 @@ void resolve_z_order_compressed_texture(SceGxmTextureBaseFormat fmt, void *dest,
 }
 
 uint32_t decompress_compressed_texture(SceGxmTextureBaseFormat fmt, void *dest, const void *data, const uint32_t width, const uint32_t height) {
+    if (fmt == SCE_GXM_TEXTURE_BASE_FORMAT_UBC6H || fmt == SCE_GXM_TEXTURE_BASE_FORMAT_SBC6H
+        || fmt == SCE_GXM_TEXTURE_BASE_FORMAT_UBC7) {
+        const auto *blocks = static_cast<const uint8_t *>(data);
+        const bool hdr = fmt != SCE_GXM_TEXTURE_BASE_FORMAT_UBC7;
+        for (uint32_t by = 0; by < (height + 3) / 4; ++by)
+            for (uint32_t bx = 0; bx < (width + 3) / 4; ++bx) {
+                const uint8_t *block = blocks + (size_t(by) * ((width + 3) / 4) + bx) * 16;
+                if (hdr) {
+                    uint16_t decoded[4 * 4 * 3];
+                    bcdec_bc6h_half(block, decoded, 4 * 3, fmt == SCE_GXM_TEXTURE_BASE_FORMAT_SBC6H);
+                    auto *output = static_cast<uint16_t *>(dest);
+                    for (uint32_t y = 0; y < 4 && by * 4 + y < height; ++y)
+                        for (uint32_t x = 0; x < 4 && bx * 4 + x < width; ++x) {
+                            const size_t pixel = (size_t(by * 4 + y) * width + bx * 4 + x) * 4;
+                            for (uint32_t channel = 0; channel < 3; ++channel)
+                                output[pixel + channel] = decoded[(y * 4 + x) * 3 + channel];
+                            output[pixel + 3] = 0x3c00; // BC6H has opaque alpha.
+                        }
+                } else {
+                    uint8_t decoded[4 * 4 * 4];
+                    bcdec_bc7(block, decoded, 4 * 4);
+                    auto *output = static_cast<uint8_t *>(dest);
+                    for (uint32_t y = 0; y < 4 && by * 4 + y < height; ++y)
+                        for (uint32_t x = 0; x < 4 && bx * 4 + x < width; ++x)
+                            std::memcpy(output + (size_t(by * 4 + y) * width + bx * 4 + x) * 4,
+                                decoded + (y * 4 + x) * 4, 4);
+                }
+            }
+        return get_compressed_size(fmt, width, height);
+    }
     uint8_t format_id = 0;
 
     switch (fmt) {

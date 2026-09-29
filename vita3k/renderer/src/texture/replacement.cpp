@@ -70,6 +70,9 @@ static bool software_bcn_format(SceGxmTextureBaseFormat format) {
     case SCE_GXM_TEXTURE_BASE_FORMAT_SBC4:
     case SCE_GXM_TEXTURE_BASE_FORMAT_UBC5:
     case SCE_GXM_TEXTURE_BASE_FORMAT_SBC5:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC6H:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_SBC6H:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC7:
         return true;
     default:
         return false;
@@ -601,9 +604,10 @@ void TextureCache::import_upload_texture() {
                     ? ((width + block_width - 1) / block_width) * block_width : align(width, block_width);
                 if (!support_dxt && support_dxt_software_import && software_bcn_format(current_info->format)) {
                     const auto decoded_format = texture::get_matching_decompressed_format(current_info->format);
-                    const uint32_t components = gxm::get_num_components(current_info->format);
+                    const uint32_t pixel_bytes = decoded_format == SCE_GXM_TEXTURE_BASE_FORMAT_F16F16F16F16 ? 8
+                        : gxm::get_num_components(decoded_format);
                     const uint32_t padded_height = align(height, 4);
-                    std::vector<uint8_t> decoded(size_t(upload_stride) * padded_height * components);
+                    std::vector<uint8_t> decoded(size_t(upload_stride) * padded_height * pixel_bytes);
                     texture::decompress_compressed_texture(current_info->format, decoded.data(), mip_data,
                         upload_stride, padded_height);
                     upload_texture_impl(decoded_format, width, height, mip, decoded.data(), is_cube + face, upload_stride);
