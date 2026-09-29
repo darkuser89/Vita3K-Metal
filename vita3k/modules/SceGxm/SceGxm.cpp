@@ -5293,8 +5293,17 @@ EXPORT(int, sceGxmTextureSetHeight, SceGxmTexture *texture, uint32_t height) {
     TRACY_FUNC(sceGxmTextureSetHeight, texture, height);
     if (!texture)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
-    if (height > 4096)
+    if (!height || height > 4096)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+
+    // SWIZZLED and CUBE encode dimensions as log2, unlike the other layouts.
+    if (texture->texture_type() == SCE_GXM_TEXTURE_SWIZZLED
+        || texture->texture_type() == SCE_GXM_TEXTURE_CUBE) {
+        if (!std::has_single_bit(height))
+            return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+        texture->height_base2 = std::countr_zero(height);
+        return 0;
+    }
 
     if ((texture->type << 29) == SCE_GXM_TEXTURE_TILED) {
         if (texture->mip_count > 1) {
@@ -5305,16 +5314,12 @@ EXPORT(int, sceGxmTextureSetHeight, SceGxmTexture *texture, uint32_t height) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
     }
 
-    if (((texture->type << 29) != SCE_GXM_TEXTURE_SWIZZLED) && ((texture->type << 29) != SCE_GXM_TEXTURE_TILED)) {
+    if ((texture->type << 29) != SCE_GXM_TEXTURE_TILED) {
     LINEAR:
         texture->height = height - 1;
         return 0;
     }
-
-    // TODO: Add support for swizzled textures
-    LOG_WARN("Unimplemented texture format detected in sceGxmTextureSetHeight call.");
-
-    return 0;
+    return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
 }
 
 EXPORT(int, _sceGxmTextureSetHeight, SceGxmTexture *texture, uint32_t height) {
@@ -5522,8 +5527,16 @@ EXPORT(int, sceGxmTextureSetWidth, SceGxmTexture *texture, uint32_t width) {
     TRACY_FUNC(sceGxmTextureSetWidth, texture, width);
     if (!texture) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
-    } else if (width > 4096) {
+    } else if (!width || width > 4096) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+    }
+
+    if (texture->texture_type() == SCE_GXM_TEXTURE_SWIZZLED
+        || texture->texture_type() == SCE_GXM_TEXTURE_CUBE) {
+        if (!std::has_single_bit(width))
+            return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+        texture->width_base2 = std::countr_zero(width);
+        return 0;
     }
 
     if ((texture->type << 29) == SCE_GXM_TEXTURE_TILED) {
@@ -5535,16 +5548,12 @@ EXPORT(int, sceGxmTextureSetWidth, SceGxmTexture *texture, uint32_t width) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
     }
 
-    if (((texture->type << 29) != SCE_GXM_TEXTURE_SWIZZLED) && ((texture->type << 29) != SCE_GXM_TEXTURE_TILED)) {
+    if ((texture->type << 29) != SCE_GXM_TEXTURE_TILED) {
     LINEAR:
         texture->width = width - 1;
         return 0;
     }
-
-    // TODO: Add support for swizzled textures
-    LOG_WARN("Unimplemented texture format detected in sceGxmTextureSetWidth call.");
-
-    return 0;
+    return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
 }
 
 EXPORT(int, _sceGxmTextureSetWidth, SceGxmTexture *texture, uint32_t width) {
