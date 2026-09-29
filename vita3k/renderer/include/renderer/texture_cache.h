@@ -142,8 +142,11 @@ public:
     // hash of the textures that have already been exported
     unordered_set_fast<uint64_t> exported_textures_hash;
 
-    // smartphone GPUs do not support DXT (BC1/2/3/4/5) textures, they must be decompressed on the GPU
+    // Devices without BC texture support use the shared CPU decoder for guest textures.
     bool support_dxt = false;
+    // A backend may import BC1-BC5 DDS files through the shared CPU decoder
+    // when the device cannot create BC textures.
+    bool support_dxt_software_import = false;
     // format for replaced texture, supported mostly by smartphone GPUs
     bool support_astc = false;
     // some smartphone GPUs do not support linear filtering on depth surfaces

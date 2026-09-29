@@ -1763,6 +1763,7 @@ struct MetalTextureCache::Impl {
 };
 MetalTextureCache::MetalTextureCache(MetalState &state) : impl(std::make_unique<Impl>(state)) {
     support_e5rgb9 = true;
+    support_dxt_software_import = true;
 }
 MetalTextureCache::~MetalTextureCache() = default;
 void MetalTextureCache::cache_and_bind_image(const SceGxmTexture &texture, MemState &mem) {

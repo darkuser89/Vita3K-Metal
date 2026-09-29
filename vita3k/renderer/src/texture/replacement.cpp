@@ -61,6 +61,21 @@ static void reverse_comp3_order(const void *src, void *dst, uint32_t nb_pixels);
 // some dds format are encoded in a bgra way, in this case the swizzle must be changed
 static bool dds_swap_rb(const ddspp::DXGIFormat format);
 
+static bool software_bcn_format(SceGxmTextureBaseFormat format) {
+    switch (format) {
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC1:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC2:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC3:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC4:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_SBC4:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC5:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_SBC5:
+        return true;
+    default:
+        return false;
+    }
+}
+
 void TextureCache::set_replacement_state(bool import_textures, bool export_textures, bool export_as_png) {
     if (this->import_textures == import_textures
         && this->export_textures == export_textures
@@ -509,7 +524,8 @@ bool TextureCache::import_configure_texture() {
             return false;
         }
 
-        if (gxm::is_bcn_format(base_format) && !support_dxt) {
+        if (gxm::is_bcn_format(base_format) && !support_dxt
+            && !(support_dxt_software_import && software_bcn_format(base_format))) {
             LOG_ERROR_ONCE("BCn textures are not supported by this device");
 #ifdef __ANDROID__
             // this issue is most likely to happen on android
@@ -583,7 +599,17 @@ void TextureCache::import_upload_texture() {
                 // dds textures are tightly packed (up to the block size)
                 const uint32_t upload_stride = texture::is_astc_format(current_info->format)
                     ? ((width + block_width - 1) / block_width) * block_width : align(width, block_width);
-                upload_texture_impl(current_info->format, width, height, mip, mip_data, is_cube + face, upload_stride);
+                if (!support_dxt && support_dxt_software_import && software_bcn_format(current_info->format)) {
+                    const auto decoded_format = texture::get_matching_decompressed_format(current_info->format);
+                    const uint32_t components = gxm::get_num_components(current_info->format);
+                    const uint32_t padded_height = align(height, 4);
+                    std::vector<uint8_t> decoded(size_t(upload_stride) * padded_height * components);
+                    texture::decompress_compressed_texture(current_info->format, decoded.data(), mip_data,
+                        upload_stride, padded_height);
+                    upload_texture_impl(decoded_format, width, height, mip, decoded.data(), is_cube + face, upload_stride);
+                } else {
+                    upload_texture_impl(current_info->format, width, height, mip, mip_data, is_cube + face, upload_stride);
+                }
 
                 // on to the next mip
                 width /= 2;
