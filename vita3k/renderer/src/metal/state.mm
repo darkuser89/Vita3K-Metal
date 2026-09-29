@@ -3616,7 +3616,30 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             // surface through the reconstructed guest grid.
             mip_info.control[1]=sampler_metadata_flags(texture);
             mip_info.control[2]=effective_sampler_anisotropy(texture,texture_cache.anisotropic_filtering);
-            auto sampling = make_sampler(*impl->device, texture, texture_cache.anisotropic_filtering);
+            const bool software_float_filter = !impl->device->native_device().supports32BitFloatFiltering
+                && native.textureType == MTLTextureType2D
+                && (native.pixelFormat == MTLPixelFormatR32Float
+                    || native.pixelFormat == MTLPixelFormatRG32Float
+                    || native.pixelFormat == MTLPixelFormatRGBA32Float);
+            auto sampling_texture = texture;
+            if (software_float_filter) {
+                // Apple7/8 can read 32-bit float textures but cannot filter
+                // them. The existing native-mip shader path reads texels and
+                // applies the guest's min/mag/mip filters in float precision.
+                // Keep a point sampler for LOD queries and Metal validation.
+                mip_info.control[0] = 1;
+                mip_info.control[2] = 1;
+                for (uint32_t mip=0;mip<native.mipmapLevelCount && mip<mip_info.sizes.size();++mip)
+                    if (!mip_info.sizes[mip][0] || !mip_info.sizes[mip][1])
+                        mip_info.sizes[mip] = {std::max(1u,uint32_t(native.width>>mip)),
+                            std::max(1u,uint32_t(native.height>>mip))};
+                sampling_texture.mag_filter = SCE_GXM_TEXTURE_FILTER_POINT;
+                if (texture.texture_type() != SCE_GXM_TEXTURE_LINEAR_STRIDED)
+                    sampling_texture.min_filter = SCE_GXM_TEXTURE_FILTER_POINT;
+                sampling_texture.mip_filter = 0;
+            }
+            auto sampling = make_sampler(*impl->device, sampling_texture,
+                software_float_filter ? 1 : texture_cache.anisotropic_filtering);
             if (vertex) { [encoder setVertexTexture:native atIndex:slot]; [encoder setVertexSamplerState:sampling atIndex:slot]; }
             else {
                 [encoder setFragmentTexture:native atIndex:slot];
