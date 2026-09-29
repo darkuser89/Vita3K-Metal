@@ -73,19 +73,15 @@ static int SDLCALL thread_function(void *data) {
 
     thread->run_loop();
     const uint32_t r0 = read_reg(*thread->cpu, 0);
-
-    {
-        std::lock_guard<std::mutex> lock(params.kernel->mutex);
-        params.kernel->threads.erase(thread->id);
-        params.kernel->corenum_allocator.free_corenum(get_processor_id(*thread->cpu));
-    }
-
-    // Erasing the guest ID is not a host-thread completion barrier: this last
-    // reference can still release guest stack/TLS allocations. Finish that
-    // cleanup before allowing process_exit() to tear down or reset guest RAM.
+    const SceUID id = thread->id;
+    const int processor_id = get_processor_id(*thread->cpu);
+    // release our reference first so the erase below destroys the ThreadState before process_exit() is woken
     thread.reset();
+
     {
         std::lock_guard<std::mutex> lock(params.kernel->mutex);
+        params.kernel->threads.erase(id);
+        params.kernel->corenum_allocator.free_corenum(processor_id);
         --params.kernel->active_host_threads;
         params.kernel->thread_deleted_cond.notify_all();
     }

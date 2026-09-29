@@ -103,8 +103,9 @@ COMMAND(handle_destroy_context) {
     if (renderer.current_backend == Backend::Metal && *ctx)
         static_cast<metal::MetalState &>(renderer).finish(static_cast<metal::MetalContext &>(**ctx));
 #endif
+    if (renderer.context == ctx->get())
+        renderer.context = nullptr;
     ctx->reset();
-    renderer.context = nullptr;
 
     complete_command(renderer, helper, 0);
 }
