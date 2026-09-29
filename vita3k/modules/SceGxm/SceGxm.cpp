@@ -1602,7 +1602,10 @@ static void gxmContextStateRestore(renderer::State &state, SceGxmContext *contex
     renderer::set_stencil_ref(state, context->renderer.get(), true, context->state.front_stencil.ref);
     renderer::set_stencil_ref(state, context->renderer.get(), false, context->state.back_stencil.ref);
 
-    if (state.features.enable_memory_mapping || state.current_backend == renderer::Backend::Metal) {
+    if (state.current_backend == renderer::Backend::Metal) {
+        renderer::set_visibility_index(state, context->renderer.get(), context->state.visibility_enable,
+            context->state.visibility_index, context->state.visibility_is_increment);
+    } else if (state.features.enable_memory_mapping) {
         context->state.visibility_enable = false;
         context->state.visibility_index = 0;
         context->state.visibility_is_increment = true;
