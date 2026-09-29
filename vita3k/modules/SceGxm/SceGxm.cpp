@@ -1810,8 +1810,7 @@ EXPORT(Ptr<void>, sceGxmColorSurfaceGetData, const SceGxmColorSurface *surface) 
 EXPORT(SceGxmColorSurfaceDitherMode, sceGxmColorSurfaceGetDitherMode, const SceGxmColorSurface *surface) {
     TRACY_FUNC(sceGxmColorSurfaceGetDitherMode, surface);
     assert(surface);
-    STUBBED("SCE_GXM_COLOR_SURFACE_DITHER_DISABLED");
-    return SceGxmColorSurfaceDitherMode::SCE_GXM_COLOR_SURFACE_DITHER_DISABLED;
+    return surface->dither_enabled ? SCE_GXM_COLOR_SURFACE_DITHER_ENABLED : SCE_GXM_COLOR_SURFACE_DITHER_DISABLED;
 }
 
 EXPORT(SceGxmColorFormat, sceGxmColorSurfaceGetFormat, const SceGxmColorSurface *surface) {
@@ -1940,7 +1939,12 @@ EXPORT(int, sceGxmColorSurfaceSetDitherMode, SceGxmColorSurface *surface, SceGxm
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
     }
 
-    return UNIMPLEMENTED();
+    if (ditherMode != SCE_GXM_COLOR_SURFACE_DITHER_DISABLED && ditherMode != SCE_GXM_COLOR_SURFACE_DITHER_ENABLED) {
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+    }
+
+    surface->dither_enabled = ditherMode == SCE_GXM_COLOR_SURFACE_DITHER_ENABLED;
+    return 0;
 }
 
 EXPORT(int, sceGxmColorSurfaceSetFormat, SceGxmColorSurface *surface, SceGxmColorFormat format) {
