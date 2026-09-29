@@ -16,7 +16,9 @@ struct RenderVertUniformBlock {
     float screen_height;
     float z_offset;
     float z_scale;
+    float point_size;
 };
+static_assert(sizeof(RenderVertUniformBlock) == 40);
 
 // used internally to identify the field by the shader recompiler
 // it is put next to the RenderVertUniformBlock so we don't forget to update both fields every time
@@ -26,7 +28,8 @@ enum VertUniformFieldId : uint32_t {
     VERT_UNIFORM_screen_width,
     VERT_UNIFORM_screen_height,
     VERT_UNIFORM_z_offset,
-    VERT_UNIFORM_z_scale
+    VERT_UNIFORM_z_scale,
+    VERT_UNIFORM_point_size
 };
 
 struct RenderFragUniformBlock {
@@ -34,7 +37,13 @@ struct RenderFragUniformBlock {
     float front_disabled;
     float writing_mask;
     float use_raw_image;
+    // Native-to-guest fragment-coordinate scale for X and Y, respectively.
     float res_multiplier;
+    // Zero uses native front-facing; +1/-1 selects the original polygon face
+    // when a clipped polygon is replayed as Metal point primitives.
+    float point_replay_face;
+    float res_multiplier_y;
+    uint32_t frag_coord_samples;
 };
 
 enum FragUniformFieldId : uint32_t {
@@ -42,7 +51,10 @@ enum FragUniformFieldId : uint32_t {
     FRAG_UNIFORM_front_disabled,
     FRAG_UNIFORM_writing_mask,
     FRAG_UNIFORM_use_raw_image,
-    FRAG_UNIFORM_res_multiplier
+    FRAG_UNIFORM_res_multiplier,
+    FRAG_UNIFORM_point_replay_face,
+    FRAG_UNIFORM_res_multiplier_y,
+    FRAG_UNIFORM_frag_coord_samples
 };
 
 template <typename T>

@@ -11,12 +11,38 @@ struct SceGxmColorSurface;
 struct SceGxmDepthStencilSurface;
 
 namespace renderer::metal {
+inline uint32_t packed_10_native_word(uint32_t guest, uint32_t mode) {
+    if (mode == 0) return guest;
+    if (mode == 1) return (guest & 0xc00ffc00u)
+        | ((guest & 0x000003ffu) << 20) | ((guest & 0x3ff00000u) >> 20);
+    const uint32_t first = (guest >> 2) & 0x3ff;
+    const uint32_t green = (guest >> 12) & 0x3ff;
+    const uint32_t third = (guest >> 22) & 0x3ff;
+    return (mode == 2 ? first : third) | (green << 10)
+        | ((mode == 2 ? third : first) << 20) | ((guest & 3) << 30);
+}
 // Linear-strided descriptors reuse LOD bits for stride and have no LOD bias.
 inline float sampler_lod_bias(const SceGxmTexture &texture) {
     return texture.texture_type() == SCE_GXM_TEXTURE_LINEAR_STRIDED ? 0.f : (float(texture.lod_bias) - 31.f) / 8.f;
 }
+inline uint32_t sampler_metadata_flags(const SceGxmTexture &texture) {
+    const auto linear=[](uint32_t filter) {
+        return filter==SCE_GXM_TEXTURE_FILTER_LINEAR || filter==SCE_GXM_TEXTURE_FILTER_MIPMAP_LINEAR;
+    };
+    const bool strided=texture.texture_type()==SCE_GXM_TEXTURE_LINEAR_STRIDED;
+    return uint32_t(linear(strided ? texture.mag_filter : texture.min_filter))
+        |(uint32_t(linear(texture.mag_filter))<<1)
+        |((strided ? 0u : texture.mip_filter)<<2)
+        |(texture.uaddr_mode<<3)|(texture.vaddr_mode<<6)
+        |((strided ? 0u : (texture.lod_min0|(texture.lod_min1<<2)))<<9);
+}
 class Device;
 struct MetalTextureCache;
+struct ImportedTextureView {
+    SceGxmTextureBaseFormat base_format{};
+    uint16_t components = 0;
+    bool active = false, swap_rb = false;
+};
 struct CubeSurface {
     id<MTLTexture> texture;
     uint32_t face, mip;
@@ -31,6 +57,7 @@ std::optional<SurfaceRect> depth_subrectangle(const SceGxmDepthStencilSurface &,
 bool depth_texture_matches(const SceGxmDepthStencilSurface &, uint32_t width, uint32_t height,
     SceGxmMultisampleMode, const SceGxmTexture &);
 id<MTLTexture> current_texture(const MetalTextureCache &cache);
+id<MTLTexture> current_texture_view(const MetalTextureCache &cache, SceGxmTextureFormat format);
 struct DepthMemoryLayout {
     uint32_t width, height, stride, depth_bytes;
     size_t depth_size, stencil_size;
@@ -38,60 +65,92 @@ struct DepthMemoryLayout {
 };
 std::optional<DepthMemoryLayout> depth_memory_layout(const SceGxmDepthStencilSurface &, uint32_t width, uint32_t height,
     SceGxmMultisampleMode);
+struct DepthStoreReadback {
+    id<MTLBuffer> depth = nil;
+    id<MTLBuffer> mask = nil;
+};
 class SurfaceCaster {
     Device &device;
     std::map<uint32_t,id<MTLRenderPipelineState>> depth_seed_pipelines;
+    std::map<uint32_t,id<MTLRenderPipelineState>> mask_seed_pipelines;
     id<MTLComputePipelineState> depth_store_pipeline, depth_store_ms_pipeline;
-    id<MTLBuffer> depth_store_buffer;
+    id<MTLComputePipelineState> mask_store_pipeline, mask_store_ms_pipeline;
+    id<MTLBuffer> depth_store_buffer, mask_store_buffer;
     id<MTLComputePipelineState> pipeline;
     id<MTLComputePipelineState> cube_pipeline, component_cast_pipeline;
-    id<MTLComputePipelineState> depth_pipeline, rg_gamma_pipeline;
+    id<MTLComputePipelineState> depth_pipeline, stencil_pipeline, stencil_ms_pipeline, rg_gamma_pipeline;
     id<MTLComputePipelineState> multisample_pipeline, multisample_depth_pipeline;
     id<MTLComputePipelineState> multisample_integer_pipeline;
     id<MTLLibrary> multisample_library;
     std::map<std::pair<uint32_t,uint32_t>,id<MTLRenderPipelineState>> seed_pipelines;
 public:
     explicit SurfaceCaster(Device &device);
-    id<MTLTexture> rgba8_from_rg32(id<MTLTexture> source, uint32_t scale, bool swap_words,
-        uint32_t word_offset = 0, bool signed_normalized = false);
-    bool load_depth_memory(id<MTLTexture>, const SceGxmDepthStencilSurface &, const DepthMemoryLayout &, uint32_t scale,
-        std::span<const uint8_t> depth, std::span<const uint8_t> stencil);
-    bool store_depth_memory(id<MTLTexture>, const SceGxmDepthStencilSurface &, const DepthMemoryLayout &, uint32_t scale,
+    id<MTLTexture> rgba8_from_rg32(id<MTLTexture> source, bool swap_words,
+        uint32_t word_offset = 0, bool signed_normalized = false,
+        uint32_t guest_width = 0, uint32_t guest_height = 0,
+        id<MTLCommandBuffer> pending_commands = nil);
+    bool load_depth_memory(id<MTLTexture>, const SceGxmDepthStencilSurface &, const DepthMemoryLayout &, float scale,
+        std::span<const uint8_t> depth, std::span<const uint8_t> stencil,
+        id<MTLCommandBuffer> commands = nil);
+    bool load_mask_memory(id<MTLTexture>, const SceGxmDepthStencilSurface &, const DepthMemoryLayout &, float scale,
+        std::span<const uint8_t> depth, id<MTLCommandBuffer> commands = nil);
+    bool store_depth_memory(id<MTLTexture>, const SceGxmDepthStencilSurface &, const DepthMemoryLayout &, float scale,
+        std::span<uint8_t> depth, std::span<uint8_t> stencil, id<MTLTexture> mask = nil);
+    bool enqueue_depth_store(id<MTLTexture>, const SceGxmDepthStencilSurface &, const DepthMemoryLayout &, float scale,
+        size_t depth_size, size_t stencil_size, id<MTLTexture> mask, id<MTLCommandBuffer>, DepthStoreReadback &);
+    void finish_depth_store(const DepthStoreReadback &, const SceGxmDepthStencilSurface &, const DepthMemoryLayout &,
         std::span<uint8_t> depth, std::span<uint8_t> stencil);
-    id<MTLTexture> depth_snapshot(id<MTLTexture> source, bool normalized16 = false, uint32_t scale = 1);
+    id<MTLTexture> depth_snapshot(id<MTLTexture> source, bool normalized16 = false, float scale = 1,
+        uint32_t guest_width = 0, uint32_t guest_height = 0, bool wait_for_completion = true,
+        id<MTLCommandBuffer> pending_commands = nil);
+    id<MTLTexture> stencil_snapshot(id<MTLTexture> source, bool signed_normalized, float scale = 1,
+        uint32_t guest_width = 0, uint32_t guest_height = 0, bool wait_for_completion = true,
+        id<MTLCommandBuffer> pending_commands = nil);
     // Native sample IDs in a 1x2 (2X) or 2x2 (4X) image. Each guest sample
-    // occupies a scale-by-scale block when rendering at higher resolution.
-    void expand_multisample(id<MTLTexture> source, id<MTLTexture> destination, uint32_t scale);
-    void seed_multisample(id<MTLTexture> source, id<MTLTexture> destination, uint32_t scale, bool expanded);
-    bool patch_multisample(id<MTLTexture> texture, const SceGxmColorSurface &, uint32_t scale,
+    // maps to the native extent using the actual guest and render dimensions.
+    void expand_multisample(id<MTLTexture> source, id<MTLTexture> destination, float scale,
+        uint32_t guest_width = 0, uint32_t guest_height = 0, id<MTLCommandBuffer> pending_commands = nil);
+    void seed_multisample(id<MTLTexture> source, id<MTLTexture> destination, float scale, bool expanded,
+        uint32_t guest_width = 0, uint32_t guest_height = 0);
+    bool patch_multisample(id<MTLTexture> texture, const SceGxmColorSurface &, float scale,
         std::span<const uint8_t> source, std::span<const SurfaceMemoryRange> ranges);
     // Diagnostic canonical RGBA values after the texture view's swizzle.
     // Returns nil for integer/unsupported formats; caller must complete producers.
     id<MTLTexture> sampling_snapshot(id<MTLTexture> source, uint32_t mip = 0, uint32_t face = 0);
     // Repack equal-sized guest pixels using integer views, preserving every
     // native pixel and floating payload. Returns nil for unsupported layouts.
-    id<MTLTexture> surface_format_cast(id<MTLTexture> source, SceGxmColorFormat, SceGxmTextureBaseFormat);
+    id<MTLTexture> surface_format_cast(id<MTLTexture> source, SceGxmColorFormat, SceGxmTextureBaseFormat,
+        uint32_t texture_swizzle = UINT32_MAX, id<MTLCommandBuffer> pending_commands = nil);
     id<MTLTexture> rgba8_memory_snapshot(id<MTLTexture> source, SceGxmColorFormat);
     // Convert encoded guest channels before filtering or texture swizzling.
     // Gamma 0: linear bytes, 1: sRGB RGB, 3: sRGB RG with unchanged BA.
-    id<MTLTexture> rgba8_surface_sampling(id<MTLTexture> source, SceGxmColorFormat, uint32_t gamma);
-    id<MTLTexture> color_snapshot(id<MTLTexture> source);
+    id<MTLTexture> rgba8_surface_sampling(id<MTLTexture> source, SceGxmColorFormat, uint32_t gamma,
+        id<MTLCommandBuffer> pending_commands = nil);
+    id<MTLTexture> color_snapshot(id<MTLTexture> source, id<MTLCommandBuffer> pending_commands = nil);
     // Inputs already have their guest channel/gamma sampling views applied.
     // Assemble all levels of a 2D image or cube from RAM uploads and rendered subresources.
-    id<MTLTexture> texture_snapshot(id<MTLTexture> uploaded, std::span<const CubeSurface> surfaces, uint32_t scale);
-    id<MTLTexture> cube_snapshot(id<MTLTexture> uploaded, std::span<const CubeSurface> surfaces, uint32_t scale);
+    id<MTLTexture> texture_snapshot(id<MTLTexture> uploaded, std::span<const CubeSurface> surfaces, float scale,
+        id<MTLCommandBuffer> pending_commands = nil);
+    id<MTLTexture> cube_snapshot(id<MTLTexture> uploaded, std::span<const CubeSurface> surfaces, float scale,
+        id<MTLCommandBuffer> pending_commands = nil);
     id<MTLTexture> snapshot_subrectangle(id<MTLTexture> source, uint32_t width, uint32_t height, SurfaceRect);
+    id<MTLTexture> enqueue_subrectangle(id<MTLTexture> source, uint32_t width, uint32_t height,
+        SurfaceRect, id<MTLCommandBuffer> commands);
     id<MTLTexture> color_subrectangle(id<MTLTexture> source, const SceGxmColorSurface &, SurfaceRect);
 };
 // Uploaded textures contain guest memory channels. Rendered surfaces instead
 // contain logical shader RGBA; undo their color swizzle before sampling them.
 id<MTLTexture> sampling_view(id<MTLTexture> texture, SceGxmTextureFormat format,
-    const SceGxmColorFormat *rendered_format = nullptr);
+    const SceGxmColorFormat *rendered_format = nullptr,
+    const ImportedTextureView *imported = nullptr);
 id<MTLTexture> rgba8_gamma_view(id<MTLTexture> texture, bool srgb);
 // Effective hardware setting after point-filter and strided-descriptor rules.
 uint32_t effective_sampler_anisotropy(const SceGxmTexture &texture, uint32_t requested);
 id<MTLSamplerState> make_sampler(Device &device, const SceGxmTexture &texture, uint32_t anisotropy);
-bool surface_format_cast_supported(SceGxmColorFormat, SceGxmTextureBaseFormat);
+bool surface_format_cast_supported(SceGxmColorFormat, SceGxmTextureBaseFormat,
+    uint32_t texture_swizzle = UINT32_MAX);
+bool surface_format_cast_enqueueable(SceGxmColorFormat, SceGxmTextureBaseFormat,
+    uint32_t texture_swizzle = UINT32_MAX);
 float packed_alias_x_offset(float scale, uint32_t native_alias_width);
 // GPU work must be complete before reading. Preserves guest row/tile padding
 // and copies raw component bits, including floating-point NaN payloads.

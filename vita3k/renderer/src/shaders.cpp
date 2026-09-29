@@ -33,27 +33,54 @@ namespace renderer {
 
 bool get_shaders_cache_hashs(State &renderer) {
     const std::string hash_file_name = fmt::format("hashs-{}.dat", (renderer.current_backend == Backend::OpenGL) ? "gl" : (renderer.current_backend == Backend::Metal ? "metal" : "vk"));
-
-    fs::ifstream shaders_hashs(renderer.shaders_path / hash_file_name, std::ios::in | std::ios::binary);
+    const auto hash_path = renderer.shaders_path / hash_file_name;
+    fs::ifstream shaders_hashs(hash_path, std::ios::in | std::ios::binary);
     if (!shaders_hashs.is_open())
         return false;
 
     renderer.shaders_cache_hashs.clear();
+    constexpr uintmax_t header_bytes = sizeof(size_t) + 2 * sizeof(uint32_t);
+    constexpr uintmax_t pair_bytes = 2 * sizeof(Sha256Hash);
+    constexpr size_t max_hash_pairs = 1'000'000;
+    boost::system::error_code size_error;
+    const auto file_bytes = fs::file_size(hash_path, size_error);
+    if (size_error || file_bytes < header_bytes) {
+        LOG_WARN("Shader hash cache has an incomplete header: {}", hash_path.string());
+        return false;
+    }
     // Read size of hashes list
-    size_t size;
-    shaders_hashs.read((char *)&size, sizeof(size));
+    size_t size = 0;
+    if (!shaders_hashs.read(reinterpret_cast<char *>(&size), sizeof(size))
+        || size > max_hash_pairs || size != (file_bytes - header_bytes) / pair_bytes
+        || file_bytes - header_bytes != uintmax_t(size) * pair_bytes) {
+        LOG_WARN("Shader hash cache has an invalid entry count: {}", hash_path.string());
+        return false;
+    }
 
     // Check version of cache
-    uint32_t versionInFile;
-    shaders_hashs.read((char *)&versionInFile, sizeof(uint32_t));
-    uint32_t features_mask;
-    shaders_hashs.read((char *)&features_mask, sizeof(uint32_t));
+    uint32_t versionInFile = 0;
+    uint32_t features_mask = 0;
+    if (!shaders_hashs.read(reinterpret_cast<char *>(&versionInFile), sizeof(versionInFile))
+        || !shaders_hashs.read(reinterpret_cast<char *>(&features_mask), sizeof(features_mask))) {
+        LOG_WARN("Shader hash cache has an incomplete version header: {}", hash_path.string());
+        return false;
+    }
     if (versionInFile != shader::CURRENT_VERSION || features_mask != renderer.get_features_mask()) {
         shaders_hashs.close();
-        fs::remove_all(renderer.shaders_path);
-        fs::remove_all(renderer.shaders_log_path);
+        if (renderer.current_backend == Backend::Metal) {
+            // Metal opens its device-scoped native cache in set_app before the
+            // launch path reads this shared index. Its complete variant keys
+            // already include the feature mask, so discard only the stale
+            // hash list and leave the live native cache directory intact.
+            fs::remove(hash_path);
+        } else {
+            fs::remove_all(renderer.shaders_path);
+            fs::remove_all(renderer.shaders_log_path);
+        }
         if (versionInFile != shader::CURRENT_VERSION)
-            LOG_WARN("Current version of cache: {}, is outdated, recreate it.", versionInFile);
+            LOG_WARN("Current version of shader hash index: {}, is outdated.", versionInFile);
+        else if (renderer.current_backend == Backend::Metal)
+            LOG_WARN("Incompatible Metal shader features enabled; recreating shader hash index");
         else
             LOG_WARN("Incompatible GPU features enabled, recreating shader cache");
         return false;
@@ -68,9 +95,7 @@ bool get_shaders_cache_hashs(State &renderer) {
     for (size_t a = 0; a < size; a++) {
         auto read = [&shaders_hashs]() {
             Sha256Hash hash;
-
             shaders_hashs.read(reinterpret_cast<char *>(hash.data()), sizeof(Sha256Hash));
-
             return hash;
         };
 
@@ -78,6 +103,11 @@ bool get_shaders_cache_hashs(State &renderer) {
         hash.frag = read();
         hash.vert = read();
 
+        if (!shaders_hashs) {
+            renderer.shaders_cache_hashs.clear();
+            LOG_WARN("Shader hash cache ended before all entries were read: {}", hash_path.string());
+            return false;
+        }
         renderer.shaders_cache_hashs.push_back({ hash.frag, hash.vert });
     }
 
@@ -157,9 +187,8 @@ static R load_shader_generic(const fs::path &shader_path) {
     return source;
 }
 
-static shader::GeneratedShader load_shader_generic(shader::Target target, const SceGxmProgram &program, const FeatureState &features, const shader::Hints &hints, bool maskupdate, const fs::path &shader_cache_path, const fs::path &shaderlog_path, const char *shader_type_str, const std::string &shader_version, bool shader_cache) {
-    // TODO: no need to recompute the hash here
-    const std::string hash_text = hex_string(get_shader_hash(program));
+static shader::GeneratedShader load_shader_generic(shader::Target target, const SceGxmProgram &program, const FeatureState &features, const shader::Hints &hints, bool maskupdate, const fs::path &shader_cache_path, const fs::path &shaderlog_path, const char *shader_type_str, const std::string &shader_version, bool shader_cache, const Sha256Hash *cache_hash = nullptr) {
+    const std::string hash_text = hex_string(cache_hash ? *cache_hash : get_shader_hash(program));
     // Set Shader Hash with Version
     const std::string hash_hex_ver = fmt::format("{}-{}", shader_version, hash_text);
     const auto get_shader_path = [&](const char *ext) {
@@ -229,14 +258,14 @@ std::string load_glsl_shader(const SceGxmProgram &program, const FeatureState &f
     return load_shader_generic(shader::Target::GLSLOpenGL, program, features, hints, maskupdate, shader_cache_path, shader_log_path, shader_type_str, shader_version, shader_cache).glsl;
 }
 
-std::vector<uint32_t> load_spirv_shader(const SceGxmProgram &program, const FeatureState &features, bool is_vulkan, const shader::Hints &hints, bool maskupdate, const fs::path &shader_cache_path, const fs::path &shader_log_path, const std::string &shader_version, bool shader_cache) {
+std::vector<uint32_t> load_spirv_shader(const SceGxmProgram &program, const FeatureState &features, bool is_vulkan, const shader::Hints &hints, bool maskupdate, const fs::path &shader_cache_path, const fs::path &shader_log_path, const std::string &shader_version, bool shader_cache, const Sha256Hash *cache_hash) {
     const shader::Target target = is_vulkan ? shader::Target::SpirVVulkan : shader::Target::SpirVOpenGL;
     auto shader_type_to_str = [](SceGxmProgramType type) {
         return (type == SceGxmProgramType::Vertex) ? "vert.spv.txt" : ((type == SceGxmProgramType::Fragment) ? "frag.spv.txt" : "unknown.spv.txt");
     };
     const char *shader_type_str = shader_type_to_str(program.get_type());
 
-    return load_shader_generic(target, program, features, hints, maskupdate, shader_cache_path, shader_log_path, shader_type_str, shader_version, shader_cache).spirv;
+    return load_shader_generic(target, program, features, hints, maskupdate, shader_cache_path, shader_log_path, shader_type_str, shader_version, shader_cache, cache_hash).spirv;
 }
 
 std::string pre_load_shader_glsl(const fs::path &shader_path) {

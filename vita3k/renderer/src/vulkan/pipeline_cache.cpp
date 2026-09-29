@@ -41,6 +41,40 @@ namespace renderer::vulkan {
 // Size of the record containing what is needed for the pipeline construction (what is after is dynamic state)
 constexpr size_t record_pipeline_len = offsetof(GxmRecordState, vertex_streams);
 
+// Texture formats and vertex attribute hints affect SPIR-V generation. Keep
+// their variants separate in both the live shader map and the disk cache.
+static Sha256Hash shader_variant_hash(const SceGxmProgram &program, const Sha256Hash &program_hash, const shader::Hints &hints,
+    bool is_vertex, bool maskupdate, uint32_t feature_mask) {
+    std::vector<uint8_t> bytes(program_hash.begin(), program_hash.end());
+    const auto append = [&bytes](const auto &value) {
+        const auto *data = reinterpret_cast<const uint8_t *>(&value);
+        bytes.insert(bytes.end(), data, data + sizeof(value));
+    };
+    append(feature_mask);
+    append(uint32_t(is_vertex));
+    append(uint32_t(maskupdate));
+    append(uint32_t(hints.color_format));
+    const auto *textures = is_vertex ? hints.vertex_textures : hints.fragment_textures;
+    const auto used_textures = gxp::get_textures_used(program);
+    for (uint32_t i = 0; i < SCE_GXM_MAX_TEXTURE_UNITS; ++i) {
+        if (used_textures[i]) {
+            append(i);
+            append(uint32_t(textures[i]));
+        }
+    }
+    if (is_vertex && hints.attributes) {
+        append(uint32_t(hints.attributes->size()));
+        for (const auto &attribute : *hints.attributes) {
+            append(uint32_t(attribute.format));
+            append(attribute.componentCount);
+            append(attribute.regIndex);
+        }
+    } else {
+        append(uint32_t(0));
+    }
+    return sha256(bytes.data(), bytes.size());
+}
+
 // structure containing everything needed to compile a pipeline
 struct CompileRequest {
     // iterator to the pipeline location
@@ -460,6 +494,7 @@ vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmPro
         LOG_WARN_ONCE("Mask not implemented in the vulkan renderer!");
 
     const vk::ShaderModule shader_compiling = std::bit_cast<vk::ShaderModule>(~0ULL);
+    const Sha256Hash variant_hash = shader_variant_hash(*program, hash, hints, is_vertex, maskupdate, state.get_features_mask());
 
     const vk::SpecializationInfo *spec_info = nullptr;
     if (!is_vertex && state.features.should_use_shader_interlock() && program->is_frag_color_used()) {
@@ -471,7 +506,7 @@ vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmPro
     {
         // look if it is in the cache
         std::unique_lock<std::mutex> lock(shaders_mutex);
-        shader_module = &shaders.insert({ hash, nullptr }).first->second;
+        shader_module = &shaders.insert({ variant_hash, nullptr }).first->second;
         if (*shader_module == shader_compiling) {
             // another thread is compiling the same exact shader at the same time
             // it's no use re-compiling it, so just wait for the other thread being done
@@ -488,7 +523,7 @@ vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmPro
     }
 
     if (*shader_module == shader_compiling) {
-        precompile_shader(hash, false);
+        precompile_shader(variant_hash, false);
     }
 
     if (*shader_module != shader_compiling) {
@@ -501,12 +536,12 @@ vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmPro
         return shader_stage_info;
     }
 
-    const std::string hash_text = hex_string(hash);
+    const std::string hash_text = hex_string(variant_hash);
 
     LOG_INFO("Generating vulkan spv shader {}", hash_text);
-    const std::string shader_version = fmt::format("vk{}", shader::CURRENT_VERSION);
+    const std::string shader_version = fmt::format("vk{}h1", shader::CURRENT_VERSION);
 
-    shader::usse::SpirvCode source = load_spirv_shader(*program, state.features, true, hints, maskupdate, state.shaders_path, state.shaders_log_path, shader_version, true);
+    shader::usse::SpirvCode source = load_spirv_shader(*program, state.features, true, hints, maskupdate, state.shaders_path, state.shaders_log_path, shader_version, true, &variant_hash);
 
     vk::ShaderModuleCreateInfo shader_info{
         .codeSize = sizeof(uint32_t) * source.size(),
@@ -520,9 +555,9 @@ vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmPro
         // vertex and fragment shaders are not linked together so no need to associate them
         Sha256Hash empty_hash{};
         if (is_vertex) {
-            state.shaders_cache_hashs.push_back({ hash, empty_hash });
+            state.shaders_cache_hashs.push_back({ variant_hash, empty_hash });
         } else {
-            state.shaders_cache_hashs.push_back({ empty_hash, hash });
+            state.shaders_cache_hashs.push_back({ empty_hash, variant_hash });
         }
     }
 
@@ -850,14 +885,13 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
     const vk::PipelineMultisampleStateCreateInfo multisampling{
         .rasterizationSamples = vk::SampleCountFlagBits::e1
     };
-    // depth and stencil tests are always enabled on the ps vita as there is almost no cost in doing so
-    // on a tiled renderer
+    // A scene without a depth/stencil surface has no attachment to test or update.
     const vk::PipelineDepthStencilStateCreateInfo ds_info{
-        .depthTestEnable = VK_TRUE,
-        .depthWriteEnable = (record.front_depth_write_mode == SCE_GXM_DEPTH_WRITE_ENABLED),
+        .depthTestEnable = record.has_depth_stencil_surface ? VK_TRUE : VK_FALSE,
+        .depthWriteEnable = record.has_depth_stencil_surface && (record.front_depth_write_mode == SCE_GXM_DEPTH_WRITE_ENABLED),
         .depthCompareOp = translate_depth_func(record.front_depth_func),
         .depthBoundsTestEnable = VK_FALSE,
-        .stencilTestEnable = VK_TRUE,
+        .stencilTestEnable = record.has_depth_stencil_surface ? VK_TRUE : VK_FALSE,
         .front = convert_op_state(record.front_stencil_state_op),
         .back = convert_op_state(two_sided ? record.back_stencil_state_op : record.front_stencil_state_op)
     };
@@ -943,6 +977,19 @@ vk::Pipeline PipelineCache::retrieve_pipeline(VKContext &context, SceGxmPrimitiv
     SceGxmVertexProgram &vertex_program_gxm = *record.vertex_program.get(mem);
     key ^= vertex_program_gxm.key_hash;
 
+    // Dynamic texture descriptors are absent from GxmRecordState's pipeline
+    // prefix, but the formats referenced by either shader alter SPIR-V.
+    std::array<uint32_t, SCE_GXM_MAX_TEXTURE_UNITS * 2> texture_formats{};
+    const auto &vertex_textures_used = vertex_program_gxm.renderer_data->textures_used;
+    const auto &fragment_textures_used = fragment_program_gxm.renderer_data->textures_used;
+    for (uint32_t i = 0; i < SCE_GXM_MAX_TEXTURE_UNITS; ++i) {
+        if (vertex_textures_used[i])
+            texture_formats[i] = uint32_t(context.shader_hints.vertex_textures[i]);
+        if (fragment_textures_used[i])
+            texture_formats[SCE_GXM_MAX_TEXTURE_UNITS + i] = uint32_t(context.shader_hints.fragment_textures[i]);
+    }
+    key ^= XXH3_64bits(texture_formats.data(), sizeof(texture_formats));
+
     // and also add the primitive type
     key ^= static_cast<uint64_t>(type);
 
@@ -1027,7 +1074,7 @@ vk::ShaderModule PipelineCache::precompile_shader(const Sha256Hash &hash, bool s
 
     Sha256Hash shader_hash;
     memcpy(shader_hash.data(), hash.data(), sizeof(Sha256Hash));
-    const std::string shader_file_name = fmt::format("vk{}-{}.spv", shader::CURRENT_VERSION, hex_string(shader_hash));
+    const std::string shader_file_name = fmt::format("vk{}h1-{}.spv", shader::CURRENT_VERSION, hex_string(shader_hash));
     const std::vector<uint32_t> source = renderer::pre_load_shader_spirv(state.shaders_path / shader_file_name);
 
     if (source.empty())

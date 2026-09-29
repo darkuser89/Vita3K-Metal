@@ -188,6 +188,8 @@ struct SceGxmSyncObject {
 struct GxmContextState {
     // Constant after initialisation.
     SceGxmContextType type;
+    std::array<SceGxmYuvProfile, 2> yuv_profiles{
+        SCE_GXM_YUV_PROFILE_BT601_STANDARD, SCE_GXM_YUV_PROFILE_BT601_STANDARD};
 
     // Surfaces.
     SceGxmColorSurface color_surface;

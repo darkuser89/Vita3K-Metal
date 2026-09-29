@@ -152,8 +152,9 @@ void set_context(VKContext &context, MemState &mem, VKRenderTarget *rt, const Fe
     context.current_color_format = vk_format;
 
     if (rt->multisample_mode && !context.record.color_surface.downscale) {
-        // using MSAA without downscaling, emulate this as best as we can by multiplying the width and height of the render target by 2
-        rt->width *= 2;
+        // Expanded 2x samples are stacked vertically; 4x samples use a 2x2 grid.
+        if (rt->multisample_mode == SCE_GXM_MULTISAMPLE_4X)
+            rt->width *= 2;
         rt->height *= 2;
     }
 
@@ -468,7 +469,8 @@ void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNot
 
     if (render_target->multisample_mode && !record.color_surface.downscale) {
         // revert changes made in set_context
-        render_target->width /= 2;
+        if (render_target->multisample_mode == SCE_GXM_MULTISAMPLE_4X)
+            render_target->width /= 2;
         render_target->height /= 2;
     }
 

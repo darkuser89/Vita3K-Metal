@@ -25,16 +25,6 @@ target_link_libraries(shader PRIVATE SPIRV spirv-cross-glsl)
 if(APPLE)
 	target_sources(shader PRIVATE src/msl_recompiler.cpp src/msl_gxp.cpp)
 	target_link_libraries(shader PRIVATE spirv-cross-msl)
-
-	option(VITA3K_BUILD_METAL_TESTS "Build native Metal shader validation tools" OFF)
-	if(VITA3K_BUILD_METAL_TESTS)
-		add_executable(metal-memory-analysis tests/metal_memory_analysis.cpp)
-		target_link_libraries(metal-memory-analysis PRIVATE shader spirv-cross-core)
-		add_test(NAME metal-memory-analysis COMMAND metal-memory-analysis)
-		add_executable(metal-shader-validation tests/metal_shader_validation.mm tests/metal_shader_fixture.cpp)
-		target_compile_options(metal-shader-validation PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
-		target_link_libraries(metal-shader-validation PRIVATE shader "-framework Metal" "-framework Foundation")
-	endif()
 endif()
 
 # Marshmallow Tracy linking

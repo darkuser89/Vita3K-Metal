@@ -26,9 +26,21 @@ void Device::configure_cache(const std::filesystem::path &root) {
 std::optional<shader::metal::Program> Device::load_cached_program(std::string_view key) const {
     return cache ? cache->load_program(key) : std::nullopt;
 }
-void Device::store_cached_program(std::string_view key, const shader::metal::Program &program) const {
+void Device::store_cached_program(std::string_view key, const shader::metal::Program &program,
+    std::string_view guest_hash, bool gamma_correction) const {
     if (cache)
-        cache->store_program(key, program);
+        cache->store_program(key, program, guest_hash, gamma_correction);
+}
+std::vector<CachedVariant> Device::cached_variants(std::string_view guest_hash) const {
+    return cache ? cache->variants(guest_hash) : std::vector<CachedVariant>{};
+}
+void Device::store_cached_pipeline_template(std::string_view fragment_hash, std::string_view vertex_hash,
+    std::string_view key, std::string_view vertex_key, std::string_view fragment_key,
+    MTLRenderPipelineDescriptor *descriptor) const {
+    if (cache) cache->store_render_pipeline_template(fragment_hash,vertex_hash,key,vertex_key,fragment_key,descriptor);
+}
+std::vector<CachedPipeline> Device::cached_pipeline_templates(std::string_view fragment_hash, std::string_view vertex_hash) const {
+    return cache ? cache->render_pipeline_templates(fragment_hash,vertex_hash) : std::vector<CachedPipeline>{};
 }
 void Device::flush_cache() const {
     if (cache)
@@ -110,7 +122,8 @@ std::unique_ptr<CompiledProgram> Device::compile(const shader::metal::Program &p
         error = describe_error(native_error, "Could not create Metal shader entry point");
         return nullptr;
     }
-    const auto expected_type = program.stage == shader::metal::Stage::Vertex ? MTLFunctionTypeVertex : MTLFunctionTypeFragment;
+    const auto expected_type = program.stage == shader::metal::Stage::Vertex ? MTLFunctionTypeVertex
+        : program.stage == shader::metal::Stage::Fragment ? MTLFunctionTypeFragment : MTLFunctionTypeKernel;
     if (result->function.functionType != expected_type) {
         error = "Metal shader entry point has the wrong stage";
         return nullptr;

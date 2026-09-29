@@ -37,27 +37,37 @@ enum SceGxmTextureBaseFormat : uint32_t;
 namespace renderer {
 struct YUVConversionCache {
     void *sws_context = nullptr;
+    std::array<void *, 4> sws_context_422{};
     size_t width = 0;
     size_t height = 0;
+    size_t width_422 = 0;
+    size_t height_422 = 0;
     bool is_p3 = false;
+    bool is_nv21 = false;
+    uint32_t profile = SCE_GXM_YUV_PROFILE_BT601_STANDARD;
+    uint32_t profile_422 = SCE_GXM_YUV_PROFILE_BT601_STANDARD;
 };
 
 enum class Backend : uint32_t;
 static constexpr size_t TextureCacheSize = 1024;
 
 typedef std::array<uint32_t, 4> TextureGxmDataRepr;
+typedef std::array<uint32_t, 5> TextureCacheKey;
 struct TextureCacheInfo {
     uint64_t hash = 0;
     uint64_t additional_hash = 0;
     SceGxmTexture texture;
+    TextureCacheKey key{};
     int index = 0;
     uint32_t texture_size = 0;
+    uint32_t protected_size = 0;
     bool use_hash = false;
     // no need for it to be atomic
     bool dirty = false;
     // used for texture importation
     bool is_imported = false;
     bool is_srgb = false;
+    bool import_swap_rb = false;
     uint16_t width = 0;
     uint16_t height = 0;
     uint16_t mip_count = 0;
@@ -66,7 +76,7 @@ struct TextureCacheInfo {
 
 struct SamplerCacheInfo {
     // compact representation of the sampler state
-    uint32_t value = 0;
+    uint64_t value = 0;
     int index = 0;
 };
 
@@ -107,16 +117,18 @@ public:
     Backend backend;
     bool use_protect = false;
     YUVConversionCache yuv_conversion_cache;
+    std::array<SceGxmYuvProfile, 2> yuv_profiles{
+        SCE_GXM_YUV_PROFILE_BT601_STANDARD, SCE_GXM_YUV_PROFILE_BT601_STANDARD};
     // use a separate sampler cache
     bool use_sampler_cache = false;
     int anisotropic_filtering = 1;
 
     // used to quickly get the info from a hash of a gxm_texture
-    unordered_map_fast<TextureGxmDataRepr, TextureCacheInfo *> texture_lookup;
+    unordered_map_fast<TextureCacheKey, TextureCacheInfo *> texture_lookup;
     lru::Queue<TextureCacheInfo> texture_queue;
 
     // when use_sampler_cache is set to true, used to quickly get a cached sampler
-    unordered_map_fast<uint32_t, SamplerCacheInfo *> sampler_lookup;
+    unordered_map_fast<uint64_t, SamplerCacheInfo *> sampler_lookup;
     lru::Queue<SamplerCacheInfo> sampler_queue;
     size_t last_bound_sampler_index;
 
@@ -152,7 +164,8 @@ public:
     virtual void upload_done() {}
     // Backends may track data outside the legacy replacement/base-mip hash.
     // Keep that hash separate so existing replacement filenames stay valid.
-    virtual uint64_t additional_texture_hash(const SceGxmTexture &, const MemState &) const { return 0; }
+    virtual uint32_t texture_size_to_protect(const SceGxmTexture &, uint32_t first_mip_size) const { return first_mip_size; }
+    virtual uint64_t additional_texture_hash(const SceGxmTexture &, const MemState &, bool) const { return 0; }
 
     virtual void configure_sampler(size_t index, const SceGxmTexture &texture, bool no_linear) {}
 

@@ -325,8 +325,8 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
     const SceGxmTextureFormat fmt = gxm::get_format(gxm_texture);
     const SceGxmTextureBaseFormat base_format = gxm::get_base_format(fmt);
 
-    if (base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV422) {
-        LOG_ERROR_ONCE("Unimplemented YUV format 0x{:0X}, please report it to the developers.", fmt::underlying(base_format));
+    if (base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV422 && backend == renderer::Backend::OpenGL) {
+        LOG_ERROR_ONCE("Unimplemented OpenGL YUV format 0x{:0X}, please report it to the developers.", fmt::underlying(base_format));
         return;
     }
 
@@ -393,6 +393,13 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
         layout_width = next_power_of_two(width);
         layout_height = next_power_of_two(height);
     }
+    if (base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV420P2
+        || base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV420P3) {
+        // GXM aligns every YUV420 plane to eight pixels, including textures
+        // without mipmaps. Chroma planes start after that padded Y plane.
+        layout_width = gxm_texture.mip_count == 0xF
+            ? align(width, 8U) : next_power_of_two(align(width, 8U));
+    }
     auto [block_width, block_height] = gxm::get_block_size(base_format);
     // block size in bytes
     const uint32_t block_size = (block_width * block_height * bpp) / 8;
@@ -414,7 +421,7 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
 
     while (face_uploaded_count < face_total_count && org_width > 0 && org_height > 0) {
         pixels = texture_data;
-        if (backend == renderer::Backend::Metal) {
+        if (backend == renderer::Backend::Metal || base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV422) {
             // Expanded uploads must not change the next guest mip's stride.
             bpp = source_bpp;
             bytes_per_pixel = (bpp + 7) / 8;
@@ -486,9 +493,31 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
             upload_format = SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8;
             bpp = 32;
             break;
+        case SCE_GXM_TEXTURE_BASE_FORMAT_S5S5U6:
+            if (backend != renderer::Backend::Metal)
+                break;
+            texture_data_decompressed.resize(size_t(pixels_per_stride) * memory_height * 8);
+            convert_s5s5u6_to_f16f16f16f16(texture_data_decompressed.data(), pixels,
+                pixels_per_stride, memory_height, fmt);
+            pixels = texture_data_decompressed.data();
+            upload_format = SCE_GXM_TEXTURE_BASE_FORMAT_F16F16F16F16;
+            bytes_per_pixel = 8;
+            bpp = 64;
+            break;
+        case SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8:
+            if (backend != renderer::Backend::Metal)
+                break;
+            texture_data_decompressed.resize(size_t(pixels_per_stride) * memory_height * 8);
+            convert_x8s8s8u8_to_f16f16f16f16(texture_data_decompressed.data(), pixels,
+                pixels_per_stride, memory_height, fmt);
+            pixels = texture_data_decompressed.data();
+            upload_format = SCE_GXM_TEXTURE_BASE_FORMAT_F16F16F16F16;
+            bytes_per_pixel = 8;
+            bpp = 64;
+            break;
         case SCE_GXM_TEXTURE_BASE_FORMAT_SE5M9M9M9:
             // this format is supported on all GPUs with vulkan
-            if (is_vulkan && support_e5rgb9) {
+            if (support_e5rgb9 && (is_vulkan || backend == renderer::Backend::Metal)) {
                 LOG_INFO_ONCE("Your device support SCE_GXM_TEXTURE_BASE_FORMAT_SE5M9M9M9");
                 break;
             }
@@ -542,7 +571,8 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
             texture_data_decompressed.resize(pixels_per_stride * memory_height * 4);
             yuv420_texture_to_rgb(yuv_conversion_cache, texture_data_decompressed.data(),
                 static_cast<const uint8_t *>(pixels), pixels_per_stride, memory_height, layout_width, layout_height,
-                base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV420P3);
+                base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV420P3, gxm_texture.swizzle_format,
+                yuv_profiles[(gxm_texture.swizzle_format >> 1) & 1]);
             pixels = texture_data_decompressed.data();
             bpp = 32;
             upload_format = SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8;
@@ -568,6 +598,20 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
             pixels = texture_pixels_lineared.data();
         }
 
+        if (base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV422) {
+            texture_data_decompressed.resize(size_t(pixels_per_stride) * memory_height * 4);
+            if (!yuv422_texture_to_rgb(yuv_conversion_cache, texture_data_decompressed.data(), static_cast<const uint8_t *>(pixels),
+                    pixels_per_stride, memory_height, gxm_texture.swizzle_format,
+                    yuv_profiles[(gxm_texture.swizzle_format >> 2) & 1])) {
+                LOG_ERROR_ONCE("Cannot convert packed GXM YUV422 texture");
+                return;
+            }
+            pixels = texture_data_decompressed.data();
+            bytes_per_pixel = 4;
+            bpp = 32;
+            upload_format = SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8;
+        }
+
         if (!support_dxt && gxm::is_bcn_format(base_format)) {
             // decompress the texture
             const int num_comp = gxm::get_num_components(base_format);
@@ -590,7 +634,9 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
         mip_index++;
         width /= 2;
         height /= 2;
-        layout_width /= 2;
+        layout_width = (base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV420P2
+                            || base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV420P3)
+            ? std::max(8U, layout_width / 2) : layout_width / 2;
         layout_height /= 2;
 
         if (mip_index == total_mip) {
@@ -640,7 +686,6 @@ static constexpr TextureGxmDataRepr strided_texture_mask = {
 
 void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemState &mem) {
     R_PROFILE(__func__);
-    const uint64_t additional_hash = additional_texture_hash(gxm_texture, mem);
 
     size_t index = 0;
     bool configure = false;
@@ -655,10 +700,30 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
         for (int i = 0; i < 4; i++)
             texture_repr[i] &= mask[i];
     }
-    auto gxm_it = texture_lookup.find(texture_repr);
+    const auto base_format = gxm::get_base_format(gxm::get_format(gxm_texture));
+    const uint32_t profile_index = base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV422
+        ? (gxm_texture.swizzle_format >> 2) & 1 : (gxm_texture.swizzle_format >> 1) & 1;
+    const uint32_t profile = gxm::is_yuv_format(base_format) ? uint32_t(yuv_profiles[profile_index]) : 0;
+    const TextureCacheKey texture_key{texture_repr[0], texture_repr[1], texture_repr[2], texture_repr[3], profile};
+    auto gxm_it = texture_lookup.find(texture_key);
     if (gxm_it != texture_lookup.end())
         // we found the texture in the cache
         cached_gxm_texture_index = gxm_it->second->index;
+
+    const uint32_t first_mip_size = cached_gxm_texture_index == -1
+        ? gxm::texture_size_first_mip(gxm_texture) : gxm_it->second->texture_size;
+    const uint32_t protected_size = cached_gxm_texture_index == -1
+        ? (use_protect && !gxm::is_yuv_format(base_format)
+            ? texture_size_to_protect(gxm_texture, first_mip_size) : first_mip_size)
+        : gxm_it->second->protected_size;
+    const uint64_t texture_end = (uint64_t(gxm_texture.data_addr) << 2) + protected_size;
+    const bool protect_storage = cached_gxm_texture_index == -1
+        ? use_protect && !gxm::is_yuv_format(base_format)
+            && protected_size >= mem.host_page_size * 4
+            && texture_end <= uint64_t(UINT32_MAX) - mem.host_page_size
+        : !gxm_it->second->use_hash;
+    // Validate/hash every mip and cube face before changing any cache entry.
+    const uint64_t additional_hash = additional_texture_hash(gxm_texture, mem, protect_storage);
 
     Address range_protect_begin = 0;
     Address range_protect_end = 0;
@@ -672,33 +737,33 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
         if (info->texture_size > 0) {
             // Cache is full.
             LOG_WARN_ONCE("Texture cache is full. Starting to replace textures");
-            texture_lookup.erase(std::bit_cast<TextureGxmDataRepr>(info->texture));
+            texture_lookup.erase(info->key);
         }
-        texture_lookup[texture_repr] = info;
+        texture_lookup[texture_key] = info;
 
         configure = true;
         upload = true;
         // only hash the first mips, assume no game would modify other mips (and faces) without modifying the first one
-        info->texture_size = gxm::texture_size_first_mip(gxm_texture);
+        info->texture_size = first_mip_size;
+        info->protected_size = protected_size;
         // use the texture_repr representation, it contains everything we need and we can use it to erase the key
         // from texture_lookup later
         info->texture = std::bit_cast<SceGxmTexture>(texture_repr);
+        info->key = texture_key;
 
-        // To prevent protecting too commonly accessed data that belongs to the page where the texture also resides
-        // (for example, uniform buffer value and texture data got mixed, so page faults are triggered too many, it's not always good).
-        // This works under the assumption that once this big enough texture decided to modify. It will have to modify either all of its data,
-        // or replace with an entire new texture.
-        bool should_use_hash = true;
-        if (use_protect && info->texture_size >= mem.host_page_size * 4) {
-            range_protect_begin = align(gxm_texture.data_addr << 2, mem.host_page_size);
-            range_protect_end = align_down((gxm_texture.data_addr << 2) + info->texture_size, mem.host_page_size);
-
-            if (range_protect_end - range_protect_begin >= mem.host_page_size * 4) {
-                should_use_hash = false;
-            }
+        // Only protect sufficiently large textures. Include the pages containing
+        // the first and last texels so writes to an unaligned texture cannot be
+        // missed. The size threshold limits faults from unrelated data sharing
+        // those boundary pages.
+        // Multiple YUV profiles share guest bytes but have distinct GPU images.
+        // Page protection merges callbacks by guest start address, so a write
+        // could otherwise invalidate only one profile variant.
+        if (protect_storage) {
+            range_protect_begin = align_down(gxm_texture.data_addr << 2, mem.host_page_size);
+            range_protect_end = align(Address(texture_end), mem.host_page_size);
         }
 
-        info->use_hash = should_use_hash;
+        info->use_hash = !protect_storage;
         if (info->use_hash) {
             if (import_textures || export_textures)
                 info->hash = hash_texture_nostride(gxm_texture, mem);
@@ -720,8 +785,8 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
 
             upload = previous_hash != info->hash;
         } else {
-            range_protect_begin = align(gxm_texture.data_addr << 2, mem.host_page_size);
-            range_protect_end = align_down((gxm_texture.data_addr << 2) + info->texture_size, mem.host_page_size);
+            range_protect_begin = align_down(gxm_texture.data_addr << 2, mem.host_page_size);
+            range_protect_end = align(Address(texture_end), mem.host_page_size);
             upload = info->dirty;
         }
     }
@@ -780,8 +845,8 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
 
         if (!info->use_hash) {
             info->dirty = false;
-            add_protect(mem, range_protect_begin, range_protect_end - range_protect_begin, MemPerm::ReadOnly, [info, texture_repr](Address, bool) {
-                if (memcmp(&info->texture, &texture_repr, sizeof(SceGxmTexture)) == 0) {
+            add_protect(mem, range_protect_begin, range_protect_end - range_protect_begin, MemPerm::ReadOnly, [info, texture_key](Address, bool) {
+                if (info->key == texture_key) {
                     info->dirty = true;
                 }
 
@@ -806,7 +871,7 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
 }
 
 int TextureCache::cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool is_depth) {
-    uint32_t compact_repr = 0;
+    uint64_t compact_repr = 0;
     if (gxm_texture.texture_type() != SCE_GXM_TEXTURE_LINEAR_STRIDED) {
         compact_repr = 0b01
             | (gxm_texture.vaddr_mode << 2)
@@ -828,6 +893,9 @@ int TextureCache::cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool 
     // the depth part only matters if we can't apply linear filtering to it
     is_depth &= !support_depth_linear_filtering;
     compact_repr |= (static_cast<uint32_t>(is_depth) << 23);
+    // This is a global setting rather than a GXM descriptor bit. Include it
+    // so changing anisotropy does not reuse a sampler built at the old value.
+    compact_repr |= uint64_t(std::max(1, anisotropic_filtering)) << 32;
 
     auto it = sampler_lookup.find(compact_repr);
     if (it != sampler_lookup.end()) {

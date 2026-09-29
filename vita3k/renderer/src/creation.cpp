@@ -115,6 +115,18 @@ COMMAND(handle_create_render_target) {
     SceGxmRenderTargetParams *params = helper.pop<SceGxmRenderTargetParams *>();
 
     bool result = false;
+    const bool macroblock_sync = (params->flags & SCE_GXM_RENDER_TARGET_MACROTILE_SYNC) != 0;
+    const uint16_t macroblocks_x = (params->flags >> 8) & 0b111;
+    const uint16_t macroblocks_y = (params->flags >> 12) & 0b111;
+    if (macroblock_sync && (macroblocks_x == 0 || macroblocks_x > 4
+            || macroblocks_y == 0 || macroblocks_y > 4
+            || params->width < macroblocks_x || params->height < macroblocks_y
+            || params->width % macroblocks_x || params->height % macroblocks_y
+            || (params->width / macroblocks_x) * renderer.res_multiplier < 1.0f
+            || (params->height / macroblocks_y) * renderer.res_multiplier < 1.0f)) {
+        complete_command(renderer, helper, false);
+        return;
+    }
 
     switch (renderer.current_backend) {
     case Backend::OpenGL:
@@ -124,6 +136,8 @@ COMMAND(handle_create_render_target) {
 #ifdef __APPLE__
     case Backend::Metal: {
         auto rt = std::make_unique<metal::MetalRenderTarget>();
+        rt->guest_width = params->width;
+        rt->guest_height = params->height;
         rt->width = static_cast<uint32_t>(params->width * renderer.res_multiplier);
         rt->height = static_cast<uint32_t>(params->height * renderer.res_multiplier);
         rt->custom_multisample_locations = (params->flags & SCE_GXM_RENDER_TARGET_CUSTOM_MULTISAMPLE_LOCATIONS) != 0;
@@ -143,15 +157,12 @@ COMMAND(handle_create_render_target) {
     }
     if (!result || !*render_target) { complete_command(renderer, helper, false); return; }
     (*render_target)->multisample_mode = params->multisampleMode;
-    (*render_target)->has_macroblock_sync = (params->flags & SCE_GXM_RENDER_TARGET_MACROTILE_SYNC);
+    (*render_target)->has_macroblock_sync = macroblock_sync;
     if ((*render_target)->has_macroblock_sync) {
         // there are between 1 and 4 macroblocks in the x and y direction
-        uint16_t nb_macroblocks_x = (params->flags >> 8) & 0b111;
-        uint16_t nb_macroblocks_y = (params->flags >> 12) & 0b111;
-
         // the width and height should be multiple of 128
-        (*render_target)->macroblock_width = static_cast<uint16_t>((params->width / nb_macroblocks_x) * renderer.res_multiplier);
-        (*render_target)->macroblock_height = static_cast<uint16_t>((params->height / nb_macroblocks_y) * renderer.res_multiplier);
+        (*render_target)->macroblock_width = static_cast<uint16_t>((params->width / macroblocks_x) * renderer.res_multiplier);
+        (*render_target)->macroblock_height = static_cast<uint16_t>((params->height / macroblocks_y) * renderer.res_multiplier);
     }
 
     complete_command(renderer, helper, result);
@@ -185,11 +196,9 @@ COMMAND(handle_memory_map) {
     const Ptr<void> addr = helper.pop<Ptr<void>>();
     const uint32_t size = helper.pop<uint32_t>();
 
-    if (renderer.current_backend == Backend::Vulkan) {
-        dynamic_cast<vulkan::VKState &>(renderer).map_memory(mem, addr, size);
-    }
-
-    complete_command(renderer, helper, 0);
+    const bool mapped = renderer.current_backend != Backend::Vulkan && renderer.current_backend != Backend::Metal
+        || renderer.map_memory(mem, addr, size);
+    complete_command(renderer, helper, mapped ? CommandErrorCodeNone : CommandErrorMemoryMapFailed);
 }
 
 COMMAND(handle_memory_unmap) {
@@ -197,9 +206,8 @@ COMMAND(handle_memory_unmap) {
 
     const Ptr<void> addr = helper.pop<Ptr<void>>();
 
-    if (renderer.current_backend == Backend::Vulkan) {
-        dynamic_cast<vulkan::VKState &>(renderer).unmap_memory(mem, addr);
-    }
+    if (renderer.current_backend == Backend::Vulkan || renderer.current_backend == Backend::Metal)
+        renderer.unmap_memory(mem, addr);
 
     complete_command(renderer, helper, 0);
 }

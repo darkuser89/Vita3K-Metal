@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <shader/msl_recompiler.h>
+#include <shader/metal_capture.h>
 
 #define SPV_ENABLE_UTILITY_CODE
 #include <spirv_msl.hpp>
@@ -123,6 +124,53 @@ Program convert_overlay_spirv(const std::vector<uint32_t> &spirv) {
     return result;
 }
 
+Program convert_builtin_compute_spirv(const std::vector<uint32_t> &spirv) {
+    if (spirv.size() < 5 || spirv.front() != spv::MagicNumber)
+        throw std::invalid_argument("Invalid built-in compute SPIR-V");
+    spirv_cross::CompilerMSL compiler(spirv);
+    const auto entries = compiler.get_entry_points_and_stages();
+    if (entries.size() != 1 || entries.front().execution_model != spv::ExecutionModelGLCompute)
+        throw std::invalid_argument("Built-in compute shader must have one compute entry point");
+    const auto &entry = entries.front();
+    const auto resources = compiler.get_shader_resources();
+    if (resources.push_constant_buffers.size() != 1 || resources.separate_images.size() != 1
+        || resources.storage_images.size() != 1 || resources.separate_samplers.size() != 1
+        || !resources.sampled_images.empty() || !resources.uniform_buffers.empty()
+        || !resources.storage_buffers.empty())
+        throw std::invalid_argument("Unexpected built-in compute resource layout");
+    const auto bind = [&](const spirv_cross::Resource &resource, uint32_t expected, uint32_t texture, uint32_t sampler) {
+        if (compiler.get_decoration(resource.id, spv::DecorationDescriptorSet) != 0
+            || compiler.get_decoration(resource.id, spv::DecorationBinding) != expected)
+            throw std::invalid_argument("Unexpected built-in compute binding");
+        spirv_cross::MSLResourceBinding binding;
+        binding.stage = entry.execution_model;
+        binding.desc_set = 0;
+        binding.binding = expected;
+        binding.msl_texture = texture;
+        binding.msl_sampler = sampler;
+        compiler.add_msl_resource_binding(binding);
+    };
+    bind(resources.separate_images.front(), 1, 0, 0);
+    bind(resources.storage_images.front(), 2, 1, 0);
+    bind(resources.separate_samplers.front(), 3, 0, 0);
+    spirv_cross::MSLResourceBinding constants;
+    constants.stage = entry.execution_model;
+    constants.desc_set = spirv_cross::kPushConstDescSet;
+    constants.binding = spirv_cross::kPushConstBinding;
+    constants.msl_buffer = 0;
+    compiler.add_msl_resource_binding(constants);
+    spirv_cross::CompilerMSL::Options options;
+    options.platform = spirv_cross::CompilerMSL::Options::macOS;
+    options.set_msl_version(3, 0);
+    compiler.set_msl_options(options);
+    Program result;
+    result.stage = Stage::Compute;
+    result.source = compiler.compile();
+    result.entry_point = compiler.get_cleansed_entry_point_name(entry.name, entry.execution_model);
+    result.writes_guest_memory = false;
+    return result;
+}
+
 Program convert_spirv(const std::vector<uint32_t> &spirv) {
     if (spirv.size() < 5 || spirv.front() != spv::MagicNumber)
         throw std::invalid_argument("Metal shader is not a SPIR-V module");
@@ -163,9 +211,11 @@ Program convert_spirv(const std::vector<uint32_t> &spirv) {
         if (buffer) {
             const uint32_t render_binding = vertex ? 0 : 1;
             const uint32_t uniform_binding = vertex ? 2 : 3;
-            if (set != 0 || (binding != render_binding && binding != uniform_binding && binding != 4))
+            if (set != 0 || (binding != render_binding && binding != uniform_binding && binding != 4
+                && !(vertex && binding == 5)))
                 throw std::invalid_argument("Unexpected GXM Metal buffer binding");
-            remap.msl_buffer = binding == 4 ? TEXTURE_INFO_BUFFER : binding == render_binding ? RENDER_INFO_BUFFER : UNIFORM_BUFFER;
+            remap.msl_buffer = binding == 5 ? VERTEX_OUTPUT_CAPTURE_BUFFER
+                : binding == 4 ? TEXTURE_INFO_BUFFER : binding == render_binding ? RENDER_INFO_BUFFER : UNIFORM_BUFFER;
         } else if (attachment) {
             if (vertex || set != 1 || binding > 2)
                 throw std::invalid_argument("Unexpected GXM Metal attachment binding");
@@ -210,6 +260,58 @@ Program convert_spirv(const std::vector<uint32_t> &spirv) {
     result.cube_texture_mask = cube_texture_mask;
     result.source = compiler.compile();
     result.entry_point = compiler.get_cleansed_entry_point_name(entry.name, entry.execution_model);
+    return result;
+}
+
+Program point_replay_vertex_program() {
+    Program result;
+    result.stage = Stage::Vertex;
+    result.entry_point = "point_replay_vs";
+    result.writes_guest_memory = false;
+    result.source = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct PointReplayOutput {
+    float4 gl_Position [[position]];
+    float gl_PointSize [[point_size]];
+    float4 v_Color0 [[user(locn1)]];
+    float4 v_Color1 [[user(locn2)]];
+    float4 v_Fog [[user(locn3)]];
+    float4 v_TexCoord0 [[user(locn4)]];
+    float4 v_TexCoord1 [[user(locn5)]];
+    float4 v_TexCoord2 [[user(locn6)]];
+    float4 v_TexCoord3 [[user(locn7)]];
+    float4 v_TexCoord4 [[user(locn8)]];
+    float4 v_TexCoord5 [[user(locn9)]];
+    float4 v_TexCoord6 [[user(locn10)]];
+    float4 v_TexCoord7 [[user(locn11)]];
+    float4 v_TexCoord8 [[user(locn12)]];
+    float4 v_TexCoord9 [[user(locn13)]];
+};
+
+vertex PointReplayOutput point_replay_vs(const device float4* outputs [[buffer(4)]],
+    uint vertex_id [[vertex_id]]) {
+    const uint base = vertex_id * )" + std::to_string(CAPTURE_OUTPUT_SLOT_COUNT) + R"(u;
+    PointReplayOutput result;
+    result.gl_Position = outputs[base];
+    result.gl_PointSize = outputs[base + 14].x;
+    result.v_Color0 = outputs[base + 1];
+    result.v_Color1 = outputs[base + 2];
+    result.v_Fog = outputs[base + 3];
+    result.v_TexCoord0 = outputs[base + 4];
+    result.v_TexCoord1 = outputs[base + 5];
+    result.v_TexCoord2 = outputs[base + 6];
+    result.v_TexCoord3 = outputs[base + 7];
+    result.v_TexCoord4 = outputs[base + 8];
+    result.v_TexCoord5 = outputs[base + 9];
+    result.v_TexCoord6 = outputs[base + 10];
+    result.v_TexCoord7 = outputs[base + 11];
+    result.v_TexCoord8 = outputs[base + 12];
+    result.v_TexCoord9 = outputs[base + 13];
+    return result;
+}
+)";
     return result;
 }
 

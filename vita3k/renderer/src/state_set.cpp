@@ -44,19 +44,21 @@ COMMAND_SET_STATE(region_clip) {
     render_context->record.region_clip_mode = helper.pop<SceGxmRegionClipMode>();
 
     // see COMMAND_SET_STATE(viewport) for an explanation
-    uint32_t factor = 1;
-    const bool has_msaa = (render_context->current_render_target && render_context->current_render_target->multisample_mode);
+    uint32_t x_factor = 1;
+    uint32_t y_factor = 1;
+    const auto multisample_mode = render_context->current_render_target
+        ? render_context->current_render_target->multisample_mode : SCE_GXM_MULTISAMPLE_NONE;
     const bool has_downscale = render_context->record.color_surface.downscale;
     // Metal rasterizes real samples at the original pixel coordinates.
-    if (renderer.current_backend != Backend::Metal && has_msaa && !has_downscale)
-        factor = 2;
-    else if (!has_msaa && has_downscale)
-        factor = 1;
+    if (renderer.current_backend != Backend::Metal && multisample_mode && !has_downscale) {
+        x_factor = renderer.current_backend == Backend::Vulkan && multisample_mode == SCE_GXM_MULTISAMPLE_2X ? 1 : 2;
+        y_factor = 2;
+    }
 
-    const uint32_t xMin = helper.pop<uint32_t>() * factor;
-    const uint32_t xMax = helper.pop<uint32_t>() * factor;
-    const uint32_t yMin = helper.pop<uint32_t>() * factor;
-    const uint32_t yMax = helper.pop<uint32_t>() * factor;
+    const uint32_t xMin = helper.pop<uint32_t>() * x_factor;
+    const uint32_t xMax = helper.pop<uint32_t>() * x_factor;
+    const uint32_t yMin = helper.pop<uint32_t>() * y_factor;
+    const uint32_t yMax = helper.pop<uint32_t>() * y_factor;
 
     render_context->record.region_clip_min.x = static_cast<SceInt>(align_down(xMin, SCE_GXM_TILE_SIZEX));
     render_context->record.region_clip_min.y = static_cast<SceInt>(align_down(yMin, SCE_GXM_TILE_SIZEY));
@@ -142,7 +144,7 @@ COMMAND_SET_STATE(uniform_buffer) {
 
 #ifdef __APPLE__
     case Backend::Metal:
-        metal::set_uniform_buffer(static_cast<metal::MetalContext &>(*render_context), *program, is_vertex, block_num, size, data.get(mem));
+        metal::set_uniform_buffer(static_cast<metal::MetalContext &>(*render_context), *program, is_vertex, block_num, size, data.get(mem), data.address());
         break;
 #endif
 
@@ -169,19 +171,21 @@ COMMAND_SET_STATE(viewport) {
     if (!flat) {
         // if we use msaa without downscaling the texture or the opposite, the surface size will differ from the expected
         // one by a factor of 2, one way or an other
-        float factor = 1.0f;
-        const bool has_msaa = (render_context->current_render_target && render_context->current_render_target->multisample_mode);
+        float x_factor = 1.0f;
+        float y_factor = 1.0f;
+        const auto multisample_mode = render_context->current_render_target
+            ? render_context->current_render_target->multisample_mode : SCE_GXM_MULTISAMPLE_NONE;
         const bool has_downscale = render_context->record.color_surface.downscale;
-        if (renderer.current_backend != Backend::Metal && has_msaa && !has_downscale)
-            factor = 2.0f;
-        else if (!has_msaa && has_downscale)
-            factor = 1.0f;
+        if (renderer.current_backend != Backend::Metal && multisample_mode && !has_downscale) {
+            x_factor = renderer.current_backend == Backend::Vulkan && multisample_mode == SCE_GXM_MULTISAMPLE_2X ? 1.0f : 2.0f;
+            y_factor = 2.0f;
+        }
 
-        const float xOffset = helper.pop<float>() * factor;
-        const float yOffset = helper.pop<float>() * factor;
+        const float xOffset = helper.pop<float>() * x_factor;
+        const float yOffset = helper.pop<float>() * y_factor;
         const float zOffset = helper.pop<float>();
-        const float xScale = helper.pop<float>() * factor;
-        const float yScale = helper.pop<float>() * factor;
+        const float xScale = helper.pop<float>() * x_factor;
+        const float yScale = helper.pop<float>() * y_factor;
         const float zScale = helper.pop<float>();
 
         const float ymin = yOffset + yScale;
@@ -268,8 +272,13 @@ COMMAND_SET_STATE(depth_bias) {
     const int factor = helper.pop<int>();
     const int unit = helper.pop<int>();
 
-    render_context->record.depth_bias_unit = unit;
-    render_context->record.depth_bias_slope = factor;
+    if (is_front) {
+        render_context->record.depth_bias_unit = unit;
+        render_context->record.depth_bias_slope = factor;
+    } else {
+        render_context->record.back_depth_bias_unit = unit;
+        render_context->record.back_depth_bias_slope = factor;
+    }
 
     switch (renderer.current_backend) {
     case Backend::OpenGL:
@@ -381,6 +390,8 @@ COMMAND_SET_STATE(point_line_width) {
     const std::uint32_t width = helper.pop<std::uint32_t>();
     if (is_front)
         render_context->record.line_width = width;
+    else
+        render_context->record.back_line_width = width;
 
     switch (renderer.current_backend) {
     case Backend::OpenGL:
@@ -500,6 +511,12 @@ COMMAND_SET_STATE(texture) {
     }
 }
 
+COMMAND_SET_STATE(yuv_profile) {
+    const uint32_t index = helper.pop<uint32_t>();
+    const auto profile = helper.pop<SceGxmYuvProfile>();
+    renderer.get_texture_cache()->yuv_profiles.at(index) = profile;
+}
+
 COMMAND_SET_STATE(two_sided) {
     TRACY_FUNC_COMMANDS_SET_STATE(two_sided);
     const SceGxmTwoSidedMode two_sided = helper.pop<SceGxmTwoSidedMode>();
@@ -582,6 +599,12 @@ COMMAND_SET_STATE(visibility_buffer) {
     if (renderer.current_backend == Backend::Vulkan) {
         vulkan::sync_visibility_buffer(*reinterpret_cast<vulkan::VKContext *>(render_context), buffer, stride);
     }
+#ifdef __APPLE__
+    else if (renderer.current_backend == Backend::Metal) {
+        static_cast<metal::MetalState &>(renderer).set_visibility_buffer(
+            *static_cast<metal::MetalContext *>(render_context), buffer, stride);
+    }
+#endif
 }
 
 COMMAND_SET_STATE(visibility_index) {
@@ -593,6 +616,12 @@ COMMAND_SET_STATE(visibility_index) {
     if (renderer.current_backend == Backend::Vulkan) {
         vulkan::sync_visibility_index(*reinterpret_cast<vulkan::VKContext *>(render_context), enable, index, is_increment);
     }
+#ifdef __APPLE__
+    else if (renderer.current_backend == Backend::Metal) {
+        static_cast<metal::MetalState &>(renderer).set_visibility_index(
+            *static_cast<metal::MetalContext *>(render_context), enable, index, is_increment);
+    }
+#endif
 }
 
 COMMAND(handle_set_state) {
@@ -611,6 +640,7 @@ COMMAND(handle_set_state) {
         { GXMState::PointLineWidth, cmd_set_state_point_line_width },
         { GXMState::StencilFunc, cmd_set_state_stencil_func },
         { GXMState::Texture, cmd_set_state_texture },
+        { GXMState::YuvProfile, cmd_set_state_yuv_profile },
         { GXMState::StencilRef, cmd_set_state_stencil_ref },
         { GXMState::TwoSided, cmd_set_state_two_sided },
         { GXMState::CullMode, cmd_set_state_cull_mode },

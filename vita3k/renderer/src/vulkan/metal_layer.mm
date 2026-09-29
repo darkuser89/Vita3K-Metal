@@ -19,5 +19,30 @@
 #import <QuartzCore/CAMetalLayer.h>
 
 extern "C" void *get_metal_layer_from_view(void *nsview) {
-    return (__bridge void *)((__bridge NSView *)nsview).layer;
+    NSView *view = (__bridge NSView *)nsview;
+    if (!view)
+        return nullptr;
+    if (!view.layer)
+        view.wantsLayer = YES;
+    CALayer *root = view.layer;
+    if (!root)
+        return nullptr;
+
+    CAMetalLayer *metal_layer = [root isKindOfClass:[CAMetalLayer class]] ? (CAMetalLayer *)root : nil;
+    if (!metal_layer) {
+        // Qt retains its QContainerLayer for VulkanSurface windows. MoltenVK
+        // requires a CAMetalLayer, so keep one sized with the Qt-owned layer.
+        for (CALayer *child in root.sublayers)
+            if ([child isKindOfClass:[CAMetalLayer class]] && [child.name isEqualToString:@"Vita3K Vulkan"])
+                metal_layer = (CAMetalLayer *)child;
+        if (!metal_layer) {
+            metal_layer = [CAMetalLayer layer];
+            metal_layer.name = @"Vita3K Vulkan";
+            metal_layer.frame = root.bounds;
+            metal_layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+            [root addSublayer:metal_layer];
+        }
+    }
+    metal_layer.contentsScale = view.window.backingScaleFactor;
+    return (__bridge void *)metal_layer;
 }

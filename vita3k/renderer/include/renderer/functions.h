@@ -65,6 +65,7 @@ void subject_done(SceGxmSyncObject *sync_object, const uint32_t timestamp);
 
 int wait_for_status(State &state, int *status, int signal, bool wake_on_equal);
 void reset_command_list(CommandList &command_list);
+bool append_deferred_command_list(Context &destination, const CommandList &source);
 void submit_command_list(State &state, renderer::Context *context, CommandList &command_list);
 bool is_cmd_ready(MemState &mem, CommandList &command_list);
 void process_batch(State &state, MemState &mem, Config &config, CommandList &command_list);
@@ -83,6 +84,7 @@ void set_stencil_ref(State &state, Context *ctx, bool is_front, unsigned char sr
 void set_program(State &state, Context *ctx, Ptr<const void> program, const bool is_fragment);
 void set_cull_mode(State &state, Context *ctx, SceGxmCullMode cull);
 void set_texture(State &state, Context *ctx, const std::uint32_t tex_index, const SceGxmTexture tex);
+void set_yuv_profile(State &state, Context *ctx, uint32_t index, SceGxmYuvProfile profile);
 void set_viewport_real(State &state, Context *ctx, float xOffset, float yOffset, float zOffset, float xScale, float yScale, float zScale);
 void set_viewport_flat(State &state, Context *ctx);
 void set_region_clip(State &state, Context *ctx, SceGxmRegionClipMode mode, unsigned int xMin, unsigned int xMax, unsigned int yMin, unsigned int yMax);
@@ -175,7 +177,8 @@ namespace texture {
 // Paletted textures.
 void palette_texture_to_rgba_4(uint32_t *dst, const uint8_t *src, uint32_t width, uint32_t height, const uint32_t *palette);
 void palette_texture_to_rgba_8(uint32_t *dst, const uint8_t *src, uint32_t width, uint32_t height, const uint32_t *palette);
-void yuv420_texture_to_rgb(YUVConversionCache &cache, uint8_t *dst, const uint8_t *src, uint32_t width, uint32_t height, uint32_t layout_width, uint32_t layout_height, bool is_p3);
+void yuv420_texture_to_rgb(YUVConversionCache &cache, uint8_t *dst, const uint8_t *src, uint32_t width, uint32_t height, uint32_t layout_width, uint32_t layout_height, bool is_p3, uint32_t swizzle, SceGxmYuvProfile profile);
+bool yuv422_texture_to_rgb(YUVConversionCache &cache, uint8_t *dst, const uint8_t *src, uint32_t width, uint32_t height, uint32_t swizzle, SceGxmYuvProfile profile);
 const uint32_t *get_texture_palette(const SceGxmTexture &texture, const MemState &mem);
 
 // Assume fmt is a bcn format
@@ -252,6 +255,10 @@ void resolve_z_order_compressed_image(uint32_t width, uint32_t height, const uin
 // Do not use a depth-stencil format as x8d24 is not supported on all GPUs for Vulkan
 void convert_x8u24_to_f32(void *dest, const void *data, const uint32_t width, const uint32_t height, const SceGxmTextureFormat format);
 void convert_U8U3U3U2_to_U8U8U8U8(void *dest, const void *data, const uint32_t width, const uint32_t height);
+void convert_s5s5u6_to_f16f16f16f16(void *dest, const void *data, uint32_t width, uint32_t height,
+    SceGxmTextureFormat format);
+void convert_x8s8s8u8_to_f16f16f16f16(void *dest, const void *data, uint32_t width, uint32_t height,
+    SceGxmTextureFormat format);
 void convert_x8u24_to_u24x8(void *dest, const void *data, const uint32_t width, const uint32_t height);
 void convert_f32m_to_f32(void *dest, const void *data, const uint32_t width, const uint32_t height);
 void convert_u2f10f10f10_to_f16f16f16f16(void *dest, const void *data, const uint32_t width, const uint32_t height, const SceGxmTextureFormat format);

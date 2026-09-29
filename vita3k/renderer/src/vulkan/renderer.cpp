@@ -1241,6 +1241,7 @@ uint32_t VKState::get_features_mask() {
             bool use_memory_mapping : 1;
             bool use_rgb_attributes : 1;
             bool use_scaled_attributes : 1;
+            bool use_shader_hint_variants : 1;
         };
         uint32_t value;
     } features_mask;
@@ -1252,6 +1253,7 @@ uint32_t VKState::get_features_mask() {
     features_mask.use_memory_mapping = features.enable_memory_mapping;
     features_mask.use_rgb_attributes = features.support_rgb_attributes;
     features_mask.use_scaled_attributes = pipeline_cache.support_scaled_vertex_attribute;
+    features_mask.use_shader_hint_variants = true;
 
     return features_mask.value;
 }

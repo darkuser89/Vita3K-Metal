@@ -20,7 +20,16 @@ namespace renderer::metal {
 namespace {
 constexpr size_t max_program_bytes = 8 * 1024 * 1024;
 constexpr std::string_view magic = "V3KMSL01";
+constexpr std::string_view variant_magic = "V3KVAR02";
+constexpr std::string_view pipeline_magic = "V3KPIPE1";
+constexpr size_t max_variant_key_bytes = 4096;
+constexpr size_t max_pipeline_template_bytes = 16 * 1024;
 std::string digest(std::string_view s) { return hex_string(sha256(s.data(), s.size())); }
+bool valid_guest_hash(std::string_view hash) {
+    return hash.size() == 64 && std::all_of(hash.begin(), hash.end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
+}
 NSURL *url(const std::filesystem::path &path) {
     return [NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()]];
 }
@@ -34,6 +43,9 @@ uint32_t get32(std::string_view s, size_t at) {
     for (unsigned i = 0; i < 4; ++i)
         v |= uint32_t(uint8_t(s[at + i])) << (i * 8);
     return v;
+}
+uint64_t get64(std::string_view s, size_t at) {
+    return uint64_t(get32(s, at)) | (uint64_t(get32(s, at + 4)) << 32);
 }
 // Same-directory rename keeps a previous complete cache valid until publication.
 struct TemporaryFile {
@@ -118,6 +130,69 @@ static std::string render_key(MTLRenderPipelineDescriptor *desc) {
         add(desc.fragmentBuffers[i].mutability);
     }
     return key;
+}
+static std::optional<CachedPipeline> restore_render_template(std::string_view bytes) {
+    constexpr size_t field_bytes=(9+8*9+31*8)*8;
+    if (bytes.size()<7+3+field_bytes || bytes.substr(0,7)!="render\n") return std::nullopt;
+    const auto names=bytes.substr(7,bytes.size()-7-field_bytes);
+    const auto separator=names.find('\n');
+    if (separator==std::string_view::npos || !separator || separator+1==names.size()
+        || names.find('\n',separator+1)!=std::string_view::npos
+        || names.size()>512) return std::nullopt;
+    CachedPipeline result;
+    result.vertex_function=names.substr(0,separator);
+    result.fragment_function=names.substr(separator+1);
+    auto desc=[MTLRenderPipelineDescriptor new];
+    size_t at=bytes.size()-field_bytes;
+    const auto next=[&]() { const uint64_t value=get64(bytes,at);at+=8;return value; };
+    const uint64_t samples=next();
+    if (samples!=1 && samples!=2 && samples!=4) return std::nullopt;
+    desc.rasterSampleCount=samples;
+    desc.alphaToCoverageEnabled=next();
+    desc.alphaToOneEnabled=next();
+    desc.rasterizationEnabled=next();
+    desc.depthAttachmentPixelFormat=MTLPixelFormat(next());
+    desc.stencilAttachmentPixelFormat=MTLPixelFormat(next());
+    desc.inputPrimitiveTopology=MTLPrimitiveTopologyClass(next());
+    desc.supportIndirectCommandBuffers=next();
+    desc.maxVertexAmplificationCount=next();
+    for (unsigned i=0;i<8;++i) {
+        auto a=desc.colorAttachments[i];
+        a.pixelFormat=MTLPixelFormat(next());
+        a.writeMask=MTLColorWriteMask(next());
+        a.blendingEnabled=next();
+        a.rgbBlendOperation=MTLBlendOperation(next());
+        a.alphaBlendOperation=MTLBlendOperation(next());
+        a.sourceRGBBlendFactor=MTLBlendFactor(next());
+        a.destinationRGBBlendFactor=MTLBlendFactor(next());
+        a.sourceAlphaBlendFactor=MTLBlendFactor(next());
+        a.destinationAlphaBlendFactor=MTLBlendFactor(next());
+    }
+    auto layout=[MTLVertexDescriptor vertexDescriptor];
+    for (unsigned i=0;i<31;++i) {
+        auto a=layout.attributes[i];auto stream=layout.layouts[i];
+        const uint64_t format=next(),offset=next(),buffer=next(),stride=next(),step=next(),rate=next();
+        const uint64_t vertex_mutability=next(),fragment_mutability=next();
+        if (format>255 || offset>65536 || buffer>=31 || stride>65536 || step>8 || rate>65536
+            || vertex_mutability>2 || fragment_mutability>2) return std::nullopt;
+        a.format=MTLVertexFormat(format);a.offset=offset;a.bufferIndex=buffer;
+        stream.stride=stride;stream.stepFunction=MTLVertexStepFunction(step);stream.stepRate=rate;
+        desc.vertexBuffers[i].mutability=MTLMutability(vertex_mutability);
+        desc.fragmentBuffers[i].mutability=MTLMutability(fragment_mutability);
+    }
+    if (at!=bytes.size()) return std::nullopt;
+    desc.vertexDescriptor=layout;
+    const std::string reconstructed=render_key(desc);
+    if (reconstructed.substr(8)!=bytes.substr(bytes.size()-field_bytes)) {
+        const auto original=bytes.substr(bytes.size()-field_bytes);
+        const auto actual=std::string_view(reconstructed).substr(8);
+        size_t mismatch=0;
+        while (mismatch<original.size() && original[mismatch]==actual[mismatch]) ++mismatch;
+        LOG_WARN("Metal pipeline warmup descriptor differs at field byte {}",mismatch);
+        return std::nullopt;
+    }
+    result.descriptor=desc;
+    return result;
 }
 struct PersistentCache::Impl {
     Device &device;
@@ -227,11 +302,12 @@ std::optional<shader::metal::Program> PersistentCache::load_program(std::string_
         || get32(view, 136) != body.size())
         return miss(true);
     const uint32_t flags = get32(body, 0), cube = get32(body, 4), entry = get32(body, 8), source = get32(body, 12);
-    if (flags & ~31u || cube & ~65535u || !entry || entry > 256 || !source || source > max_program_bytes
+    if (flags & ~63u || (flags & 33u) == 33u || cube & ~65535u || !entry || entry > 256 || !source || source > max_program_bytes
         || uint64_t(entry) + source + 16 != body.size())
         return miss(true);
     shader::metal::Program program;
-    program.stage = flags & 1 ? shader::metal::Stage::Fragment : shader::metal::Stage::Vertex;
+    program.stage = flags & 32 ? shader::metal::Stage::Compute
+        : flags & 1 ? shader::metal::Stage::Fragment : shader::metal::Stage::Vertex;
     program.uses_framebuffer_fetch = flags & 2;
     program.uses_raster_order_groups = flags & 4;
     program.uses_buffer_addresses = flags & 8;
@@ -244,13 +320,15 @@ std::optional<shader::metal::Program> PersistentCache::load_program(std::string_
     ++impl->counters.program_hits;
     return program;
 }
-void PersistentCache::store_program(std::string_view key, const shader::metal::Program &program) {
+void PersistentCache::store_program(std::string_view key, const shader::metal::Program &program,
+    std::string_view guest_hash, bool gamma_correction) {
     std::lock_guard lock(impl->mutex);
     if (program.source.empty() || program.source.size() + program.entry_point.size() + 16 > max_program_bytes
         || program.entry_point.empty() || program.entry_point.size() > 256)
         return;
     std::string body;
-    put32(body, uint32_t(program.stage == shader::metal::Stage::Fragment) | (uint32_t(program.uses_framebuffer_fetch) << 1) | (uint32_t(program.uses_raster_order_groups) << 2) | (uint32_t(program.uses_buffer_addresses) << 3) | (uint32_t(program.writes_guest_memory) << 4));
+    put32(body, uint32_t(program.stage == shader::metal::Stage::Fragment) | (uint32_t(program.uses_framebuffer_fetch) << 1) | (uint32_t(program.uses_raster_order_groups) << 2) | (uint32_t(program.uses_buffer_addresses) << 3) | (uint32_t(program.writes_guest_memory) << 4)
+        | (uint32_t(program.stage == shader::metal::Stage::Compute) << 5));
     put32(body, program.cube_texture_mask);
     put32(body, uint32_t(program.entry_point.size()));
     put32(body, uint32_t(program.source.size()));
@@ -262,10 +340,143 @@ void PersistentCache::store_program(std::string_view key, const shader::metal::P
     file += digest(body);
     put32(file, uint32_t(body.size()));
     file += body;
-    if (atomic_write(impl->programs / (hash + ".mslcache"), file))
+    if (atomic_write(impl->programs / (hash + ".mslcache"), file)) {
         ++impl->counters.program_writes;
-    else
+        if (guest_hash.empty()) return;
+        if (!valid_guest_hash(guest_hash) || key.size() > max_variant_key_bytes
+            || key.substr(0, guest_hash.size()) != guest_hash) return;
+        const auto directory = impl->programs / "variants" / std::string(guest_hash);
+        std::error_code ec;
+        std::filesystem::create_directories(directory, ec);
+        if (ec) {
+            impl->io_error("Cannot create shader variant index");
+            return;
+        }
+        std::string body;
+        put32(body, uint32_t(key.size()));
+        body.push_back(char(gamma_correction));
+        body += key;
+        std::string variant(variant_magic);
+        variant += hash;
+        variant += digest(body);
+        variant += body;
+        if (!atomic_write(directory / (hash + ".variant"), variant))
+            impl->io_error("Cannot save shader variant index");
+    } else
         impl->io_error("Cannot save translated shader");
+}
+std::vector<CachedVariant> PersistentCache::variants(std::string_view guest_hash) {
+    std::lock_guard lock(impl->mutex);
+    std::vector<CachedVariant> result;
+    if (!valid_guest_hash(guest_hash)) return result;
+    std::error_code ec;
+    const auto directory = impl->programs / "variants" / std::string(guest_hash);
+    std::filesystem::directory_iterator it(directory, ec), end;
+    if (ec) return result;
+    for (; it != end; it.increment(ec)) {
+        if (ec) break;
+        const auto path = it->path();
+        if (path.extension() != ".variant") continue;
+        const auto size = std::filesystem::file_size(path, ec);
+        if (ec || size < 141 || size > 141 + max_variant_key_bytes) {
+            ++impl->counters.rejected_files;
+            ec.clear();
+            continue;
+        }
+        std::string bytes(size, '\0');
+        std::ifstream file(path, std::ios::binary);
+        if (!file.read(bytes.data(), bytes.size())) {
+            ++impl->counters.rejected_files;
+            continue;
+        }
+        const std::string_view view(bytes), key = view.substr(141);
+        if (view.substr(0, 8) != variant_magic || uint8_t(view[140]) > 1
+            || get32(view, 136) != key.size() || key.substr(0, 64) != guest_hash
+            || view.substr(8, 64) != digest(key)
+            || view.substr(72, 64) != digest(view.substr(136))
+            || path.filename() != std::string(view.substr(8, 64)) + ".variant") {
+            ++impl->counters.rejected_files;
+            continue;
+        }
+        result.push_back({std::string(key), view[140] != 0});
+    }
+    std::sort(result.begin(), result.end(), [](const auto &a, const auto &b) { return a.key < b.key; });
+    return result;
+}
+void PersistentCache::store_render_pipeline_template(std::string_view fragment_hash, std::string_view vertex_hash,
+    std::string_view key, std::string_view vertex_key, std::string_view fragment_key,
+    MTLRenderPipelineDescriptor *descriptor) {
+    std::lock_guard lock(impl->mutex);
+    if (!valid_guest_hash(fragment_hash) || !valid_guest_hash(vertex_hash) || !descriptor
+        || key.empty() || key.size()>max_variant_key_bytes
+        || vertex_key.empty() || vertex_key.size()>max_variant_key_bytes
+        || fragment_key.empty() || fragment_key.size()>max_variant_key_bytes
+        || vertex_key.substr(0,64)!=vertex_hash
+        || (fragment_key.substr(0,64)!=fragment_hash && !fragment_key.starts_with("metal-depth-only"))
+        || !key.starts_with(vertex_key) || !key.substr(vertex_key.size()).starts_with(fragment_key)) return;
+    const std::string descriptor_key=render_key(descriptor);
+    const size_t payload=key.size()+vertex_key.size()+fragment_key.size()+descriptor_key.size();
+    if (payload+16>max_pipeline_template_bytes) return;
+    std::string body;
+    for (size_t length:{key.size(),vertex_key.size(),fragment_key.size(),descriptor_key.size()})
+        put32(body,uint32_t(length));
+    body.append(key);body.append(vertex_key);body.append(fragment_key);body+=descriptor_key;
+    std::string file(pipeline_magic);
+    file+=digest(body);file+=body;
+    const auto directory=impl->native/"warmup"/std::string(fragment_hash)/std::string(vertex_hash);
+    std::error_code ec;
+    std::filesystem::create_directories(directory,ec);
+    if (ec || !atomic_write(directory/(digest(key)+".pipeline"),file))
+        impl->io_error("Cannot save Metal pipeline warmup descriptor");
+}
+std::vector<CachedPipeline> PersistentCache::render_pipeline_templates(std::string_view fragment_hash,
+    std::string_view vertex_hash) {
+    std::lock_guard lock(impl->mutex);
+    std::vector<CachedPipeline> result;
+    if (!valid_guest_hash(fragment_hash) || !valid_guest_hash(vertex_hash)) return result;
+    const auto directory=impl->native/"warmup"/std::string(fragment_hash)/std::string(vertex_hash);
+    std::error_code ec;
+    std::filesystem::directory_iterator it(directory,ec),end;
+    if (ec) return result;
+    for (size_t count=0;it!=end && count<4096;it.increment(ec),++count) {
+        if (ec) break;
+        const auto path=it->path();
+        if (path.extension()!=".pipeline") continue;
+        const auto size=std::filesystem::file_size(path,ec);
+        if (ec || size<72+16 || size>72+max_pipeline_template_bytes) {
+            ++impl->counters.rejected_files;ec.clear();continue;
+        }
+        std::string bytes(size,'\0');
+        std::ifstream input(path,std::ios::binary);
+        if (!input.read(bytes.data(),bytes.size())) {++impl->counters.rejected_files;continue;}
+        const std::string_view view(bytes),body=view.substr(72);
+        if (view.substr(0,8)!=pipeline_magic || view.substr(8,64)!=digest(body)) {
+            ++impl->counters.rejected_files;continue;
+        }
+        const size_t key_size=get32(body,0),vertex_size=get32(body,4),fragment_size=get32(body,8),descriptor_size=get32(body,12);
+        if (!key_size || !vertex_size || !fragment_size || !descriptor_size
+            || key_size>max_variant_key_bytes || vertex_size>max_variant_key_bytes
+            || fragment_size>max_variant_key_bytes || size_t(16)+key_size+vertex_size+fragment_size+descriptor_size!=body.size()) {
+            ++impl->counters.rejected_files;continue;
+        }
+        const auto key=body.substr(16,key_size);
+        const auto vertex=body.substr(16+key_size,vertex_size);
+        const auto fragment=body.substr(16+key_size+vertex_size,fragment_size);
+        const auto descriptor=body.substr(16+key_size+vertex_size+fragment_size,descriptor_size);
+        if (path.filename()!=digest(key)+".pipeline" || vertex.substr(0,64)!=vertex_hash
+            || (fragment.substr(0,64)!=fragment_hash && !fragment.starts_with("metal-depth-only"))
+            || !key.starts_with(vertex) || !key.substr(vertex.size()).starts_with(fragment)) {
+            ++impl->counters.rejected_files;continue;
+        }
+        auto restored=restore_render_template(descriptor);
+        if (!restored) {++impl->counters.rejected_files;continue;}
+        restored->key=key;
+        restored->vertex_key=vertex;
+        restored->fragment_key=fragment;
+        result.push_back(std::move(*restored));
+    }
+    std::sort(result.begin(),result.end(),[](const auto &a,const auto &b){return a.key<b.key;});
+    return result;
 }
 id<MTLRenderPipelineState> PersistentCache::create_render_pipeline(MTLRenderPipelineDescriptor *descriptor, std::string &error) {
     std::lock_guard lock(impl->mutex);

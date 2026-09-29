@@ -90,7 +90,8 @@ enum class CommandOpcode : std::uint8_t {
 enum CommandErrorCode {
     CommandErrorCodeNone = 0,
     CommandErrorCodePending = -1,
-    CommandErrorArgumentsTooLarge = -2
+    CommandErrorArgumentsTooLarge = -2,
+    CommandErrorMemoryMapFailed = -3
 };
 
 constexpr std::size_t MAX_COMMAND_DATA_SIZE = 0x20;

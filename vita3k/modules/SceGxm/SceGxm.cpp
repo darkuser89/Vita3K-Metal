@@ -1556,12 +1556,15 @@ EXPORT(void, sceGxmSetDefaultRegionClipAndViewport, SceGxmContext *context, uint
 
 static void gxmContextStateRestore(renderer::State &state, SceGxmContext *context, const bool sync_viewport_and_clip) {
     if (sync_viewport_and_clip) {
-        renderer::set_region_clip(state, context->renderer.get(), SCE_GXM_REGION_CLIP_OUTSIDE,
+        renderer::set_region_clip(state, context->renderer.get(), context->state.region_clip_mode,
             context->state.region_clip_min.x, context->state.region_clip_max.x, context->state.region_clip_min.y,
             context->state.region_clip_max.y);
 
         update_viewport(state, context);
     }
+
+    for (uint32_t index = 0; index < context->state.yuv_profiles.size(); ++index)
+        renderer::set_yuv_profile(state, context->renderer.get(), index, context->state.yuv_profiles[index]);
 
     renderer::set_cull_mode(state, context->renderer.get(), context->state.cull_mode);
     renderer::set_depth_bias(state, context->renderer.get(), true, context->state.front_depth_bias_factor, context->state.front_depth_bias_units);
@@ -1575,6 +1578,10 @@ static void gxmContextStateRestore(renderer::State &state, SceGxmContext *contex
     renderer::set_polygon_mode(state, context->renderer.get(), true, context->state.front_polygon_mode);
     renderer::set_polygon_mode(state, context->renderer.get(), false, context->state.back_polygon_mode);
     renderer::set_two_sided_enable(state, context->renderer.get(), context->state.two_sided);
+    renderer::set_side_fragment_program_enable(state, context->renderer.get(), true,
+        context->state.front_side_fragment_program_mode);
+    renderer::set_side_fragment_program_enable(state, context->renderer.get(), false,
+        context->state.back_side_fragment_program_mode);
     renderer::set_stencil_func(state, context->renderer.get(), true, context->state.front_stencil.func, context->state.front_stencil.stencil_fail,
         context->state.front_stencil.depth_fail, context->state.front_stencil.depth_pass, context->state.front_stencil.compare_mask,
         context->state.front_stencil.write_mask);
@@ -1584,7 +1591,7 @@ static void gxmContextStateRestore(renderer::State &state, SceGxmContext *contex
     renderer::set_stencil_ref(state, context->renderer.get(), true, context->state.front_stencil.ref);
     renderer::set_stencil_ref(state, context->renderer.get(), false, context->state.back_stencil.ref);
 
-    if (state.features.enable_memory_mapping) {
+    if (state.features.enable_memory_mapping || state.current_backend == renderer::Backend::Metal) {
         context->state.visibility_enable = false;
         context->state.visibility_index = 0;
         context->state.visibility_is_increment = true;
@@ -1622,8 +1629,6 @@ EXPORT(int, sceGxmBeginCommandList, SceGxmContext *deferredContext) {
     deferredContext->state.fragment_ring_buffer_used = 0;
     deferredContext->state.vertex_ring_buffer_used = 0;
 
-    deferredContext->curr_command_list = new SceGxmCommandList();
-
     if (!deferredContext->make_new_alloc_space(emuenv.kernel, emuenv.mem, thread_id)) {
         return RET_ERROR(SCE_GXM_ERROR_RESERVE_FAILED);
     }
@@ -1660,6 +1665,10 @@ EXPORT(int, sceGxmBeginCommandList, SceGxmContext *deferredContext) {
     deferredContext->renderer->free_func = [](renderer::Command *cmd) {
         // do not delete here, commands will be deleted when they are overwritten
     };
+
+    // Keep the pending list only after all callback-backed buffers exist.
+    // A failed Begin must not leave an orphan that a later Begin overwrites.
+    deferredContext->curr_command_list = new SceGxmCommandList();
 
     // Begin the command list by white washing previous command list, and restoring deferred state
     renderer::reset_command_list(deferredContext->renderer->command_list);
@@ -1837,6 +1846,12 @@ EXPORT(int, sceGxmColorSurfaceInit, SceGxmColorSurface *surface, SceGxmColorForm
     if (surfaceType == SCE_GXM_COLOR_SURFACE_SWIZZLED && ((width & (width - 1)) || (height & (height - 1))))
         return RET_ERROR(SCE_GXM_ERROR_INVALID_ALIGNMENT);
 
+    SceGxmTextureFormat tex_format;
+    if (!gxm::convert_color_format_to_texture_format(colorFormat, tex_format)) {
+        LOG_WARN("Unable to convert color surface type 0x{:X} to texture format enum for background texture of color surface!", static_cast<std::uint32_t>(colorFormat));
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+    }
+
     memset(surface, 0, sizeof(SceGxmColorSurface));
     surface->disabled = 0;
     surface->downscale = scaleMode == SCE_GXM_COLOR_SURFACE_SCALE_MSAA_DOWNSCALE;
@@ -1847,11 +1862,6 @@ EXPORT(int, sceGxmColorSurfaceInit, SceGxmColorSurface *surface, SceGxmColorForm
     surface->colorFormat = colorFormat;
     surface->surfaceType = surfaceType;
     surface->outputRegisterSize = outputRegisterSize;
-
-    SceGxmTextureFormat tex_format;
-    if (!gxm::convert_color_format_to_texture_format(colorFormat, tex_format)) {
-        LOG_WARN("Unable to convert color surface type 0x{:X} to texture format enum for background texture of color surface!", static_cast<std::uint32_t>(colorFormat));
-    }
 
     // initialize the background texture
     switch (surfaceType) {
@@ -1923,13 +1933,13 @@ EXPORT(int, sceGxmColorSurfaceSetFormat, SceGxmColorSurface *surface, SceGxmColo
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
     }
 
-    surface->colorFormat = format;
-
     SceGxmTextureFormat tex_format;
     if (!gxm::convert_color_format_to_texture_format(format, tex_format)) {
         LOG_WARN("Unable to convert color surface type 0x{:X} to texture format enum for background texture of color surface!", static_cast<std::uint32_t>(format));
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
     }
 
+    surface->colorFormat = format;
     return CALL_EXPORT(sceGxmTextureSetFormat, &surface->backgroundTex, tex_format);
 }
 
@@ -2569,6 +2579,8 @@ EXPORT(int, sceGxmDrawPrecomputed, SceGxmContext *context, SceGxmPrecomputedDraw
 
 EXPORT(int, sceGxmEndCommandList, SceGxmContext *deferredContext, SceGxmCommandList *commandList) {
     TRACY_FUNC(sceGxmEndCommandList, deferredContext, commandList);
+    if (!deferredContext || !commandList)
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
     if (deferredContext->state.type != SCE_GXM_CONTEXT_TYPE_DEFERRED) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
     }
@@ -2578,8 +2590,11 @@ EXPORT(int, sceGxmEndCommandList, SceGxmContext *deferredContext, SceGxmCommandL
     }
 
     // only set the first two fields for commandList (its size is assumed to be 32 bytes by the game)
-    commandList->list = deferredContext->linearly_allocate<renderer::CommandList>(emuenv.kernel, emuenv.mem,
+    renderer::CommandList *list = deferredContext->linearly_allocate<renderer::CommandList>(emuenv.kernel, emuenv.mem,
         thread_id);
+    if (!list)
+        return RET_ERROR(SCE_GXM_ERROR_RESERVE_FAILED);
+    commandList->list = list;
 
     // also update our own command list
     deferredContext->curr_command_list->list = commandList->list;
@@ -2654,17 +2669,8 @@ EXPORT(int, sceGxmExecuteCommandList, SceGxmContext *context, SceGxmCommandList 
     if (!commandList || !commandList->list)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
-    // Emit a jump to the first command of given command list
-    // Since only one immediate context exists per process, direct linking like this should be fine! (I hope)
-    renderer::CommandList &imm_cmds = context->renderer->command_list;
-
-    if (imm_cmds.last) {
-        imm_cmds.last->next = commandList->list->first;
-        imm_cmds.last = commandList->list->last;
-    } else {
-        imm_cmds.first = commandList->list->first;
-        imm_cmds.last = commandList->list->last;
-    }
+    if (!renderer::append_deferred_command_list(*context->renderer, *commandList->list))
+        return RET_ERROR(SCE_GXM_ERROR_RESERVE_FAILED);
 
     // Restore back our GXM state
     gxmContextStateRestore(*emuenv.renderer, context, true);
@@ -2905,7 +2911,10 @@ EXPORT(int, sceGxmMapMemory, Ptr<void> base, uint32_t size, uint32_t attribs) {
 
     // Make sure the base address and size are 4KiB-aligned
     Address aligned_base = align_down(base.address(), KiB(4));
-    size = align(base.address() + size, KiB(4)) - aligned_base;
+    const uint64_t aligned_end = align(uint64_t(base.address()) + size, uint64_t(KiB(4)));
+    if (aligned_end > UINT32_MAX)
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
+    size = uint32_t(aligned_end - aligned_base);
 
     // Check if it has already been mapped
     // Some games intentionally overlapping mapped region. Nothing we can do. Allow it, bear your own consequences.
@@ -2920,11 +2929,14 @@ EXPORT(int, sceGxmMapMemory, Ptr<void> base, uint32_t size, uint32_t attribs) {
                 return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
             }
         }
-        gxm.memory_mapped_regions.emplace(aligned_base, MemoryMapInfo{ aligned_base, size, attribs });
-
         // little big planet maps regions of size 0
-        if (emuenv.renderer->features.enable_memory_mapping && size > 0)
-            renderer::send_single_command(*emuenv.renderer, nullptr, renderer::CommandOpcode::MemoryMap, true, aligned_base, size);
+        if ((emuenv.renderer->features.enable_memory_mapping
+                || emuenv.renderer->current_backend == renderer::Backend::Metal) && size > 0
+            && renderer::send_single_command(*emuenv.renderer, nullptr,
+                renderer::CommandOpcode::MemoryMap, true, aligned_base, size) != renderer::CommandErrorCodeNone)
+            return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
+
+        gxm.memory_mapped_regions.emplace(aligned_base, MemoryMapInfo{ aligned_base, size, attribs });
 
         return 0;
     }
@@ -3741,7 +3753,11 @@ EXPORT(void, sceGxmSetBackDepthWriteEnable, SceGxmContext *context, SceGxmDepthW
 
 EXPORT(void, sceGxmSetBackFragmentProgramEnable, SceGxmContext *context, SceGxmFragmentProgramMode enable) {
     TRACY_FUNC(sceGxmSetBackFragmentProgramEnable, context, enable);
-    renderer::set_side_fragment_program_enable(*emuenv.renderer, context->renderer.get(), false, enable);
+    if (context->state.back_side_fragment_program_mode != enable) {
+        context->state.back_side_fragment_program_mode = enable;
+        if (context->alloc_space)
+            renderer::set_side_fragment_program_enable(*emuenv.renderer, context->renderer.get(), false, enable);
+    }
 }
 
 EXPORT(void, sceGxmSetBackLineFillLastPixelEnable, SceGxmContext *context, SceGxmLineFillLastPixelMode enable) {
@@ -3997,7 +4013,11 @@ EXPORT(void, sceGxmSetFrontDepthWriteEnable, SceGxmContext *context, SceGxmDepth
 
 EXPORT(void, sceGxmSetFrontFragmentProgramEnable, SceGxmContext *context, SceGxmFragmentProgramMode enable) {
     TRACY_FUNC(sceGxmSetFrontFragmentProgramEnable, context, enable);
-    renderer::set_side_fragment_program_enable(*emuenv.renderer, context->renderer.get(), true, enable);
+    if (context->state.front_side_fragment_program_mode != enable) {
+        context->state.front_side_fragment_program_mode = enable;
+        if (context->alloc_space)
+            renderer::set_side_fragment_program_enable(*emuenv.renderer, context->renderer.get(), true, enable);
+    }
 }
 
 EXPORT(void, sceGxmSetFrontLineFillLastPixelEnable, SceGxmContext *context, SceGxmLineFillLastPixelMode enable) {
@@ -4063,7 +4083,8 @@ EXPORT(void, sceGxmSetFrontStencilRef, SceGxmContext *context, uint8_t sref) {
 EXPORT(void, sceGxmSetFrontVisibilityTestEnable, SceGxmContext *context, SceGxmVisibilityTestMode enable) {
     TRACY_FUNC(sceGxmSetFrontVisibilityTestEnable, context, enable);
 
-    if (!emuenv.renderer->features.enable_memory_mapping) {
+    if (!emuenv.renderer->features.enable_memory_mapping
+        && emuenv.renderer->current_backend != renderer::Backend::Metal) {
         UNIMPLEMENTED();
         return;
     }
@@ -4075,7 +4096,8 @@ EXPORT(void, sceGxmSetFrontVisibilityTestEnable, SceGxmContext *context, SceGxmV
 EXPORT(void, sceGxmSetFrontVisibilityTestIndex, SceGxmContext *context, uint32_t index) {
     TRACY_FUNC(sceGxmSetFrontVisibilityTestIndex, context, index);
 
-    if (!emuenv.renderer->features.enable_memory_mapping) {
+    if (!emuenv.renderer->features.enable_memory_mapping
+        && emuenv.renderer->current_backend != renderer::Backend::Metal) {
         UNIMPLEMENTED();
         return;
     }
@@ -4087,7 +4109,8 @@ EXPORT(void, sceGxmSetFrontVisibilityTestIndex, SceGxmContext *context, uint32_t
 EXPORT(void, sceGxmSetFrontVisibilityTestOp, SceGxmContext *context, SceGxmVisibilityTestOp op) {
     TRACY_FUNC(sceGxmSetFrontVisibilityTestOp, context, op);
 
-    if (!emuenv.renderer->features.enable_memory_mapping) {
+    if (!emuenv.renderer->features.enable_memory_mapping
+        && emuenv.renderer->current_backend != renderer::Backend::Metal) {
         UNIMPLEMENTED();
         return;
     }
@@ -4413,7 +4436,8 @@ EXPORT(int, sceGxmSetVisibilityBuffer, SceGxmContext *immediateContext, Ptr<void
     if (bufferBase.address() & (SCE_GXM_VISIBILITY_ALIGNMENT - 1))
         return RET_ERROR(SCE_GXM_ERROR_INVALID_ALIGNMENT);
 
-    if (emuenv.renderer->features.enable_memory_mapping) {
+    if (emuenv.renderer->features.enable_memory_mapping
+        || emuenv.renderer->current_backend == renderer::Backend::Metal) {
         renderer::set_visibility_buffer(*emuenv.renderer, immediateContext->renderer.get(), bufferBase.cast<uint32_t>(), stridePerCore);
     } else {
         STUBBED("Set all visible");
@@ -4443,9 +4467,21 @@ EXPORT(int, sceGxmSetWarningEnabled) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceGxmSetYuvProfile) {
-    TRACY_FUNC(sceGxmSetYuvProfile);
-    return UNIMPLEMENTED();
+EXPORT(int, sceGxmSetYuvProfile, SceGxmContext *context, uint32_t index, SceGxmYuvProfile profile) {
+    TRACY_FUNC(sceGxmSetYuvProfile, context, index, profile);
+    if (!context)
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
+    if (index >= context->state.yuv_profiles.size() || profile > SCE_GXM_YUV_PROFILE_BT709_FULL_RANGE)
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+
+    context->state.yuv_profiles[index] = profile;
+    // Deferred contexts acquire their command allocator at BeginCommandList.
+    // Between lists, only the saved state changes; Begin restores it.
+    if (context->state.type != SCE_GXM_CONTEXT_TYPE_DEFERRED || context->state.active)
+        renderer::set_yuv_profile(*emuenv.renderer, context->renderer.get(), index, profile);
+    context->is_vert_texture_dirty.set();
+    context->is_frag_texture_dirty.set();
+    return 0;
 }
 
 static Address alloc_callbacked(EmuEnvState &emuenv, SceUID thread_id, const SceGxmShaderPatcherParams &shaderPatcherParams, unsigned int size) {
@@ -5684,7 +5720,8 @@ EXPORT(int, sceGxmUnmapMemory, Ptr<void> base) {
         *addr = *addr;
     }
 
-    if (emuenv.renderer->features.enable_memory_mapping && ite->second.size > 0)
+    if ((emuenv.renderer->features.enable_memory_mapping
+            || emuenv.renderer->current_backend == renderer::Backend::Metal) && ite->second.size > 0)
         renderer::send_single_command(*emuenv.renderer, nullptr, renderer::CommandOpcode::MemoryUnmap, true, aligned_base);
 
     emuenv.gxm.memory_mapped_regions.erase(ite);

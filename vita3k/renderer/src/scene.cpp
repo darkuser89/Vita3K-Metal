@@ -74,15 +74,11 @@ COMMAND(handle_set_context) {
 
     if (depth_stencil_surface && !depth_stencil_surface->disabled()) {
         render_context->record.depth_stencil_surface = *depth_stencil_surface;
+        render_context->record.has_depth_stencil_surface = true;
     } else {
-        render_context->record.depth_stencil_surface.depth_data.reset();
-        render_context->record.depth_stencil_surface.stencil_data.reset();
-#ifdef __APPLE__
-        // Metal derives depth/stencil enablement from the recorded descriptor.
+        render_context->record.has_depth_stencil_surface = false;
         // Do not retain a previous scene's format when the new scene disables it.
-        if (renderer.current_backend == Backend::Metal)
-            render_context->record.depth_stencil_surface = {};
-#endif
+        render_context->record.depth_stencil_surface = {};
     }
 
     destroy_command_payload(*helper.cmd);
@@ -138,15 +134,16 @@ COMMAND(handle_sync_surface_data) {
 #ifdef __APPLE__
     if (renderer.current_backend == Backend::Metal) {
         auto &metal = static_cast<metal::MetalState &>(renderer);
+        bool already_synced = false;
         if (render_context) {
             auto &ctx=static_cast<metal::MetalContext &>(*render_context);
             if(helper.cmd->status) metal.finish(ctx);
-            else metal.end_scene(ctx);
+            else already_synced = metal.end_scene(ctx, renderer.disable_surface_sync);
         }
         const auto *surface = helper.cmd->status ? helper.pop<SceGxmColorSurface *>()
             : (render_context ? &render_context->record.color_surface : nullptr);
         const bool synced = surface && (helper.cmd->status || !renderer.disable_surface_sync)
-            && metal.sync_surface(mem, *surface);
+            && (already_synced || metal.sync_surface(mem, *surface));
         signal_notifications();
         if (helper.cmd->status) complete_command(renderer, helper, synced ? 0 : 1);
         return;
@@ -238,6 +235,22 @@ COMMAND(handle_sync_surface_data) {
 COMMAND(handle_mid_scene_flush) {
     TRACY_FUNC_COMMANDS(handle_mid_scene_flush);
 
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal) {
+        const auto notification = helper.pop<SceGxmNotification>();
+        if (render_context)
+            static_cast<metal::MetalState &>(renderer).mid_scene_flush(
+                *static_cast<metal::MetalContext *>(render_context), bool(notification.address));
+        if (notification.address) {
+            std::unique_lock<std::mutex> lock(renderer.notification_mutex);
+            if (uint32_t *value = notification.address.get(mem))
+                *value = notification.value;
+            lock.unlock();
+            renderer.notification_ready.notify_all();
+        }
+        return;
+    }
+#endif
     if (!renderer.features.enable_memory_mapping) {
         // handle it like a simple notification
         cmd_handle_notification(renderer, mem, config, helper, features, render_context);

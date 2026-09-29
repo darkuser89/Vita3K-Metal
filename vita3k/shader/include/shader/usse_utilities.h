@@ -39,6 +39,7 @@ struct SpirvUtilFunctions {
     // this is technically not a function but is the best place to put it
     // buffer_address_vec[0] is for a packed float[] array
     spv::Id buffer_address_vec[5][2] = {};
+    spv::Id atomic_word_buffer_pointer = 0;
 };
 
 spv::Id finalize(spv::Builder &b, spv::Id first, spv::Id second, const Swizzle4 swizz, spv::Id offset, const Imm4 dest_mask);

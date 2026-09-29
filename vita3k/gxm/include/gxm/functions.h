@@ -29,6 +29,17 @@ struct GxmState;
 namespace gxm {
 // Color.
 SceGxmColorBaseFormat get_base_format(SceGxmColorFormat src);
+inline bool is_alpha_only_color_format(SceGxmColorFormat format) {
+    return format == SCE_GXM_COLOR_FORMAT_U8_A || format == SCE_GXM_COLOR_FORMAT_S8_A;
+}
+inline bool is_green_only_color_format(SceGxmColorFormat format) {
+    return format == SCE_GXM_COLOR_FORMAT_U16_G || format == SCE_GXM_COLOR_FORMAT_S16_G
+        || format == SCE_GXM_COLOR_FORMAT_F16_G;
+}
+inline bool is_red_alpha_color_format(SceGxmColorFormat format) {
+    return format == SCE_GXM_COLOR_FORMAT_U8U8_RA || format == SCE_GXM_COLOR_FORMAT_U8U8_AR
+        || format == SCE_GXM_COLOR_FORMAT_S8S8_RA || format == SCE_GXM_COLOR_FORMAT_S8S8_AR;
+}
 size_t bits_per_pixel(SceGxmColorBaseFormat base_format);
 size_t get_stride_in_bytes(const SceGxmColorFormat src, const std::size_t stride_in_pixels);
 

@@ -36,7 +36,62 @@
 #include <gxm/functions.h>
 #include <util/log.h>
 
+#include <cstring>
+
 namespace renderer {
+
+bool append_deferred_command_list(Context &destination, const CommandList &source) {
+    if (!source.first)
+        return source.last == nullptr;
+    if (!source.last)
+        return false;
+
+    CommandList copied{};
+    const auto discard = [&]() {
+        for (Command *cmd = copied.first; cmd;) {
+            Command *next = cmd->next;
+            destination.free_func(cmd);
+            cmd = next;
+        }
+    };
+
+    // A deferred list may be executed more than once before the immediate
+    // batch is consumed. Linking its original nodes would overwrite `next`
+    // pointers in earlier executions and can create a cycle.
+    for (const Command *original = source.first; original; original = original->next) {
+        // SetContext owns surface descriptors and is only legal in an
+        // immediate scene. A shallow copy would free those pointers twice.
+        if (original->opcode == CommandOpcode::SetContext || original->status) {
+            discard();
+            return false;
+        }
+        Command *copy = destination.alloc_func();
+        if (!copy) {
+            discard();
+            return false;
+        }
+        copy->opcode = original->opcode;
+        copy->status = nullptr;
+        std::memcpy(copy->data, original->data, sizeof(copy->data));
+        copy->next = nullptr;
+        if (copied.last)
+            copied.last->next = copy;
+        else
+            copied.first = copy;
+        copied.last = copy;
+        if (original == source.last) {
+            if (destination.command_list.last)
+                destination.command_list.last->next = copied.first;
+            else
+                destination.command_list.first = copied.first;
+            destination.command_list.last = copied.last;
+            return true;
+        }
+    }
+
+    discard();
+    return false;
+}
 
 void State::update_overlays() {
     if (!overlay_manager)
@@ -183,6 +238,10 @@ void set_cull_mode(State &state, Context *ctx, SceGxmCullMode cull) {
 
 void set_texture(State &state, Context *ctx, const std::uint32_t tex_index, const SceGxmTexture tex) {
     renderer::add_state_set_command(ctx, renderer::GXMState::Texture, tex_index, tex);
+}
+
+void set_yuv_profile(State &state, Context *ctx, uint32_t index, SceGxmYuvProfile profile) {
+    renderer::add_state_set_command(ctx, renderer::GXMState::YuvProfile, index, profile);
 }
 
 void set_viewport_real(State &state, Context *ctx, float xOffset, float yOffset, float zOffset, float xScale, float yScale, float zScale) {

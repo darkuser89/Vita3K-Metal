@@ -16,13 +16,16 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 
 #include <gxm/types.h>
 #include <renderer/functions.h>
 #include <renderer/pvrt-dec.h>
+#include <util/float_to_half.h>
 #include <util/log.h>
 
 namespace renderer::texture {
@@ -230,6 +233,44 @@ void convert_U8U3U3U2_to_U8U8U8U8(void *dest, const void *data, const uint32_t w
 
             dst[row * width + col] = value;
         }
+    }
+}
+
+void convert_s5s5u6_to_f16f16f16f16(void *dest, const void *data, uint32_t width, uint32_t height,
+    SceGxmTextureFormat format) {
+    const uint32_t mode=(uint32_t(format)&SCE_GXM_TEXTURE_SWIZZLE_MASK)>>12;
+    auto *output=static_cast<uint16_t *>(dest);
+    const auto *input=static_cast<const uint8_t *>(data);
+    for (size_t pixel=0;pixel<size_t(width)*height;++pixel) {
+        const uint16_t word=uint16_t(input[pixel*2]) | (uint16_t(input[pixel*2+1])<<8);
+        const uint32_t red=mode==0 ? word&31 : (word>>11)&31;
+        const uint32_t green=(word>>(mode==0 ? 5 : 6))&31;
+        const uint32_t blue=mode==0 ? (word>>10)&63 : word&63;
+        const auto signed5=[](uint32_t bits) { return int(bits<16 ? bits : bits-32); };
+        output[pixel*4+0]=util::encode_flt16(float(std::max(signed5(red),-15))/15.f);
+        output[pixel*4+1]=util::encode_flt16(float(std::max(signed5(green),-15))/15.f);
+        output[pixel*4+2]=util::encode_flt16(float(blue)/63.f);
+        output[pixel*4+3]=0x3c00;
+    }
+}
+
+void convert_x8s8s8u8_to_f16f16f16f16(void *dest, const void *data, uint32_t width, uint32_t height,
+    SceGxmTextureFormat format) {
+    const uint32_t mode = (uint32_t(format) & SCE_GXM_TEXTURE_SWIZZLE_MASK) >> 12;
+    if (mode > 1)
+        throw std::invalid_argument("Unsupported X8S8S8U8 texture channel order");
+    auto *output = static_cast<uint16_t *>(dest);
+    const auto *input = static_cast<const uint8_t *>(data);
+    for (size_t pixel = 0; pixel < size_t(width) * height; ++pixel) {
+        const auto *bytes = input + pixel * 4;
+        const uint8_t red = bytes[mode == 0 ? 0 : 2];
+        const auto signed_byte = [](uint8_t byte) { return byte < 128 ? int(byte) : int(byte) - 256; };
+        const int green = signed_byte(bytes[1]);
+        const int blue = signed_byte(bytes[mode == 0 ? 2 : 0]);
+        output[pixel * 4 + 0] = util::encode_flt16(float(red) / 255.f);
+        output[pixel * 4 + 1] = util::encode_flt16(float(std::max(green, -127)) / 127.f);
+        output[pixel * 4 + 2] = util::encode_flt16(float(std::max(blue, -127)) / 127.f);
+        output[pixel * 4 + 3] = 0x3c00;
     }
 }
 

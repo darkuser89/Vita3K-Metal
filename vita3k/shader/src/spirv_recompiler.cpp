@@ -17,6 +17,7 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <shader/spirv_recompiler.h>
+#include <shader/metal_capture.h>
 #include <shader/uniform_block.h>
 #include <shader/usse_disasm.h>
 #include <shader/usse_program_analyzer.h>
@@ -41,6 +42,7 @@
 #include <list>
 #include <map>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -108,6 +110,7 @@ struct TranslationState {
     spv::Id frag_coord_id = spv::NoResult;
     spv::Id native_front_facing_id = spv::NoResult;
     spv::Id render_info_id = spv::NoResult;
+    spv::Id metal_vertex_id = spv::NoResult;
     std::vector<VarToReg> var_to_regs;
     std::vector<spv::Id> interfaces;
     bool is_maskupdate = false;
@@ -391,6 +394,53 @@ static spv::Id make_metal_half4_type(spv::Builder &b) {
     return b.makeVectorType(b.makeFloatType(16), 4);
 }
 
+static bool uses_metal_guest_color_quantization(SceGxmColorFormat format) {
+    const auto base = gxm::get_base_format(format);
+    return base == SCE_GXM_COLOR_BASE_FORMAT_U8U3U3U2
+        || base == SCE_GXM_COLOR_BASE_FORMAT_S5S5U6
+        || base == SCE_GXM_COLOR_BASE_FORMAT_U8S8S8U8;
+}
+
+static spv::Id quantize_metal_guest_color(spv::Builder &b, utils::SpirvUtilFunctions &utils,
+    SceGxmColorFormat format, spv::Id color) {
+    const auto f32 = b.makeFloatType(32);
+    const auto v4 = b.makeVectorType(f32, 4);
+    const auto zero = b.makeFloatConstant(0);
+    const auto one = b.makeFloatConstant(1);
+    const auto base = gxm::get_base_format(format);
+    const bool packed_332 = base == SCE_GXM_COLOR_BASE_FORMAT_U8U3U3U2;
+    const bool signed_556 = base == SCE_GXM_COLOR_BASE_FORMAT_S5S5U6;
+    spv::Id channels[4];
+    for (unsigned channel = 0; channel < 4; ++channel) {
+        if (signed_556 && channel == 3) {
+            channels[channel] = one;
+            continue;
+        }
+        const bool signed_channel = (signed_556 && channel < 2)
+            || (base == SCE_GXM_COLOR_BASE_FORMAT_U8S8S8U8 && (channel == 1 || channel == 2));
+        const float scale_value = packed_332 ? (channel == 3 ? 255.f : channel == 2 ? 3.f : 7.f)
+            : signed_556 ? (channel < 2 ? 15.f : 63.f)
+            : signed_channel ? 127.f : 255.f;
+        const auto scale = b.makeFloatConstant(scale_value);
+        const auto value = b.createCompositeExtract(color, f32, channel);
+        const auto scaled = b.createBinOp(spv::OpFMul, f32, value, scale);
+        const auto positive = b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450Floor,
+            {b.createBinOp(spv::OpFAdd, f32, scaled, b.makeFloatConstant(0.5f))});
+        spv::Id rounded = positive;
+        if (signed_channel) {
+            const auto negative = b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450Ceil,
+                {b.createBinOp(spv::OpFSub, f32, scaled, b.makeFloatConstant(0.5f))});
+            rounded = b.createTriOp(spv::OpSelect, f32,
+                b.createBinOp(spv::OpFOrdLessThan, b.makeBoolType(), scaled, zero), negative, positive);
+        }
+        const float minimum = signed_channel ? (signed_556 ? -16.f : -128.f) : 0.f;
+        const auto code = b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450FClamp,
+            {rounded, b.makeFloatConstant(minimum), scale});
+        channels[channel] = b.createBinOp(spv::OpFDiv, f32, code, scale);
+    }
+    return b.createCompositeConstruct(v4, {channels[0], channels[1], channels[2], channels[3]});
+}
+
 static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &parameters, utils::SpirvUtilFunctions &utils, const FeatureState &features, TranslationState &translation_state, NonDependentTextureQueryCallInfos &tex_query_infos, SamplerMap &samplers,
     const SceGxmProgram &program) {
     static const std::unordered_map<std::uint32_t, std::pair<std::string, std::uint32_t>> name_map = {
@@ -417,6 +467,7 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
 
     std::uint32_t pa_offset = 0;
     std::uint32_t anon_tex_count = 0;
+    std::unordered_map<std::uint32_t, spv::Id> pa_input_by_id;
 
     const SceGxmProgramParameter *const gxp_parameters = program.program_parameters();
 
@@ -483,20 +534,68 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
             if (input_id == 0xD000) {
                 pa_iter_var = b.createLoad(translation_state.frag_coord_id, spv::NoPrecision);
 
+                if (translation_state.is_metal) {
+                    b.addCapability(spv::CapabilitySampleRateShading);
+                    const spv::Id u32 = b.makeUintType(32);
+                    const spv::Id f32 = b.makeFloatType(32);
+                    const spv::Id sample_input = b.createVariable(spv::NoPrecision, spv::StorageClassInput, u32, "gl_SampleID");
+                    b.addDecoration(sample_input, spv::DecorationBuiltIn, spv::BuiltInSampleId);
+                    translation_state.interfaces.push_back(sample_input);
+                    const spv::Id sample_id = b.createLoad(sample_input, spv::NoPrecision);
+                    const spv::Id count_ptr = utils::create_access_chain(b, spv::StorageClassUniform,
+                        translation_state.render_info_id, { b.makeIntConstant(FRAG_UNIFORM_frag_coord_samples) });
+                    const spv::Id sample_count = b.createLoad(count_ptr, spv::NoPrecision);
+                    const spv::Id is_four = b.createBinOp(spv::OpIEqual, b.makeBoolType(), sample_count, b.makeUintConstant(4));
+                    const spv::Id has_samples = b.createBinOp(spv::OpUGreaterThan, b.makeBoolType(), sample_count, b.makeUintConstant(1));
+                    const spv::Id sample_x = b.createBinOp(spv::OpBitwiseAnd, u32, sample_id, b.makeUintConstant(1));
+                    const spv::Id sample_y_four = b.createBinOp(spv::OpShiftRightLogical, u32, sample_id, b.makeUintConstant(1));
+                    const spv::Id sample_y = b.createTriOp(spv::OpSelect, u32, is_four, sample_y_four, sample_id);
+                    const spv::Id half = b.makeFloatConstant(0.5f);
+                    const auto sample_position = [&](spv::Id sample) {
+                        const spv::Id value = b.createUnaryOp(spv::OpConvertUToF, f32, sample);
+                        return b.createBinOp(spv::OpFMul, f32,
+                            b.createBinOp(spv::OpFAdd, f32, value, half), half);
+                    };
+                    const spv::Id native_x = b.createCompositeExtract(pa_iter_var, f32, 0);
+                    const spv::Id native_y = b.createCompositeExtract(pa_iter_var, f32, 1);
+                    const auto pixel_origin = [&](spv::Id native) {
+                        return b.createUnaryOp(spv::OpConvertUToF, f32,
+                            b.createUnaryOp(spv::OpConvertFToU, u32, native));
+                    };
+                    const spv::Id x_sample = b.createBinOp(spv::OpFAdd, f32, pixel_origin(native_x),
+                        b.createTriOp(spv::OpSelect, f32, is_four, sample_position(sample_x), half));
+                    const spv::Id y_sample = b.createBinOp(spv::OpFAdd, f32,
+                        pixel_origin(native_y), sample_position(sample_y));
+                    const spv::Id x = b.createTriOp(spv::OpSelect, f32, has_samples, x_sample, native_x);
+                    const spv::Id y = b.createTriOp(spv::OpSelect, f32, has_samples, y_sample, native_y);
+                    pa_iter_var = b.createCompositeConstruct(v4, { x, y,
+                        b.createCompositeExtract(pa_iter_var, f32, 2),
+                        b.createCompositeExtract(pa_iter_var, f32, 3) });
+                }
+
                 // divide by the resolution multiplier
                 spv::Id res_multiplier = utils::create_access_chain(b, spv::StorageClassUniform, translation_state.render_info_id, { b.makeIntConstant(FRAG_UNIFORM_res_multiplier) });
                 res_multiplier = b.createLoad(res_multiplier, spv::NoPrecision);
+                spv::Id res_multiplier_y = utils::create_access_chain(b, spv::StorageClassUniform, translation_state.render_info_id, { b.makeIntConstant(FRAG_UNIFORM_res_multiplier_y) });
+                res_multiplier_y = b.createLoad(res_multiplier_y, spv::NoPrecision);
                 // don't change the z and w coords
                 spv::Id one = b.makeFloatConstant(1.0f);
-                res_multiplier = b.createCompositeConstruct(v4, { res_multiplier, res_multiplier, one, one });
+                res_multiplier = b.createCompositeConstruct(v4, { res_multiplier, res_multiplier_y, one, one });
 
                 pa_iter_var = b.createBinOp(spv::OpFDiv, v4, pa_iter_var, res_multiplier);
             } else {
-                spv::Decoration precision = get_data_type_size(pa_dtype) < 4 ? spv::DecorationRelaxedPrecision : spv::NoPrecision;
-                pa_iter_var = b.createVariable(precision, spv::StorageClassInput, pa_iter_type, pa_name.c_str());
-                b.addDecoration(pa_iter_var, spv::DecorationLocation, pa_loc);
-
-                translation_state.interfaces.push_back(pa_iter_var);
+                // A GXP may describe the same varying more than once to copy it
+                // into different PA registers. Each SPIR-V location must still
+                // have exactly one input variable (and one Metal stage input).
+                if (const auto existing = pa_input_by_id.find(input_id); existing != pa_input_by_id.end()) {
+                    pa_iter_var = existing->second;
+                } else {
+                    spv::Decoration precision = get_data_type_size(pa_dtype) < 4 ? spv::DecorationRelaxedPrecision : spv::NoPrecision;
+                    pa_iter_var = b.createVariable(precision, spv::StorageClassInput, pa_iter_type, pa_name.c_str());
+                    b.addDecoration(pa_iter_var, spv::DecorationLocation, pa_loc);
+                    translation_state.interfaces.push_back(pa_iter_var);
+                    pa_input_by_id.emplace(input_id, pa_iter_var);
+                }
             }
 
             translation_state.var_to_regs.push_back(
@@ -747,11 +846,25 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
 
         auto store_source_result = [&](const bool direct_store = false) {
             if (source != spv::NoResult) {
-                if (translation_state.is_metal && translation_state.hints->color_format == SCE_GXM_COLOR_FORMAT_U8_A) {
+                if (translation_state.is_metal
+                    && gxm::is_alpha_only_color_format(translation_state.hints->color_format)) {
                     // Alpha-only guest surfaces are backed by native R8.
                     const auto alpha = b.createCompositeExtract(source, f32, 0);
                     const auto zero = b.makeFloatConstant(0);
                     source = b.createCompositeConstruct(v4, {zero, zero, zero, alpha});
+                } else if (translation_state.is_metal
+                    && gxm::is_green_only_color_format(translation_state.hints->color_format)) {
+                    const auto green = b.createCompositeExtract(source, f32, 0);
+                    const auto zero = b.makeFloatConstant(0);
+                    source = b.createCompositeConstruct(v4, {zero, green, zero, b.makeFloatConstant(1)});
+                } else if (translation_state.is_metal
+                    && gxm::is_red_alpha_color_format(translation_state.hints->color_format)) {
+                    // RG8 framebuffer fetch returns native R/G; the G channel
+                    // represents the guest's logical alpha.
+                    const auto zero = b.makeFloatConstant(0);
+                    source = b.createCompositeConstruct(v4,
+                        {b.createCompositeExtract(source, f32, 0), zero, zero,
+                            b.createCompositeExtract(source, f32, 1)});
                 }
                 if (!direct_store && !is_float_data_type(target_to_store.type)) {
                     source = utils::convert_to_int(b, utils, source, target_to_store.type, true);
@@ -798,6 +911,10 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
                 utils::store(b, parameters, utils, features, raw_target, words, 0b0011, 0);
                 source = spv::NoResult;
             }
+
+            if (source != spv::NoResult && translation_state.is_metal
+                && uses_metal_guest_color_quantization(translation_state.hints->color_format))
+                source = quantize_metal_guest_color(b, utils, translation_state.hints->color_format, source);
 
             translation_state.last_frag_data_id = last_frag_data;
         } else if (features.support_shader_interlock || features.support_texture_barrier) {
@@ -1061,7 +1178,7 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
 
     if (program_type == SceGxmProgramType::Vertex) {
         // Create the default reg uniform buffer
-        std::vector<spv::Id> uniform_composition = { v4, f32, f32, f32, f32, f32 };
+        std::vector<spv::Id> uniform_composition = { v4, f32, f32, f32, f32, f32, f32 };
         if (uniform_buffer_count > 0)
             uniform_composition.push_back(buffer_addresses_type);
         if (uniform_texture_count > 0) {
@@ -1085,6 +1202,7 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
         ADD_VERT_UNIFORM_MEMBER(screen_height);
         ADD_VERT_UNIFORM_MEMBER(z_offset);
         ADD_VERT_UNIFORM_MEMBER(z_scale);
+        ADD_VERT_UNIFORM_MEMBER(point_size);
 
 #undef ADD_VERT_UNIFORM_MEMBER
 #define ADD_EXT_UNIFORM_MEMBER(name)                                                                                                                                                \
@@ -1110,7 +1228,7 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
     }
 
     if (program_type == SceGxmProgramType::Fragment) {
-        std::vector<spv::Id> uniform_composition = { f32, f32, f32, f32, f32 };
+        std::vector<spv::Id> uniform_composition = { f32, f32, f32, f32, f32, f32, f32, u32 };
         if (uniform_buffer_count > 0)
             uniform_composition.push_back(buffer_addresses_type);
         if (uniform_texture_count > 0) {
@@ -1134,10 +1252,14 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
         ADD_FRAG_UNIFORM_MEMBER(writing_mask);
         ADD_FRAG_UNIFORM_MEMBER(use_raw_image);
         ADD_FRAG_UNIFORM_MEMBER(res_multiplier);
+        ADD_FRAG_UNIFORM_MEMBER(point_replay_face);
+        ADD_FRAG_UNIFORM_MEMBER(res_multiplier_y);
+        ADD_FRAG_UNIFORM_MEMBER(frag_coord_samples);
 
 #undef ADD_FRAG_UNIFORM_MEMBER
         // the resolution multiplier does not require a high precision
         b.addMemberDecoration(render_buf_type, FRAG_UNIFORM_res_multiplier, spv::DecorationRelaxedPrecision);
+        b.addMemberDecoration(render_buf_type, FRAG_UNIFORM_res_multiplier_y, spv::DecorationRelaxedPrecision);
 
 #define ADD_EXT_UNIFORM_MEMBER(name)                                                                                                                                                \
     spv_params.name##_id = curr_field_id;                                                                                                                                           \
@@ -1299,8 +1421,11 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
         case SCE_GXM_PARAMETER_SEMANTIC_INDEX:
             if (translation_state.is_vulkan)
                 b.addDecoration(var, spv::DecorationBuiltIn, spv::BuiltInVertexIndex);
-            else
+            else {
                 b.addDecoration(var, spv::DecorationBuiltIn, spv::BuiltInVertexId);
+                if (translation_state.is_metal)
+                    translation_state.metal_vertex_id = var;
+            }
             break;
 
         case SCE_GXM_PARAMETER_SEMANTIC_INSTANCE:
@@ -1518,9 +1643,13 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
         const auto scale_ptr = utils::create_access_chain(b, spv::StorageClassUniform, spv_params.render_info_id,
             {b.makeIntConstant(FRAG_UNIFORM_res_multiplier)});
         const auto scale = b.createLoad(scale_ptr, spv::NoPrecision);
+        const auto scale_y_ptr = utils::create_access_chain(b, spv::StorageClassUniform, spv_params.render_info_id,
+            {b.makeIntConstant(FRAG_UNIFORM_res_multiplier_y)});
+        const auto scale_y = b.createLoad(scale_y_ptr, spv::NoPrecision);
         const auto coordinate = [&](int component) {
             const auto value = b.createCompositeExtract(coords, f32_type, component);
-            return b.createUnaryOp(spv::OpConvertFToU, u32, b.createBinOp(spv::OpFDiv, f32_type, value, scale));
+            return b.createUnaryOp(spv::OpConvertFToU, u32,
+                b.createBinOp(spv::OpFDiv, f32_type, value, component == 0 ? scale : scale_y));
         };
         const auto x = coordinate(0), y = coordinate(1);
         const auto local_x = b.createBinOp(spv::OpBitwiseAnd, u32, x, b.makeUintConstant(15));
@@ -1535,8 +1664,16 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
             b.makeBoolType(), "gl_FrontFacing");
         b.addDecoration(translation_state.native_front_facing_id, spv::DecorationBuiltIn, spv::BuiltInFrontFacing);
         translation_state.interfaces.push_back(translation_state.native_front_facing_id);
+        const auto replay_face_ptr = utils::create_access_chain(b, spv::StorageClassUniform,
+            spv_params.render_info_id, {b.makeIntConstant(FRAG_UNIFORM_point_replay_face)});
+        const auto replay_face = b.createLoad(replay_face_ptr, spv::NoPrecision);
+        const auto native_front = b.createLoad(translation_state.native_front_facing_id, spv::NoPrecision);
+        const auto effective_front = b.createTriOp(spv::OpSelect, b.makeBoolType(),
+            b.createBinOp(spv::OpFOrdNotEqual, b.makeBoolType(), replay_face, b.makeFloatConstant(0.0f)),
+            b.createBinOp(spv::OpFOrdGreaterThan, b.makeBoolType(), replay_face, b.makeFloatConstant(0.0f)),
+            native_front);
         const auto back_face = b.createTriOp(spv::OpSelect, u32,
-            b.createLoad(translation_state.native_front_facing_id, spv::NoPrecision), b.makeUintConstant(0), b.makeUintConstant(1));
+            effective_front, b.makeUintConstant(0), b.makeUintConstant(1));
         const auto values = b.createCompositeConstruct(f32_v4_type, {
             b.createUnaryOp(spv::OpBitcast, f32_type, local_x),
             b.createUnaryOp(spv::OpBitcast, f32_type, local_y),
@@ -1555,6 +1692,170 @@ static void generate_shader_body(spv::Builder &b, const SpirvShaderParameters &p
     const NonDependentTextureQueryCallInfos &texture_queries, const spv::Id render_info_id, spv::Function *spv_func_main, std::vector<spv::Id> &interfaces) {
     // Do texture queries
     usse::convert_gxp_usse_to_spirv(b, program, features, parameters, utils, begin_hook_func, end_hook_func, texture_queries, render_info_id, spv_func_main, interfaces);
+}
+
+static spv::Id blend_metal_red_alpha(spv::Builder &b, utils::SpirvUtilFunctions &utils,
+    TranslationState &state, spv::Id source) {
+    const auto f32 = b.makeFloatType(32);
+    const auto v4 = b.makeVectorType(f32, 4);
+    if (state.last_frag_data_id == spv::NoResult) {
+        const auto image = b.makeImageType(f32, spv::DimSubpassData, false, false, false, 2,
+            spv::ImageFormatUnknown);
+        state.last_frag_data_id = b.createVariable(spv::NoPrecision, spv::StorageClassUniformConstant,
+            image, "red_alpha_destination");
+        b.addDecoration(state.last_frag_data_id, spv::DecorationInputAttachmentIndex, 0);
+        b.addDecoration(state.last_frag_data_id, spv::DecorationDescriptorSet, 1);
+        b.addDecoration(state.last_frag_data_id, spv::DecorationBinding, 0);
+    }
+    const auto zero = b.makeFloatConstant(0);
+    const auto one = b.makeFloatConstant(1);
+    const auto offset = b.makeCompositeConstant(b.makeVectorType(b.makeIntType(32), 2),
+        {b.makeIntConstant(0), b.makeIntConstant(0)});
+    const auto destination = b.createOp(spv::OpImageRead, v4,
+        {b.createLoad(state.last_frag_data_id, spv::NoPrecision), offset});
+    const auto src_r = b.createCompositeExtract(source, f32, 0);
+    const auto src_a = b.createCompositeExtract(source, f32, 3);
+    const auto dst_r = b.createCompositeExtract(destination, f32, 0);
+    // RG8's green component stores the logical destination alpha.
+    const auto dst_a = b.createCompositeExtract(destination, f32, 1);
+    const auto subtract_one = [&](spv::Id value) { return b.createBinOp(spv::OpFSub, f32, one, value); };
+    const auto factor = [&](SceGxmBlendFactor value, bool alpha_channel) -> spv::Id {
+        switch (value) {
+        case SCE_GXM_BLEND_FACTOR_ZERO: return zero;
+        case SCE_GXM_BLEND_FACTOR_ONE: return one;
+        case SCE_GXM_BLEND_FACTOR_SRC_COLOR: return alpha_channel ? src_a : src_r;
+        case SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_COLOR:
+            return subtract_one(alpha_channel ? src_a : src_r);
+        case SCE_GXM_BLEND_FACTOR_SRC_ALPHA: return src_a;
+        case SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: return subtract_one(src_a);
+        case SCE_GXM_BLEND_FACTOR_DST_COLOR: return alpha_channel ? dst_a : dst_r;
+        case SCE_GXM_BLEND_FACTOR_ONE_MINUS_DST_COLOR:
+            return subtract_one(alpha_channel ? dst_a : dst_r);
+        case SCE_GXM_BLEND_FACTOR_DST_ALPHA:
+        case SCE_GXM_BLEND_FACTOR_DST_ALPHA_SATURATE: return dst_a;
+        case SCE_GXM_BLEND_FACTOR_ONE_MINUS_DST_ALPHA: return subtract_one(dst_a);
+        case SCE_GXM_BLEND_FACTOR_SRC_ALPHA_SATURATE:
+            return alpha_channel ? one : b.createBuiltinCall(f32, utils.std_builtins,
+                GLSLstd450FMin, {src_a, subtract_one(dst_a)});
+        }
+        throw std::runtime_error("Unknown GXM R/A blend factor");
+    };
+    const auto apply = [&](SceGxmBlendFunc operation, SceGxmBlendFactor source_factor,
+        SceGxmBlendFactor destination_factor, spv::Id src, spv::Id dst,
+        bool alpha_channel) -> spv::Id {
+        switch (operation) {
+        case SCE_GXM_BLEND_FUNC_NONE: return src;
+        case SCE_GXM_BLEND_FUNC_MIN:
+            return b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450FMin, {src, dst});
+        case SCE_GXM_BLEND_FUNC_MAX:
+            return b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450FMax, {src, dst});
+        default: break;
+        }
+        const auto scaled_source = b.createBinOp(spv::OpFMul, f32, src, factor(source_factor, alpha_channel));
+        const auto scaled_destination = b.createBinOp(spv::OpFMul, f32, dst, factor(destination_factor, alpha_channel));
+        switch (operation) {
+        case SCE_GXM_BLEND_FUNC_ADD:
+            return b.createBinOp(spv::OpFAdd, f32, scaled_source, scaled_destination);
+        case SCE_GXM_BLEND_FUNC_SUBTRACT:
+            return b.createBinOp(spv::OpFSub, f32, scaled_source, scaled_destination);
+        case SCE_GXM_BLEND_FUNC_REVERSE_SUBTRACT:
+            return b.createBinOp(spv::OpFSub, f32, scaled_destination, scaled_source);
+        default: throw std::runtime_error("Unknown GXM R/A blend operation");
+        }
+    };
+    const auto &blend = state.hints->metal_red_alpha_blend;
+    const auto red = apply(blend.colorFunc, blend.colorSrc, blend.colorDst, src_r, dst_r, false);
+    const auto alpha = apply(blend.alphaFunc, blend.alphaSrc, blend.alphaDst, src_a, dst_a, true);
+    return b.createCompositeConstruct(v4, {red, zero, zero, alpha});
+}
+
+static spv::Id blend_metal_quantized_color(spv::Builder &b, utils::SpirvUtilFunctions &utils,
+    TranslationState &state, spv::Id source) {
+    const auto f32 = b.makeFloatType(32);
+    const auto v4 = b.makeVectorType(f32, 4);
+    if (state.last_frag_data_id == spv::NoResult) {
+        const auto image = b.makeImageType(f32, spv::DimSubpassData, false, false, false, 2,
+            spv::ImageFormatUnknown);
+        state.last_frag_data_id = b.createVariable(spv::NoPrecision, spv::StorageClassUniformConstant,
+            image, "quantized_color_destination");
+        b.addDecoration(state.last_frag_data_id, spv::DecorationInputAttachmentIndex, 0);
+        b.addDecoration(state.last_frag_data_id, spv::DecorationDescriptorSet, 1);
+        b.addDecoration(state.last_frag_data_id, spv::DecorationBinding, 0);
+    }
+    const auto zero = b.makeFloatConstant(0);
+    const auto one = b.makeFloatConstant(1);
+    const auto offset = b.makeCompositeConstant(b.makeVectorType(b.makeIntType(32), 2),
+        {b.makeIntConstant(0), b.makeIntConstant(0)});
+    const auto raw_destination = b.createOp(spv::OpImageRead, v4,
+        {b.createLoad(state.last_frag_data_id, spv::NoPrecision), offset});
+    const auto destination = quantize_metal_guest_color(b, utils, state.hints->color_format,
+        raw_destination);
+    const auto src_a = b.createCompositeExtract(source, f32, 3);
+    const auto dst_a = b.createCompositeExtract(destination, f32, 3);
+    const auto subtract_one = [&](spv::Id value) {
+        return b.createBinOp(spv::OpFSub, f32, one, value);
+    };
+    const auto factor = [&](SceGxmBlendFactor value, unsigned channel) -> spv::Id {
+        const auto src = b.createCompositeExtract(source, f32, channel);
+        const auto dst = b.createCompositeExtract(destination, f32, channel);
+        switch (value) {
+        case SCE_GXM_BLEND_FACTOR_ZERO: return zero;
+        case SCE_GXM_BLEND_FACTOR_ONE: return one;
+        case SCE_GXM_BLEND_FACTOR_SRC_COLOR: return src;
+        case SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_COLOR: return subtract_one(src);
+        case SCE_GXM_BLEND_FACTOR_DST_COLOR: return dst;
+        case SCE_GXM_BLEND_FACTOR_ONE_MINUS_DST_COLOR: return subtract_one(dst);
+        case SCE_GXM_BLEND_FACTOR_SRC_ALPHA: return src_a;
+        case SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: return subtract_one(src_a);
+        case SCE_GXM_BLEND_FACTOR_DST_ALPHA:
+        case SCE_GXM_BLEND_FACTOR_DST_ALPHA_SATURATE: return dst_a;
+        case SCE_GXM_BLEND_FACTOR_ONE_MINUS_DST_ALPHA: return subtract_one(dst_a);
+        case SCE_GXM_BLEND_FACTOR_SRC_ALPHA_SATURATE:
+            return channel == 3 ? one : b.createBuiltinCall(f32, utils.std_builtins,
+                GLSLstd450FMin, {src_a, subtract_one(dst_a)});
+        }
+        throw std::runtime_error("Unknown GXM quantized color blend factor");
+    };
+    const auto apply = [&](SceGxmBlendFunc operation, SceGxmBlendFactor src_factor,
+        SceGxmBlendFactor dst_factor, unsigned channel) -> spv::Id {
+        const auto src = b.createCompositeExtract(source, f32, channel);
+        const auto dst = b.createCompositeExtract(destination, f32, channel);
+        switch (operation) {
+        case SCE_GXM_BLEND_FUNC_NONE: return src;
+        case SCE_GXM_BLEND_FUNC_MIN:
+            return b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450FMin, {src, dst});
+        case SCE_GXM_BLEND_FUNC_MAX:
+            return b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450FMax, {src, dst});
+        default: break;
+        }
+        const auto scaled_src = b.createBinOp(spv::OpFMul, f32, src, factor(src_factor, channel));
+        const auto scaled_dst = b.createBinOp(spv::OpFMul, f32, dst, factor(dst_factor, channel));
+        switch (operation) {
+        case SCE_GXM_BLEND_FUNC_ADD: return b.createBinOp(spv::OpFAdd, f32, scaled_src, scaled_dst);
+        case SCE_GXM_BLEND_FUNC_SUBTRACT: return b.createBinOp(spv::OpFSub, f32, scaled_src, scaled_dst);
+        case SCE_GXM_BLEND_FUNC_REVERSE_SUBTRACT: return b.createBinOp(spv::OpFSub, f32, scaled_dst, scaled_src);
+        default: throw std::runtime_error("Unknown GXM quantized color blend operation");
+        }
+    };
+    const auto &blend = state.hints->metal_quantized_blend;
+    const bool write[] = {
+        bool(blend.colorMask & SCE_GXM_COLOR_MASK_R),
+        bool(blend.colorMask & SCE_GXM_COLOR_MASK_G),
+        bool(blend.colorMask & SCE_GXM_COLOR_MASK_B),
+        bool(blend.colorMask & SCE_GXM_COLOR_MASK_A)
+    };
+    spv::Id channels[4];
+    for (unsigned channel = 0; channel < 4; ++channel) {
+        const auto dst = b.createCompositeExtract(destination, f32, channel);
+        auto value = write[channel]
+            ? apply(channel == 3 ? blend.alphaFunc : blend.colorFunc,
+                  channel == 3 ? blend.alphaSrc : blend.colorSrc,
+                  channel == 3 ? blend.alphaDst : blend.colorDst, channel)
+            : dst;
+        channels[channel] = value;
+    }
+    return quantize_metal_guest_color(b, utils, state.hints->color_format,
+        b.createCompositeConstruct(v4, {channels[0], channels[1], channels[2], channels[3]}));
 }
 
 static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvShaderParameters &parameters,
@@ -1654,13 +1955,28 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
             color = b.createUnaryOp(spv::OpBitcast, output_type, words);
             precision = spv::NoPrecision;
         }
+        if (translate_state.is_metal && translate_state.hints->metal_red_alpha_shader_blend)
+            color = blend_metal_red_alpha(b, utils, translate_state, color);
+        if (translate_state.is_metal && translate_state.hints->metal_quantized_color_blend)
+            color = blend_metal_quantized_color(b, utils, translate_state, color);
         spv::Id out = b.createVariable(precision, spv::StorageClassOutput, output_type, "out_color");
         translate_state.interfaces.push_back(out);
         b.addDecoration(out, spv::DecorationLocation, 0);
-        if (translate_state.is_metal && translate_state.hints->color_format == SCE_GXM_COLOR_FORMAT_U8_A) {
+        if (translate_state.is_metal && gxm::is_alpha_only_color_format(translate_state.hints->color_format)) {
             // Keep source alpha available for blending, while R8 stores it in R.
             color = b.createOp(spv::OpVectorShuffle, output_type,
                 {{true, color}, {true, color}, {false, 3}, {false, 1}, {false, 2}, {false, 3}});
+        } else if (translate_state.is_metal && gxm::is_green_only_color_format(translate_state.hints->color_format)) {
+            // Native R stores the guest's sole G channel. Preserve source A
+            // for blend factors even though the attachment has no alpha.
+            color = b.createOp(spv::OpVectorShuffle, output_type,
+                {{true, color}, {true, color}, {false, 1}, {false, 1}, {false, 2}, {false, 3}});
+        } else if (translate_state.is_metal && gxm::is_red_alpha_color_format(translate_state.hints->color_format)) {
+            // Metal backs the guest R/A pair with RG8. Keep logical source
+            // alpha in A for source-alpha blend factors. Guest AR byte order
+            // is handled when copying between the native surface and memory.
+            color = b.createOp(spv::OpVectorShuffle, output_type,
+                {{true, color}, {true, color}, {false, 0}, {false, 3}, {false, 2}, {false, 3}});
         }
         b.createStore(color, out);
 
@@ -1789,6 +2105,59 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
     o_op.num = 0;
     o_op.swizzle = SWIZZLE_CHANNEL_4_DEFAULT;
 
+    spv::Id capture = spv::NoResult;
+    spv::Id capture_vertex_id = spv::NoResult;
+    if (translation_state.is_metal && translation_state.hints->metal_capture_vertex_outputs) {
+        // Capture the values leaving the guest vertex stage, including the
+        // position after viewport/depth mapping. Slots match output locations;
+        // point size occupies slot 14. Sparse indices use a distinct variant
+        // whose output starts at the renderer-selected buffer offset.
+        if (!translation_state.hints->metal_capture_vertex_outputs_compact
+            && translation_state.metal_vertex_id == spv::NoResult) {
+            translation_state.metal_vertex_id = b.createVariable(spv::NoPrecision,
+                spv::StorageClassInput, b.makeUintType(32), "metalCaptureVertexId");
+            b.addDecoration(translation_state.metal_vertex_id,
+                spv::DecorationBuiltIn, spv::BuiltInVertexId);
+            translation_state.interfaces.push_back(translation_state.metal_vertex_id);
+        }
+        const spv::Id f32 = b.makeFloatType(32);
+        const spv::Id v4 = b.makeVectorType(f32, 4);
+        const spv::Id outputs = b.makeRuntimeArray(v4);
+        b.addDecoration(outputs, spv::DecorationArrayStride, 16);
+        const spv::Id block = b.makeStructType({outputs}, "MetalVertexOutputCaptureBlock");
+        b.addDecoration(block, spv::DecorationBlock);
+        b.addMemberName(block, 0, "outputs");
+        b.addMemberDecoration(block, 0, spv::DecorationOffset, 0);
+        capture = b.createVariable(spv::NoPrecision, spv::StorageClassStorageBuffer,
+            block, "metalVertexOutputCapture");
+        b.addDecoration(capture, spv::DecorationDescriptorSet, 0);
+        b.addDecoration(capture, spv::DecorationBinding, 5);
+        capture_vertex_id = translation_state.hints->metal_capture_vertex_outputs_compact
+            ? b.makeUintConstant(0)
+            : b.createUnaryOp(spv::OpBitcast, b.makeUintType(32),
+                b.createLoad(translation_state.metal_vertex_id, spv::NoPrecision));
+    }
+    const auto capture_output = [&](uint32_t slot, spv::Id value) {
+        if (capture == spv::NoResult)
+            return;
+        const spv::Id u32 = b.makeUintType(32);
+        const spv::Id offset = b.createBinOp(spv::OpIMul, u32, capture_vertex_id,
+            b.makeUintConstant(metal::CAPTURE_OUTPUT_SLOT_COUNT));
+        const spv::Id index = b.createBinOp(spv::OpIAdd, u32, offset, b.makeUintConstant(slot));
+        const spv::Id target = utils::create_access_chain(b, spv::StorageClassStorageBuffer,
+            capture, {b.makeIntConstant(0), index});
+        b.createStore(value, target);
+    };
+    if (capture != spv::NoResult) {
+        // The replay path can read every slot without consulting the guest
+        // output mask. Outputs absent from this program are defined as zero.
+        const spv::Id zero = b.makeFloatConstant(0.0f);
+        const spv::Id v4 = b.makeVectorType(b.makeFloatType(32), 4);
+        const spv::Id zero4 = b.makeCompositeConstant(v4, {zero, zero, zero, zero});
+        for (uint32_t slot = 0; slot < metal::CAPTURE_OUTPUT_SLOT_COUNT; ++slot)
+            capture_output(slot, zero4);
+    }
+
     for (const auto vo : vertex_outputs_list) {
         if (vertex_outputs & vo) {
             const auto vo_typed = static_cast<SceGxmVertexProgramOutputs>(vo);
@@ -1908,11 +2277,19 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
                 }
 
                 cond_builder.makeEndIf();
+                if (capture != spv::NoResult)
+                    capture_output(properties.location, b.createLoad(out_var, spv::NoPrecision));
             } else if (vo == SCE_GXM_VERTEX_PROGRAM_OUTPUT_PSIZE) {
                 b.addDecoration(out_var, spv::DecorationBuiltIn, spv::BuiltInPointSize);
                 b.createStore(o_val, out_var);
+                if (capture != spv::NoResult) {
+                    const spv::Id zero = b.makeFloatConstant(0.0f);
+                    capture_output(properties.location, b.createCompositeConstruct(
+                        b.makeVectorType(b.makeFloatType(32), 4), {o_val, zero, zero, zero}));
+                }
             } else {
                 b.createStore(o_val, out_var);
+                capture_output(properties.location, o_val);
             }
 
             o_op.num += properties.component_count;
@@ -1928,7 +2305,28 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
             b.addDecoration(out, spv::DecorationLocation, properties.location);
             translation_state.interfaces.push_back(out);
             const auto zero = b.makeFloatConstant(0.0f);
-            b.createStore(b.makeCompositeConstant(type, {zero, zero, zero, zero}), out);
+            const auto value = b.makeCompositeConstant(type, {zero, zero, zero, zero});
+            b.createStore(value, out);
+            capture_output(properties.location, value);
+        }
+    }
+
+    if (translation_state.is_metal && !(vertex_outputs & SCE_GXM_VERTEX_PROGRAM_OUTPUT_PSIZE)) {
+        // Metal point rasterization needs a defined size even when the guest
+        // vertex program does not write PSIZE. GXM may change the front size
+        // dynamically between draws, including with resolution scaling.
+        const spv::Id point_size = b.createVariable(spv::NoPrecision, spv::StorageClassOutput,
+            b.makeFloatType(32), "v_DefaultPointSize");
+        b.addDecoration(point_size, spv::DecorationBuiltIn, spv::BuiltInPointSize);
+        translation_state.interfaces.push_back(point_size);
+        const spv::Id requested_size = utils::create_access_chain(b, spv::StorageClassUniform,
+            translation_state.render_info_id, { b.makeIntConstant(VERT_UNIFORM_point_size) });
+        const spv::Id size = b.createLoad(requested_size, spv::NoPrecision);
+        b.createStore(size, point_size);
+        if (capture != spv::NoResult) {
+            const spv::Id zero = b.makeFloatConstant(0.0f);
+            capture_output(14, b.createCompositeConstruct(
+                b.makeVectorType(b.makeFloatType(32), 4), {size, zero, zero, zero}));
         }
     }
 
@@ -1962,6 +2360,14 @@ static spv::Function *make_frag_initialize_function(spv::Builder &b, Translation
     spv::Id back_disabled = utils::create_access_chain(b, spv::StorageClassUniform, translate_state.render_info_id, { b.makeIntConstant(FRAG_UNIFORM_back_disabled) });
 
     front_facing = b.createLoad(front_facing, spv::NoPrecision);
+    if (translate_state.is_metal) {
+        const spv::Id replay_face_ptr = utils::create_access_chain(b, spv::StorageClassUniform,
+            translate_state.render_info_id, {b.makeIntConstant(FRAG_UNIFORM_point_replay_face)});
+        const spv::Id replay_face = b.createLoad(replay_face_ptr, spv::NoPrecision);
+        front_facing = b.createTriOp(spv::OpSelect, booltype,
+            b.createBinOp(spv::OpFOrdNotEqual, booltype, replay_face, zero),
+            b.createBinOp(spv::OpFOrdGreaterThan, booltype, replay_face, zero), front_facing);
+    }
 
     spv::Id pred = b.createOp(spv::OpLogicalAnd, booltype, { b.createBinOp(spv::OpFOrdNotEqual, booltype, b.createLoad(front_disabled, spv::NoPrecision), zero), front_facing });
 

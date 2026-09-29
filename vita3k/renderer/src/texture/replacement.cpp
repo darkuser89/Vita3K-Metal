@@ -547,9 +547,10 @@ bool TextureCache::import_configure_texture() {
     if (current_info->is_imported
         && current_info->width == width
         && current_info->height == height
-        && current_info->mip_count == 1
+        && current_info->mip_count == mipcount
         && current_info->format == base_format
-        && current_info->is_srgb == is_srgb) {
+        && current_info->is_srgb == is_srgb
+        && current_info->import_swap_rb == swap_rb) {
         // no parameter was changed, no need to reconfigure the texture
         return true;
     }
@@ -560,6 +561,7 @@ bool TextureCache::import_configure_texture() {
     current_info->mip_count = mipcount;
     current_info->format = base_format;
     current_info->is_srgb = is_srgb;
+    current_info->import_swap_rb = swap_rb;
 
     import_configure_impl(base_format, width, height, is_srgb, nb_comp, mipcount, swap_rb);
     return true;
@@ -579,7 +581,9 @@ void TextureCache::import_upload_texture() {
             for (uint32_t mip = 0; mip < mipcount; mip++) {
                 const uint8_t *mip_data = imported_texture_decoded + ddspp::get_offset(*dds_descriptor, mip, face);
                 // dds textures are tightly packed (up to the block size)
-                upload_texture_impl(current_info->format, width, height, mip, mip_data, is_cube + face, align(width, block_width));
+                const uint32_t upload_stride = texture::is_astc_format(current_info->format)
+                    ? ((width + block_width - 1) / block_width) * block_width : align(width, block_width);
+                upload_texture_impl(current_info->format, width, height, mip, mip_data, is_cube + face, upload_stride);
 
                 // on to the next mip
                 width /= 2;

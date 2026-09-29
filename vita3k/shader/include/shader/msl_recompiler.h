@@ -21,13 +21,14 @@ inline constexpr uint32_t RENDER_INFO_BUFFER = 0;
 inline constexpr uint32_t UNIFORM_BUFFER = 1;
 inline constexpr uint32_t TEXTURE_INFO_BUFFER = 2;
 inline constexpr uint32_t VERTEX_STREAM_BUFFER_BASE = 4;
+inline constexpr uint32_t VERTEX_OUTPUT_CAPTURE_BUFFER = 30;
 inline constexpr uint32_t TEXTURE_COUNT = 16;
 inline constexpr uint32_t COLOR_ATTACHMENT_TEXTURE = 16;
 inline constexpr uint32_t MASK_TEXTURE = 17;
 inline constexpr uint32_t RAW_COLOR_ATTACHMENT_TEXTURE = 18;
-inline constexpr uint32_t SHADER_ABI_VERSION = 18;
+inline constexpr uint32_t SHADER_ABI_VERSION = 23;
 
-enum class Stage { Vertex, Fragment };
+enum class Stage { Vertex, Fragment, Compute };
 
 struct Program {
     std::string source;
@@ -51,6 +52,14 @@ bool writes_external_memory(const std::vector<uint32_t> &spirv);
 // Built-in emulator overlays use their own ABI: push constants at buffer(0),
 // vertex data at buffer(1), and image/font textures at texture/sampler(0..1).
 Program convert_overlay_spirv(const std::vector<uint32_t> &spirv);
+
+// Replay post-vertex polygon points after CPU clipping. The input buffer
+// contains CAPTURE_OUTPUT_SLOT_COUNT float4 values per point, in capture order.
+Program point_replay_vertex_program();
+
+// Translate the bundled FSR compute shaders. Their Vulkan bindings are mapped
+// to Metal buffer(0), texture(0..1), and sampler(0).
+Program convert_builtin_compute_spirv(const std::vector<uint32_t> &spirv);
 
 // Recompile the guest program using the native renderer's current format and
 // attribute hints. With memory mapping enabled the render-info address table

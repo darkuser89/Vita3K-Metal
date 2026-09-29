@@ -63,6 +63,7 @@ enum class GXMState : std::uint16_t {
     PointLineWidth,
     StencilFunc,
     Texture,
+    YuvProfile,
     StencilRef,
     VertexStream,
     TwoSided,
@@ -123,8 +124,9 @@ struct GxmRecordState {
 
     bool is_maskupdate = false;
     bool is_gamma_corrected = false;
+    bool has_depth_stencil_surface = true;
 
-    uint8_t _padding[6] = {};
+    uint8_t _padding[5] = {};
 
     // Do not put any state not used for the Vulkan pipeline creation before vertex_streams
     std::array<GXMStreamInfo, SCE_GXM_MAX_VERTEX_STREAMS> vertex_streams;
@@ -145,9 +147,12 @@ struct GxmRecordState {
     GxmStencilStateValues back_stencil_state_values;
 
     uint32_t line_width = 1;
+    uint32_t back_line_width = 1;
 
     int depth_bias_unit = 0;
     int depth_bias_slope = 0;
+    int back_depth_bias_unit = 0;
+    int back_depth_bias_slope = 0;
 
     SceIVector2 region_clip_min;
     SceIVector2 region_clip_max;

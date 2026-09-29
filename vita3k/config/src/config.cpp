@@ -368,7 +368,7 @@ ExitCode init_config(Config &cfg, int argc, char **argv, const Root &root_paths,
     auto config = app.add_option_group("Configuration", "Modify Vita3K's config.yml file");
     config->add_flag("--archive-log,-A", command_line.archive_log, "Make a duplicate of the log file with TITLE_ID and Game ID as title")
         ->group("Logging");
-    config->add_option("--backend-renderer,-B", command_line.backend_renderer, "Renderer backend to use")
+    auto backend_option = config->add_option("--backend-renderer,-B", command_line.backend_renderer, "Renderer backend to use")
         ->ignore_case()->check(CLI::IsMember(std::set<std::string>{ "OpenGL", "Vulkan"
 #ifdef __APPLE__
             , "Metal"
@@ -405,6 +405,8 @@ ExitCode init_config(Config &cfg, int argc, char **argv, const Root &root_paths,
             return InitConfigFailed;
         }
     }
+    const bool explicit_backend = backend_option->count() != 0;
+    const std::string requested_backend = command_line.backend_renderer;
 
     if (!app.get_help_ptr()->empty()) {
         std::cout << app.help() << std::endl;
@@ -438,6 +440,10 @@ ExitCode init_config(Config &cfg, int argc, char **argv, const Root &root_paths,
         } else {
             if (parse(command_line, command_line.config_path, root_paths.get_vita_fs_path()) != Success)
                 return InitConfigFailed;
+            // A selected config file is complete, including settings whose
+            // values happen to equal the defaults. Merge's default-value
+            // heuristic would otherwise keep values from the old config.
+            update_members(cfg, command_line);
         }
     }
 
@@ -457,6 +463,9 @@ ExitCode init_config(Config &cfg, int argc, char **argv, const Root &root_paths,
 
     // Merge configurations
     merge(cfg, command_line);
+    // An explicit CLI choice wins even when it equals the default value.
+    if (explicit_backend)
+        cfg.backend_renderer = requested_backend;
     // In portable mode, override the VitaFS path to be within the portable directory
     if (portable || cfg.vita_fs_path.empty())
         cfg.set_vita_fs_path(root_paths.get_vita_fs_path());

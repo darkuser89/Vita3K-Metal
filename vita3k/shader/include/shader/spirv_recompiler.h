@@ -31,7 +31,7 @@ namespace shader {
 static constexpr int COLOR_ATTACHMENT_TEXTURE_SLOT_IMAGE = 0;
 static constexpr int MASK_TEXTURE_SLOT_IMAGE = 1;
 static constexpr int COLOR_ATTACHMENT_RAW_TEXTURE_SLOT_IMAGE = 3;
-static constexpr uint32_t CURRENT_VERSION = 13;
+static constexpr uint32_t CURRENT_VERSION = 17;
 // fragment shader using the rendering surface as a storage image (because of shader interlock) have a line
 // layout (constant_id = GAMMA_CORRECTION_SPECIALIZATIO_ID) const bool is_srgb = false;
 // Setting this constant to true performs gamma correction in the shader
@@ -54,6 +54,15 @@ struct Hints {
     // color format of the surface, used for the opengl renderer when the GPU does not support features.support_unknown_format
     // I'm asking for the format instead of the base format as the swizzle might be used in future updates for surfaces with only 1 or 2 components
     SceGxmColorFormat color_format;
+    // RG8 backs Metal R/A color targets. Their independent GXM red/alpha
+    // blend equations are evaluated with framebuffer fetch in the fragment
+    // shader because Metal applies one RGB equation to both RG channels.
+    bool metal_red_alpha_shader_blend = false;
+    SceGxmBlendInfo metal_red_alpha_blend = {};
+    // The packed 3/3/2 and mixed signed targets use expanded Metal attachments.
+    // Apply guest channel precision between draws, including masked channels.
+    bool metal_quantized_color_blend = false;
+    SceGxmBlendInfo metal_quantized_blend = {};
 
     // we need to have the texture formats of the sampled textures in two cases:
     // - when doing dependent texture queries with unknown format we need to know the format
@@ -65,6 +74,12 @@ struct Hints {
     // Missing varyings requested by the paired fragment program. Choose zero
     // for unwritten values; declared outputs retain their register layout.
     uint32_t metal_missing_vertex_outputs = 0;
+    // Emit final clip-space position and varyings to a separate Metal buffer
+    // for post-vertex polygon routing. Ordinary shader variants leave this off.
+    bool metal_capture_vertex_outputs = false;
+    // Store every captured vertex at slot zero. The renderer can bind a
+    // different buffer offset per sparse guest index to avoid a huge buffer.
+    bool metal_capture_vertex_outputs_compact = false;
     bool metal_mip_sampling = false;
     // Tile register width is independent of the stored surface format. Keep
     // the declared shader type when no native draw descriptor is available.

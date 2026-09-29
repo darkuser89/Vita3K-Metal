@@ -118,10 +118,13 @@ static void process_batch(renderer::State &state, const FeatureState &features, 
         } else {
 #ifdef __APPLE__
             // Metal may queue snapshot-backed read-only draws. Publish GPU work
-            // before notifications, transfers, frees and all other CPU-visible
-            // commands; state updates and further draws can stay in the batch.
+            // before notifications, transfers, frees and other CPU-visible
+            // commands. SyncSurfaceData finishes in its handler, where the
+            // scene's depth store can join the pending draw command buffer
+            // before notifications are signaled.
             if(state.current_backend==Backend::Metal && state.context
-                && cmd->opcode!=CommandOpcode::Draw && cmd->opcode!=CommandOpcode::SetState)
+                && cmd->opcode!=CommandOpcode::Draw && cmd->opcode!=CommandOpcode::SetState
+                && cmd->opcode!=CommandOpcode::SyncSurfaceData)
                 static_cast<metal::MetalState &>(state).finish(*static_cast<metal::MetalContext *>(state.context));
 #endif
             CommandHelper helper(cmd);

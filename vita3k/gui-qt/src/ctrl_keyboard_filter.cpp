@@ -27,6 +27,7 @@
 #include <QEvent>
 #include <QKeyEvent>
 #include <QMouseEvent>
+#include <QTimer>
 #include <QWheelEvent>
 #include <QWidget>
 #include <QWindow>
@@ -42,6 +43,7 @@ bool CtrlKeyboardFilter::eventFilter(QObject *watched, QEvent *event) {
     case QEvent::FocusOut: {
         std::lock_guard<std::mutex> lock(m_emuenv.ctrl.mutex);
 
+        ++m_focus_generation;
         m_pressed_keys.clear();
         m_emuenv.ctrl.keyboard_state = {};
         pinch_modifier(m_emuenv.touch, false);
@@ -63,7 +65,19 @@ bool CtrlKeyboardFilter::eventFilter(QObject *watched, QEvent *event) {
 
         const bool pressed = (event->type() == QEvent::KeyPress);
         const auto key = physical_key_from_qt_event(*ke);
-        update_state(key, pressed);
+        if (pressed) {
+            ++m_key_generations[key];
+            update_state(key, true);
+        } else if (key != input::PhysicalKeyCode::Unbound) {
+            // A tap can begin and end between guest controller polls. Keep it
+            // visible for one short polling interval before releasing it.
+            const auto key_generation = m_key_generations[key];
+            const auto focus_generation = m_focus_generation;
+            QTimer::singleShot(50, this, [this, key, key_generation, focus_generation] {
+                if (focus_generation == m_focus_generation && key_generation == m_key_generations[key])
+                    update_state(key, false);
+            });
+        }
 
         const auto &cfg = m_emuenv.cfg;
         const auto matches = [key](input::PhysicalKeyCode primary, input::PhysicalKeyCode alternate) {

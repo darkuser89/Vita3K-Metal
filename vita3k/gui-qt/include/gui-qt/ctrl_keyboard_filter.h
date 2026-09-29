@@ -22,6 +22,8 @@
 
 #include <QObject>
 
+#include <cstdint>
+#include <unordered_map>
 #include <unordered_set>
 
 class CtrlKeyboardFilter : public QObject {
@@ -45,4 +47,6 @@ private:
 
     EmuEnvState &m_emuenv;
     std::unordered_set<input::PhysicalKeyCode> m_pressed_keys;
+    std::unordered_map<input::PhysicalKeyCode, uint64_t> m_key_generations;
+    uint64_t m_focus_generation = 0;
 };

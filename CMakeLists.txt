@@ -74,8 +74,6 @@ if(MSVC)
 	string(REPLACE "/Zi" "/Z7" CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO}")
 endif()
 
-enable_testing()
-
 cmake_policy(SET CMP0069 NEW)
 set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
 
@@ -165,6 +163,20 @@ endmacro(boost_compile)
 option(VITA3K_FORCE_CUSTOM_BOOST "Force Vita3K build process to use the Boost version included with the repository" OFF)
 option(VITA3K_FORCE_SYSTEM_BOOST "Force Vita3K build process to use the Boost version in the system and CMake's default paths and ignore the Boost version included with Vita3K" OFF)
 
+set(VITA3K_REQUIRED_BOOST_VERSION 1.81)
+if(APPLE)
+	include(CheckCXXSourceCompiles)
+	check_cxx_source_compiles("#include <version>
+#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION < 220000
+#error libc++ is older than 22
+#endif
+int main() { return 0; }" VITA3K_LIBCPP_22_OR_NEWER)
+	if(VITA3K_LIBCPP_22_OR_NEWER)
+		# Older Boost.ICL assumes associative lookup behavior that libc++ 22 changed.
+		set(VITA3K_REQUIRED_BOOST_VERSION 1.92)
+	endif()
+endif()
+
 # Boost modules to be found by CMake
 set(BOOST_MODULES_TO_FIND filesystem)
 
@@ -178,11 +190,14 @@ macro(get_boost)
 
 		# First, try to find Boost without any hints (system Boost)
 		if(NOT VITA3K_FORCE_CUSTOM_BOOST)
-			find_package(Boost 1.81 COMPONENTS ${BOOST_MODULES_TO_FIND} QUIET)
+			find_package(Boost ${VITA3K_REQUIRED_BOOST_VERSION} COMPONENTS ${BOOST_MODULES_TO_FIND} QUIET)
 		endif()
 
 		# If system Boost hasn't been found, then enable hints to find custom Boost
 		if (NOT Boost_FOUND)
+			if(VITA3K_LIBCPP_22_OR_NEWER)
+				message(FATAL_ERROR "libc++ 22 requires Boost 1.92 or newer for Boost.ICL. Install an updated system Boost or set Boost_DIR to its CMake package; the bundled Boost 1.89 is incompatible.")
+			endif()
 			message(STATUS "A Boost distribution that meets the requirements needed for the project hasn't been found in your system. Falling back to custom Boost distribution...")
 
 			# Set path hints for Boost search inside the repository folder and assist in compilation if needed
@@ -193,7 +208,7 @@ macro(get_boost)
 			set(BOOST_LIBRARYDIR "${BOOST_INSTALLDIR}/lib")                 # find_package(Boost ...) hint
 
 			# Find Boost again to check for a existing compilation of the custom distribution
-			find_package(Boost 1.81 COMPONENTS ${BOOST_MODULES_TO_FIND} PATHS ${BOOST_INSTALLDIR} NO_DEFAULT_PATH)
+			find_package(Boost ${VITA3K_REQUIRED_BOOST_VERSION} COMPONENTS ${BOOST_MODULES_TO_FIND} PATHS ${BOOST_INSTALLDIR} NO_DEFAULT_PATH)
 
 			# If no build of the custom distribution is found, compile it
 			if(NOT Boost_FOUND)
@@ -254,7 +269,7 @@ macro(get_boost)
 				boost_compile()
 
 				# Find Boost again
-				find_package(Boost 1.81 COMPONENTS ${BOOST_MODULES_TO_FIND} PATHS ${BOOST_INSTALLDIR} NO_DEFAULT_PATH REQUIRED)
+				find_package(Boost ${VITA3K_REQUIRED_BOOST_VERSION} COMPONENTS ${BOOST_MODULES_TO_FIND} PATHS ${BOOST_INSTALLDIR} NO_DEFAULT_PATH REQUIRED)
 			else()
 				message(STATUS "Custom Boost distribution found in ${BOOST_INSTALLDIR}")
 			endif()
@@ -262,7 +277,7 @@ macro(get_boost)
 	else()
 		# Try to find Boost on the system and CMake's default paths
 		set(Boost_USE_STATIC_LIBS ON)
-		find_package(Boost 1.81 COMPONENTS ${BOOST_MODULES_TO_FIND} REQUIRED)
+		find_package(Boost ${VITA3K_REQUIRED_BOOST_VERSION} COMPONENTS ${BOOST_MODULES_TO_FIND} REQUIRED)
 	endif()
 endmacro(get_boost)
 
@@ -293,6 +308,12 @@ if (${BUILD_APPIMAGE})
 	else()
 		message(FATAL_ERROR "Cannot build an AppImage for a non-Linux host.")
 	endif()
+endif()
+
+# Tracy is not built in Release. A cached Debug option must not make the
+# Release targets link against a library that does not exist.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+	set(TRACY_ENABLE_ON_CORE_COMPONENTS OFF)
 endif()
 
 add_subdirectory(external)

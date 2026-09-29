@@ -729,21 +729,36 @@ bool USSETranslatorVisitor::vldst(
         // shared scratch storage; our private array already isolates instances.
         // Immediate offsets instead contain a four-bit offset in element units
         // (src1 has already been scaled to bytes above).
-        if (mode != 0 || mask_count != 0 || to_store.type != DataType::F32)
+        if (mode != 0 || to_store.type != DataType::F32)
             throw std::runtime_error("Metal: unsupported private LOCAL load/store mode");
         const auto i32 = m_b.makeIntType(32);
         const uint32_t offset_mask = inst.opr.src1.bank == RegisterBank::IMMEDIATE ? 15 * sizeof(float) : 0xffff;
-        auto offset = m_b.createBinOp(spv::OpBitwiseAnd, i32, source_1, m_b.makeIntConstant(offset_mask));
+        // For an immediate STR address, the repeat advances the LOCAL element.
+        // For a register address, SLMSI selects the address register on each
+        // repeat, so use that register's byte offset directly.
+        auto address_offset = is_store && mask_count != 0 && inst.opr.src1.bank == RegisterBank::IMMEDIATE
+            ? load(inst.opr.src1, 0b1, 0) : source_1;
+        auto offset = m_b.createBinOp(spv::OpBitwiseAnd, i32, address_offset, m_b.makeIntConstant(offset_mask));
         if (!is_store)
             offset = m_b.createBinOp(spv::OpIAdd, i32, offset, load(inst.opr.src2, 0b1, src2_offset));
         if (m_spirv_params.thread_buffer_base)
             offset = m_b.createBinOp(spv::OpIAdd, i32, offset, m_b.makeIntConstant(m_spirv_params.thread_buffer_base));
-        const auto index = m_b.createBinOp(spv::OpShiftRightLogical, i32, offset, m_b.makeUintConstant(2));
-        const auto ptr = utils::create_access_chain(m_b, spv::StorageClassPrivate, m_spirv_params.thread_buffer, { index });
-        if (is_store)
-            m_b.createStore(load(to_store, 0b1), ptr);
-        else
-            store(to_store, m_b.createLoad(ptr, spv::NoPrecision), 0b1);
+        const auto base_index = m_b.createBinOp(spv::OpShiftRightLogical, i32, offset, m_b.makeUintConstant(2));
+        const int components = is_store ? 1 : current_number_to_fetch;
+        for (int component = 0; component < components; ++component) {
+            const int element = is_store
+                ? (inst.opr.src1.bank == RegisterBank::IMMEDIATE ? current_repeat : 0) : component;
+            const auto index = element
+                ? m_b.createBinOp(spv::OpIAdd, i32, base_index, m_b.makeIntConstant(element)) : base_index;
+            const auto ptr = utils::create_access_chain(m_b, spv::StorageClassPrivate, m_spirv_params.thread_buffer, { index });
+            if (is_store) {
+                m_b.createStore(load(to_store, 0b1, to_store_offset), ptr);
+            } else {
+                Operand output = to_store;
+                output.num += component;
+                store(output, m_b.createLoad(ptr, spv::NoPrecision), 0b1);
+            }
+        }
         continue;
     }
 

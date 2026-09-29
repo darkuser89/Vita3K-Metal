@@ -29,7 +29,13 @@ public:
     ~Device();
     void configure_cache(const std::filesystem::path &root);
     std::optional<shader::metal::Program> load_cached_program(std::string_view key) const;
-    void store_cached_program(std::string_view key, const shader::metal::Program &) const;
+    void store_cached_program(std::string_view key, const shader::metal::Program &,
+        std::string_view guest_hash = {}, bool gamma_correction = false) const;
+    std::vector<CachedVariant> cached_variants(std::string_view guest_hash) const;
+    void store_cached_pipeline_template(std::string_view fragment_hash, std::string_view vertex_hash,
+        std::string_view key, std::string_view vertex_key, std::string_view fragment_key,
+        MTLRenderPipelineDescriptor *descriptor) const;
+    std::vector<CachedPipeline> cached_pipeline_templates(std::string_view fragment_hash, std::string_view vertex_hash) const;
     void flush_cache() const;
     CacheStats cache_stats() const;
     std::filesystem::path cache_directory() const;

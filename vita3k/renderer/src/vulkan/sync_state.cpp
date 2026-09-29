@@ -30,6 +30,8 @@ void sync_clipping(VKContext &context) {
     if (!context.render_target)
         return;
 
+    // The region coordinates have already been expanded for MSAA by
+    // COMMAND_SET_STATE(region_clip).
     const float res_multiplier = context.state.res_multiplier;
 
     const int scissor_x = context.record.region_clip_min.x;
@@ -181,6 +183,7 @@ void sync_viewport_real(VKContext &context, const float xOffset, const float yOf
     const float x = xOffset - std::abs(xScale);
     const float y = yOffset - yScale;
 
+    // COMMAND_SET_STATE(viewport) has already expanded the coordinates for MSAA.
     const float res_multiplier = context.state.res_multiplier;
 
     // https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkViewport.html

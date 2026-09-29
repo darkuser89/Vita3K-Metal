@@ -174,9 +174,10 @@ VKRenderTarget::VKRenderTarget(VKState &state, const SceGxmRenderTargetParams &p
     else
         color_usage |= vk::ImageUsageFlagBits::eInputAttachment | vk::ImageUsageFlagBits::eTransientAttachment;
     color.init_image(color_usage);
-    if (params.multisampleMode == SCE_GXM_MULTISAMPLE_4X) {
-        // the depth buffer may need to be 4x bigger if we use a texture without downscale
-        depthstencil.width *= 2;
+    if (params.multisampleMode != SCE_GXM_MULTISAMPLE_NONE) {
+        // Expanded 2x samples need two rows; 4x samples also need two columns.
+        if (params.multisampleMode == SCE_GXM_MULTISAMPLE_4X)
+            depthstencil.width *= 2;
         depthstencil.height *= 2;
     }
 

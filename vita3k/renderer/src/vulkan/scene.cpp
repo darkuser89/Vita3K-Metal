@@ -453,13 +453,20 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
 
     auto &frag_ublock = context.curr_frag_ublock.base_block;
     frag_ublock.writing_mask = context.record.writing_mask;
+    frag_ublock.frag_coord_samples = 1;
     frag_ublock.res_multiplier = context.state.res_multiplier;
-    const bool has_msaa = context.render_target->multisample_mode;
+    frag_ublock.res_multiplier_y = context.state.res_multiplier;
+    const auto multisample_mode = context.render_target->multisample_mode;
+    const bool has_msaa = multisample_mode != SCE_GXM_MULTISAMPLE_NONE;
     const bool has_downscale = context.record.color_surface.downscale;
-    if (has_msaa && !has_downscale)
-        frag_ublock.res_multiplier *= 2;
-    else if (!has_msaa && has_downscale)
+    if (has_msaa && !has_downscale) {
+        if (multisample_mode == SCE_GXM_MULTISAMPLE_4X)
+            frag_ublock.res_multiplier *= 2;
+        frag_ublock.res_multiplier_y *= 2;
+    } else if (!has_msaa && has_downscale) {
         frag_ublock.res_multiplier /= 2;
+        frag_ublock.res_multiplier_y /= 2;
+    }
 
     if (context.curr_frag_ublock.changed || memcmp(&context.prev_frag_ublock, &frag_ublock, sizeof(frag_ublock)) != 0) {
         // TODO: this intermediate step can be avoided
