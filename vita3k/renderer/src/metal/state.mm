@@ -1101,8 +1101,11 @@ static std::pair<std::span<uint8_t>,std::span<uint8_t>> depth_memory_spans(MemSt
     auto span=[&](Ptr<void> pointer,size_t bytes) -> std::span<uint8_t> {
         if(!bytes) return {};
         const uint64_t end=uint64_t(pointer.address())+bytes;
-        require(pointer && end<=uint64_t(UINT32_MAX)-4095 && is_valid_addr_range(mem,pointer.address(),Address(end)),
-            "Metal: depth/stencil allocation extends beyond mapped guest memory");
+        if (!pointer || end>uint64_t(UINT32_MAX)-4095 || !is_valid_addr_range(mem,pointer.address(),Address(end)))
+            throw std::runtime_error(fmt::format(
+                "Metal: depth/stencil allocation extends beyond mapped guest memory: address={:#x} bytes={} size={}x{} stride={} format={:#x} type={:#x}",
+                pointer.address(),bytes,layout.width,layout.height,layout.stride,
+                uint32_t(surface.get_format()),uint32_t(surface.get_type())));
         return {static_cast<uint8_t *>(pointer.get(mem)),bytes};
     };
     return {span(surface.depth_data,layout.depth_size),span(surface.stencil_data,layout.stencil_size)};

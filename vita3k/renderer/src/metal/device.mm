@@ -137,6 +137,18 @@ std::unique_ptr<CompiledProgram> Device::compile(const shader::metal::Program &p
 
 id<MTLRenderPipelineState> Device::create_pipeline(MTLRenderPipelineDescriptor *descriptor,
     std::string &error) const {
+    for (NSUInteger i = 0; i < 8; ++i) {
+        auto *color = descriptor.colorAttachments[i];
+        if (color.pixelFormat != MTLPixelFormatRGB9E5Float)
+            continue;
+        // RGB9E5 has no stored alpha. Metal nevertheless requires All for
+        // a complete RGB write, including when the guest masks alpha out.
+        const auto rgb = color.writeMask & (MTLColorWriteMaskRed | MTLColorWriteMaskGreen | MTLColorWriteMaskBlue);
+        if (rgb == (MTLColorWriteMaskRed | MTLColorWriteMaskGreen | MTLColorWriteMaskBlue))
+            color.writeMask = MTLColorWriteMaskAll;
+        else if (rgb == MTLColorWriteMaskNone)
+            color.writeMask = MTLColorWriteMaskNone;
+    }
     if (cache)
         return cache->create_render_pipeline(descriptor, error);
     error.clear();
