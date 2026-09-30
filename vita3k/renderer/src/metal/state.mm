@@ -454,6 +454,8 @@ struct MetalState::Impl {
     uint32_t traced_draw_flushes = 0;
     uint32_t traced_mid_scene_flushes = 0;
     uint32_t traced_display_fallbacks = 0;
+    uint32_t traced_transfers = 0;
+    uint32_t traced_display_frames = 0;
     bool trace_textures = std::getenv("VITA3K_METAL_TRACE_TEXTURES") != nullptr;
     bool trace_finish_timing = std::getenv("VITA3K_METAL_TRACE_FINISH_TIMING") != nullptr;
     uint64_t timed_finishes = 0;
@@ -1481,6 +1483,12 @@ bool MetalState::transfer_image(MemState &mem, const SceGxmTransferImage &source
     const TransferLayout src{source,source_type,bytes}, dst{destination,destination_type,bytes};
     TransferRanges reads, destinations;
     if (!src.validate(mem,reads) || !dst.validate(mem,destinations)) return false;
+    const bool trace_transfer = impl->trace_batches && impl->traced_transfers++ < 512;
+    if (trace_transfer)
+        LOG_INFO("Metal transfer: src={:#x} {}x{} stride={} xy={},{} type={} dst={:#x} {}x{} stride={} xy={},{} type={} format={:#x} downscale={}",
+            source.address.address(), source.width, source.height, source.stride, source.x, source.y, uint32_t(source_type),
+            destination.address.address(), destination.width, destination.height, destination.stride, destination.x, destination.y,
+            uint32_t(destination_type), uint32_t(source.format), downscale);
     if (context) finish(*static_cast<MetalContext *>(context));
     struct Snapshot { uint64_t address; std::vector<uint8_t> data; };
     struct Update { Surface *surface; size_t bytes; };
@@ -1492,6 +1500,10 @@ bool MetalState::transfer_image(MemState &mem, const SceGxmTransferImage &source
         const bool read=!surface_intersections(address,extent,reads).empty();
         const bool write=!surface_intersections(address,extent,destinations).empty();
         if (!read && !write) continue;
+        if (trace_transfer)
+            LOG_INFO("Metal transfer surface: address={:#x} {}x{} stride={} type={} format={:#x} native={}x{} read={} write={}",
+                address, surface.guest.width, surface.guest.height, surface.guest.strideInPixels, uint32_t(surface.guest.surfaceType),
+                uint32_t(surface.guest.colorFormat), surface.color.width, surface.color.height, read, write);
         const size_t size=surface_memory_size(surface.guest);
         const uint64_t end=uint64_t(address)+size;
         if (!size || end>uint64_t(UINT32_MAX)-4095 || !is_valid_addr_range(mem,address,Address(end))) return false;
@@ -3111,6 +3123,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                           << "\nfragment " << hex_string(fp->renderer_data->hash)
                           << "\nvertex " << hex_string(vp->renderer_data->hash)
                           << "\noutput_register_size " << record.color_surface.outputRegisterSize << '\n';
+            std::ofstream attachment_info(impl->dump_draw_dir/"attachments.txt",std::ios::app);
+            attachment_info << "target " << ctx.impl->guest_color.data.address() << " recorded " << record.color_surface.data.address()
+                << " same_native " << (ctx.impl->color == ctx.impl->render_color) << '\n';
             auto shader_features = features;
             shader_features.enable_memory_mapping = true;
             auto msl = shader::metal::convert_gxp(*vp->program.get(mem), hex_string(vp->renderer_data->hash), shader_features, ctx.shader_hints, false);
@@ -3789,6 +3804,14 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 rendered_format);
             if (capture_draw) {
                 const char *stage=vertex ? "vertex" : "fragment";
+                if (const auto producer=impl->surfaces.find(texture_address);producer!=impl->surfaces.end()) {
+                    const auto &guest=producer->second.guest;
+                    texture_metadata << "producer " << stage << ' ' << slot << ' ' << guest.data.address() << ' '
+                        << guest.width << ' ' << guest.height << ' ' << guest.strideInPixels << ' '
+                        << uint32_t(guest.colorFormat) << ' ' << uint32_t(guest.surfaceType) << ' '
+                        << prepared << ' ' << uploaded_view << '\n';
+                    dump_attachment(fmt::format("{}-producer-{}",stage,slot).c_str(),producer->second.color);
+                }
                 const bool is_cube=native.textureType==MTLTextureTypeCube;
                 const uint32_t faces=is_cube ? 6 : 1;
                 const uint32_t levels=uint32_t(native.mipmapLevelCount);
@@ -4597,6 +4620,13 @@ void MetalState::render_frame(DisplayState &display, const GxmState &, MemState 
         id<MTLTexture> source = nil;
         const auto region = has_frame
             ? find_display_surface_region(impl->surfaces, next, res_multiplier, false) : std::nullopt;
+        if (impl->trace_batches && impl->traced_display_frames++ % 60 == 0 && impl->traced_display_frames < 600) {
+            Address cached_address = 0;
+            if (region) for (const auto &[address, surface] : impl->surfaces)
+                if (surface.color == region->color) { cached_address = address; break; }
+            LOG_INFO("Metal display selection: base={:#x} pitch={} size={}x{} cached={:#x}",
+                next.base.address(), next.pitch, next.image_size.x, next.image_size.y, cached_address);
+        }
         if (region) {
             source = region->color;
             if (region->destination_line || region->available_rows != region->height) {

@@ -833,10 +833,28 @@ bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surfa
         return true;
     }
     const size_t native_pixel_bytes = components.count == 3 ? 4 : pixel_bytes;
-    const size_t native_stride = texture.width * native_pixel_bytes;
-    std::vector<uint8_t> raw(native_stride * texture.height);
+    const size_t native_width = texture.width, native_height = texture.height;
+    const size_t native_stride = native_width * native_pixel_bytes;
+    std::vector<uint8_t> raw(native_stride * native_height);
     [texture getBytes:raw.data() bytesPerRow:native_stride
-        fromRegion:MTLRegionMake2D(0, 0, texture.width, texture.height) mipmapLevel:0];
+        fromRegion:MTLRegionMake2D(0, 0, native_width, native_height) mipmapLevel:0];
+    // Linear byte-channel surfaces need only a permutation. Keep the four
+    // byte copies explicit so this common readback avoids dynamic memcpy
+    // calls and Objective-C texture queries for every component and pixel.
+    if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR && components.count == 4 && components.bytes == 1
+        && native_width == surface.width && native_height == surface.height) {
+        for (uint32_t y = 0; y < surface.height; ++y) {
+            const auto *input = raw.data() + y * native_stride;
+            auto *output = destination.data() + size_t(y) * surface.strideInPixels * 4;
+            for (uint32_t x = 0; x < surface.width; ++x, input += 4, output += 4) {
+                output[0] = input[channel[0]];
+                output[1] = input[channel[1]];
+                output[2] = input[channel[2]];
+                output[3] = input[channel[3]];
+            }
+        }
+        return true;
+    }
     for (uint32_t y = 0; y < surface.height; ++y) for (uint32_t x = 0; x < surface.width; ++x) {
         size_t offset;
         if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_TILED)
@@ -846,8 +864,8 @@ bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surfa
         else offset = size_t(y) * surface.strideInPixels + x;
         // Point-select the top-left native sample of each guest pixel, matching
         // the existing GL readback convention; never average packed data words.
-        const auto *input = raw.data() + (size_t(y) * texture.height / surface.height) * native_stride
-            + (size_t(x) * texture.width / surface.width) * native_pixel_bytes;
+        const auto *input = raw.data() + (size_t(y) * native_height / surface.height) * native_stride
+            + (size_t(x) * native_width / surface.width) * native_pixel_bytes;
         auto *output = destination.data() + offset * pixel_bytes;
         if (packed565) {
             uint16_t word;
