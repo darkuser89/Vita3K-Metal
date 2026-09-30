@@ -26,6 +26,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <fstream>
@@ -481,6 +482,12 @@ struct MetalState::Impl {
     std::set<std::string> traced_textures;
     bool trace_draws = std::getenv("VITA3K_METAL_TRACE_DRAWS") != nullptr;
     std::set<std::string> traced_draws;
+    std::string trace_pixel = std::getenv("VITA3K_METAL_TRACE_PIXEL") ? std::getenv("VITA3K_METAL_TRACE_PIXEL") : "";
+    std::filesystem::path trace_pixel_trigger = std::getenv("VITA3K_METAL_TRACE_PIXEL_TRIGGER")
+        ? std::getenv("VITA3K_METAL_TRACE_PIXEL_TRIGGER") : "";
+    uint32_t traced_pixel_draws = 0;
+    float last_traced_pixel[4]{};
+    bool has_traced_pixel = false;
     std::filesystem::path dump_pipeline_dir = std::getenv("VITA3K_METAL_DUMP_PIPELINE_DIR") ? std::getenv("VITA3K_METAL_DUMP_PIPELINE_DIR") : "";
     uint32_t dumped_pipelines = 0;
     std::filesystem::path dump_surface_dir = std::getenv("VITA3K_METAL_DUMP_SURFACE_DIR") ? std::getenv("VITA3K_METAL_DUMP_SURFACE_DIR") : "";
@@ -493,6 +500,9 @@ struct MetalState::Impl {
     uint32_t dump_draw_texture_width = std::getenv("VITA3K_METAL_DUMP_DRAW_TEXTURE_WIDTH")
         ? uint32_t(std::strtoul(std::getenv("VITA3K_METAL_DUMP_DRAW_TEXTURE_WIDTH"), nullptr, 10)) : 0;
     std::string dump_arm_shader = std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_SHADER") ? std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_SHADER") : "";
+    std::string dump_arm_pixel_shader = std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_PIXEL_SHADER")
+        ? std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_PIXEL_SHADER") : "";
+    bool dump_pixel_armed = false;
     bool dump_armed = dump_arm_shader.empty();
     bool dump_attachments = std::getenv("VITA3K_METAL_DUMP_DRAW_ATTACHMENTS") != nullptr;
     std::string dump_vertex_shader = std::getenv("VITA3K_METAL_DUMP_VERTEX_SHADER") ? std::getenv("VITA3K_METAL_DUMP_VERTEX_SHADER") : "";
@@ -2328,6 +2338,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         if (!impl->dump_armed && fragment_resources && impl->dump_arm_shader == hex_string(fp->renderer_data->hash))
             impl->dump_armed = true;
         const bool capture_draw = !impl->dump_draw_dir.empty() && !impl->draw_dumped && impl->dump_armed
+            && (impl->dump_arm_pixel_shader.empty() || impl->dump_pixel_armed)
             && (impl->dump_draw_shader.empty() || impl->dump_draw_shader == hex_string(fp->renderer_data->hash))
             && (!impl->dump_draw_texture_address || (fp->renderer_data->textures_used[0]
                 && (ctx.textures[0].data_addr << 2) == impl->dump_draw_texture_address))
@@ -4586,6 +4597,35 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         if (capture_draw && impl->dump_attachments) {
             finish(ctx);
             dump_attachment("color-after",ctx.impl->color);
+        }
+        if (!impl->trace_pixel.empty() && impl->traced_pixel_draws < 1000
+            && (impl->trace_pixel_trigger.empty() || std::filesystem::exists(impl->trace_pixel_trigger))) {
+            unsigned x = 0, y = 0;
+            if (std::sscanf(impl->trace_pixel.c_str(), "%u,%u", &x, &y) == 2
+                && ctx.impl->color && x < ctx.impl->color.width && y < ctx.impl->color.height) {
+                finish(ctx);
+                if (!impl->caster) impl->caster = std::make_unique<SurfaceCaster>(*impl->device);
+                auto snapshot = impl->caster->sampling_snapshot(ctx.impl->color, 0, 0);
+                if (snapshot) {
+                    float pixel[4]{};
+                    [snapshot getBytes:pixel bytesPerRow:sizeof(pixel)
+                        fromRegion:MTLRegionMake2D(x, y, 1, 1) mipmapLevel:0];
+                    bool changed = !impl->has_traced_pixel;
+                    for (unsigned channel = 0; channel < 4 && !changed; ++channel)
+                        changed = std::abs(pixel[channel] - impl->last_traced_pixel[channel]) > 1.0f / 255.0f;
+                    if (changed) {
+                        LOG_INFO("Metal pixel trace draw={} target={:x} fs={} xy={},{} rgba={},{},{},{}",
+                            impl->traced_pixel_draws, ctx.impl->guest_color.data.address(),
+                            hex_string(fp->renderer_data->hash), x, y, pixel[0], pixel[1], pixel[2], pixel[3]);
+                        if (!impl->dump_arm_pixel_shader.empty()
+                            && impl->dump_arm_pixel_shader == hex_string(fp->renderer_data->hash))
+                            impl->dump_pixel_armed = true;
+                        std::copy(std::begin(pixel), std::end(pixel), impl->last_traced_pixel);
+                        impl->has_traced_pixel = true;
+                    }
+                }
+                ++impl->traced_pixel_draws;
+            }
         }
     }
 }
