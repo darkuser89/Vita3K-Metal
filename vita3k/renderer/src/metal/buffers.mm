@@ -68,18 +68,31 @@ void UploadBufferArena::reset_after_completion() {
     blocks.resize(keep);
     current = 0;
 }
-id<MTLBuffer> DirectGuestBufferCache::get(Device &device, uintptr_t begin, uintptr_t end) {
+UploadBufferSlice DirectGuestBufferCache::get(Device &device, uintptr_t begin, uintptr_t end) {
     if (begin >= end || end - begin > device.native_device().maxBufferLength)
         throw std::invalid_argument("Metal: invalid direct guest buffer range");
     const auto key = std::make_pair(begin, end);
     if (const auto found = buffers.find(key); found != buffers.end())
-        return found->second;
+        return {found->second, 0};
+    // Uniform addresses often advance through one large GXM mapping. Reuse a
+    // containing resource instead of registering its remaining pages again.
+    for (const auto &[range, buffer] : buffers) {
+        if (range.first > begin) break;
+        if (range.second >= end) return {buffer, begin - range.first};
+    }
     id<MTLBuffer> buffer = [device.native_device() newBufferWithBytesNoCopy:reinterpret_cast<void *>(begin)
         length:end - begin options:MTLResourceStorageModeShared deallocator:nil];
     if (!buffer || !buffer.gpuAddress)
         throw std::runtime_error("Metal: cannot map direct guest buffer");
+    // Already encoded commands retain their resources through useResource.
+    // Drop cache ownership of narrower aliases now covered by this buffer.
+    for (auto entry = buffers.lower_bound({begin, 0}); entry != buffers.end();) {
+        if (entry->first.first >= end) break;
+        if (entry->first.second <= end) entry = buffers.erase(entry);
+        else ++entry;
+    }
     buffers.emplace(key, buffer);
-    return buffer;
+    return {buffer, 0};
 }
 GuestBufferBindings::GuestBufferBindings(Device &device, std::span<const GuestBufferRange> ranges, size_t page_size, bool snapshot,
     UploadBufferArena *arena, DirectGuestBufferCache *direct_cache)
@@ -103,10 +116,20 @@ GuestBufferBindings::GuestBufferBindings(Device &device, std::span<const GuestBu
         if (!mappings.empty() && begin <= mappings.back().end) {
             mappings.back().end = std::max(mappings.back().end, end);
             mappings.back().direct |= direct;
-            mappings.back().cacheable &= direct;
         } else mappings.push_back({begin, end, nil, 0, direct, direct});
     }
     for (auto &mapping : mappings) {
+        // A register-only binding inside mapped guest pages does not shorten
+        // those pages' lifetime. Determine coverage of the merged resource
+        // from the direct ranges, instead of rejecting every mixed alias.
+        // An adjacent transient page outside that coverage must remain uncached.
+        uintptr_t covered = mapping.begin;
+        for (const auto &range : pages) {
+            if (range.begin > covered) break;
+            if (range.direct && range.end > covered) covered = range.end;
+            if (covered >= mapping.end) break;
+        }
+        mapping.cacheable = covered >= mapping.end;
         const auto length = mapping.end - mapping.begin;
         if (length > device.native_device().maxBufferLength)
             throw std::runtime_error("Metal: guest buffer exceeds maximum native buffer length");
@@ -122,8 +145,11 @@ GuestBufferBindings::GuestBufferBindings(Device &device, std::span<const GuestBu
             if (mapping.buffer)
                 std::memcpy(static_cast<uint8_t *>(mapping.buffer.contents)+mapping.offset,
                     reinterpret_cast<const void *>(mapping.begin),length);
-        } else if (mapping.cacheable && direct_cache)
-            mapping.buffer = direct_cache->get(device, mapping.begin, mapping.end);
+        } else if (mapping.cacheable && direct_cache) {
+            const auto slice = direct_cache->get(device, mapping.begin, mapping.end);
+            mapping.buffer = slice.buffer;
+            mapping.offset = slice.offset;
+        }
         else mapping.buffer = [device.native_device() newBufferWithBytesNoCopy:reinterpret_cast<void *>(mapping.begin)
             length:length options:MTLResourceStorageModeShared deallocator:nil];
         if (!mapping.buffer || !mapping.buffer.gpuAddress)

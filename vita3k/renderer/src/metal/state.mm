@@ -999,6 +999,11 @@ bool MetalState::finish(MetalContext &ctx, bool publish_color) {
             impl->timed_depth_blocked_scenes, impl->timed_mapped_blocked_scenes,
             impl->timed_mapped_draws, impl->timed_mapped_bytes,
             impl->timed_max_mapped_extent);
+        LOG_INFO("Metal resource usage: allocated_bytes={} recommended_bytes={} direct_buffers={} color_surfaces={} depth_surfaces={} pipelines={} compiling={}",
+            uint64_t(impl->device->native_device().currentAllocatedSize),
+            uint64_t(impl->device->native_device().recommendedMaxWorkingSetSize),
+            impl->direct_guest_buffers.size(), impl->surfaces.size(), impl->depth_surfaces.size(),
+            impl->pipelines.size(), impl->compiling_pipelines.size());
         impl->timed_finishes = impl->timed_submits = impl->timed_pending_waits = impl->timed_publications = 0;
         impl->timed_scene_ends = impl->timed_deferred_scenes = impl->timed_depth_blocked_scenes = 0;
         impl->timed_mapped_blocked_scenes = impl->timed_mapped_draws = 0;

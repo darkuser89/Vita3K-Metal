@@ -56,7 +56,7 @@ public:
 class DirectGuestBufferCache {
     std::map<std::pair<uintptr_t, uintptr_t>, id<MTLBuffer>> buffers;
 public:
-    id<MTLBuffer> get(Device &, uintptr_t begin, uintptr_t end);
+    UploadBufferSlice get(Device &, uintptr_t begin, uintptr_t end);
     void clear() { buffers.clear(); }
     size_t size() const { return buffers.size(); }
 };
