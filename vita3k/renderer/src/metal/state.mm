@@ -483,6 +483,10 @@ struct MetalState::Impl {
     bool dump_armed = dump_arm_shader.empty();
     bool dump_attachments = std::getenv("VITA3K_METAL_DUMP_DRAW_ATTACHMENTS") != nullptr;
     std::string dump_vertex_shader = std::getenv("VITA3K_METAL_DUMP_VERTEX_SHADER") ? std::getenv("VITA3K_METAL_DUMP_VERTEX_SHADER") : "";
+    std::filesystem::path dump_trigger_file = std::getenv("VITA3K_METAL_DUMP_DRAW_TRIGGER_FILE")
+        ? std::getenv("VITA3K_METAL_DUMP_DRAW_TRIGGER_FILE") : "";
+    uint32_t dump_stream_stride = std::getenv("VITA3K_METAL_DUMP_DRAW_STREAM_STRIDE")
+        ? uint32_t(std::strtoul(std::getenv("VITA3K_METAL_DUMP_DRAW_STREAM_STRIDE"), nullptr, 10)) : 0;
     bool draw_dumped = false;
     uint32_t dump_draw_matches = 0;
     uint32_t dump_draw_skip = std::getenv("VITA3K_METAL_DUMP_DRAW_SKIP")
@@ -2266,6 +2270,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             && (impl->dump_draw_texture_format.empty() || (fp->renderer_data->textures_used[0]
                 && uint32_t(gxm::get_format(ctx.textures[0])) == std::strtoul(impl->dump_draw_texture_format.c_str(), nullptr, 0)))
             && (impl->dump_vertex_shader.empty() || impl->dump_vertex_shader == hex_string(vp->renderer_data->hash))
+            && (!impl->dump_stream_stride || (!vp->streams.empty() && vp->streams[0].stride == impl->dump_stream_stride))
+            && (impl->dump_trigger_file.empty() || std::filesystem::exists(impl->dump_trigger_file))
             && impl->dump_draw_matches++ >= impl->dump_draw_skip;
         std::ofstream draw_metadata;
         std::ofstream texture_metadata;
@@ -3510,12 +3516,16 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 const uint64_t address = native_buffers.address({binding.data, binding.size});
                 if (stage == 0) vertex_info.set_buffer_address(block, address);
                 else fragment_info.set_buffer_address(block, address);
+                // A replay needs the same LDR/STR-visible span as the live draw,
+                // including bone palettes beyond the declared register block.
+                const size_t capture_size = capture_draw && memory_backed_uniform_slot(gxps[stage]->buffer_flags, block)
+                    ? impl->mapped_memory.extent(binding.address, binding.size) : binding.size;
                 if (capture_draw && stage == 0) {
-                    dump_bytes(fmt::format("uniform-{}.bin",block),binding.data,binding.size);
-                    draw_metadata << "uniform " << block << ' ' << binding.size << '\n';
+                    dump_bytes(fmt::format("uniform-{}.bin",block),binding.data,capture_size);
+                    draw_metadata << "uniform " << block << ' ' << capture_size << '\n';
                 } else if (capture_draw) {
-                    dump_bytes(fmt::format("fragment-uniform-{}.bin",block),binding.data,binding.size);
-                    texture_metadata << "fragment_uniform " << block << ' ' << binding.size << '\n';
+                    dump_bytes(fmt::format("fragment-uniform-{}.bin",block),binding.data,capture_size);
+                    texture_metadata << "fragment_uniform " << block << ' ' << capture_size << '\n';
                 }
             }
         }
