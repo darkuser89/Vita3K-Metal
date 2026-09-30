@@ -35,6 +35,8 @@
 #include <numeric>
 #include <set>
 #include <stdexcept>
+#define XXH_INLINE_ALL
+#include <xxhash.h>
 extern "C" {
 #include <libswscale/swscale.h>
 }
@@ -245,9 +247,13 @@ struct Surface {
     // Last CPU bytes imported or published. Compare against this baseline,
     // not a downsampled GPU image, to retain untouched high-resolution pixels.
     std::vector<uint8_t> cpu_snapshot;
+    uint64_t cpu_hash = 0;
+    size_t cpu_hash_size = 0;
 };
 static void update_cpu_snapshot(Surface &surface, std::span<const uint8_t> bytes,
     std::span<const SurfaceMemoryRange> ranges) {
+    surface.cpu_hash = XXH3_64bits(bytes.data(), bytes.size());
+    surface.cpu_hash_size = bytes.size();
     if (surface.cpu_snapshot.size() != bytes.size()) return;
     for (const auto &range : ranges)
         std::memcpy(surface.cpu_snapshot.data()+range.offset, bytes.data()+range.offset, range.size);
@@ -482,6 +488,10 @@ struct MetalState::Impl {
     std::filesystem::path dump_draw_dir = std::getenv("VITA3K_METAL_DUMP_DRAW_DIR") ? std::getenv("VITA3K_METAL_DUMP_DRAW_DIR") : "";
     std::string dump_draw_shader = std::getenv("VITA3K_METAL_DUMP_DRAW_SHADER") ? std::getenv("VITA3K_METAL_DUMP_DRAW_SHADER") : "";
     std::string dump_draw_texture_format = std::getenv("VITA3K_METAL_DUMP_DRAW_TEXTURE_FORMAT") ? std::getenv("VITA3K_METAL_DUMP_DRAW_TEXTURE_FORMAT") : "";
+    uint32_t dump_draw_texture_address = std::getenv("VITA3K_METAL_DUMP_DRAW_TEXTURE_ADDRESS")
+        ? uint32_t(std::strtoul(std::getenv("VITA3K_METAL_DUMP_DRAW_TEXTURE_ADDRESS"), nullptr, 0)) : 0;
+    uint32_t dump_draw_texture_width = std::getenv("VITA3K_METAL_DUMP_DRAW_TEXTURE_WIDTH")
+        ? uint32_t(std::strtoul(std::getenv("VITA3K_METAL_DUMP_DRAW_TEXTURE_WIDTH"), nullptr, 10)) : 0;
     std::string dump_arm_shader = std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_SHADER") ? std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_SHADER") : "";
     bool dump_armed = dump_arm_shader.empty();
     bool dump_attachments = std::getenv("VITA3K_METAL_DUMP_DRAW_ATTACHMENTS") != nullptr;
@@ -1785,6 +1795,13 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
             }
             ctx.impl->render_color=samples>1 ? entry.multisample_color : entry.color;
             entry.guest = surface;
+            const size_t guest_bytes = surface_memory_size(surface);
+            const uint64_t guest_end = uint64_t(surface.data.address()) + guest_bytes;
+            if (guest_bytes && guest_end <= uint64_t(UINT32_MAX) - 4095
+                && is_valid_addr_range(mem, surface.data.address(), Address(guest_end))) {
+                entry.cpu_hash = XXH3_64bits(surface.data.get(mem), guest_bytes);
+                entry.cpu_hash_size = guest_bytes;
+            } else entry.cpu_hash_size = 0;
             ctx.impl->color = entry.color;
         } else {
             // Vulkan binds the render target's transient RGBA8 color image
@@ -1955,6 +1972,8 @@ struct MetalTextureCache::Impl {
     std::array<ImportedTextureView, TextureCacheSize> imported_views{};
     SceGxmTexture source{};
     std::filesystem::path dump_dir = std::getenv("VITA3K_METAL_DUMP_TEXTURE_DIR") ? std::getenv("VITA3K_METAL_DUMP_TEXTURE_DIR") : "";
+    uint32_t dump_limit = std::getenv("VITA3K_METAL_DUMP_TEXTURE_LIMIT")
+        ? uint32_t(std::min<unsigned long>(std::strtoul(std::getenv("VITA3K_METAL_DUMP_TEXTURE_LIMIT"), nullptr, 10), 4096)) : 64;
     std::set<std::string> dumped_textures;
     explicit Impl(MetalState &state) : state(state) {}
 };
@@ -2095,7 +2114,7 @@ void MetalTextureCache::upload_texture_impl(SceGxmTextureBaseFormat format, uint
     default: throw std::runtime_error("Metal: unsupported decoded texture format " + std::to_string(format));
     }
     const uint32_t slice = face > 0 ? face - 1 : 0;
-    if (!impl->dump_dir.empty() && !mip && format == SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8 && impl->dumped_textures.size() < 64) {
+    if (!impl->dump_dir.empty() && !mip && format == SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8 && impl->dumped_textures.size() < impl->dump_limit) {
         auto name = fmt::format("{:08x}-{:08x}-{}x{}", impl->source.data_addr << 2, uint32_t(gxm::get_format(impl->source)), width, height);
         if (slice) name += fmt::format("-face{}",slice);
         if (impl->dumped_textures.insert(name).second) {
@@ -2310,6 +2329,10 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             impl->dump_armed = true;
         const bool capture_draw = !impl->dump_draw_dir.empty() && !impl->draw_dumped && impl->dump_armed
             && (impl->dump_draw_shader.empty() || impl->dump_draw_shader == hex_string(fp->renderer_data->hash))
+            && (!impl->dump_draw_texture_address || (fp->renderer_data->textures_used[0]
+                && (ctx.textures[0].data_addr << 2) == impl->dump_draw_texture_address))
+            && (!impl->dump_draw_texture_width || (fp->renderer_data->textures_used[0]
+                && gxm::get_width(ctx.textures[0]) == impl->dump_draw_texture_width))
             && (impl->dump_draw_texture_format.empty() || (fp->renderer_data->textures_used[0]
                 && uint32_t(gxm::get_format(ctx.textures[0])) == std::strtoul(impl->dump_draw_texture_format.c_str(), nullptr, 0)))
             && (impl->dump_vertex_shader.empty() || impl->dump_vertex_shader == hex_string(vp->renderer_data->hash))
@@ -2536,6 +2559,31 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         }
         const bool synchronous = impl->sync_draws || vs.writes_guest_memory || fs.writes_guest_memory;
         size_t captured_texture_bytes = 0;
+        // A game may reuse former render-target storage for CPU-loaded assets.
+        // Never publish an obsolete GPU image over those new guest bytes.
+        // Check before any alias lookup, including overlapping mip/cube views.
+        for (uint32_t index = 0; index < SCE_GXM_MAX_TEXTURE_UNITS * 2; ++index) {
+            const bool vertex = index >= SCE_GXM_MAX_TEXTURE_UNITS;
+            if (!vertex && !fragment_resources) continue;
+            const auto &program = vertex ? static_cast<const ShaderProgram &>(*vp->renderer_data)
+                                         : static_cast<const ShaderProgram &>(*fp->renderer_data);
+            if (!program.textures_used[index % SCE_GXM_MAX_TEXTURE_UNITS]) continue;
+            const auto &texture = ctx.textures[index];
+            const uint64_t begin = uint32_t(texture.data_addr) << 2;
+            const uint64_t end = begin + texture_storage_size(texture);
+            for (auto it = impl->surfaces.begin(); it != impl->surfaces.end();) {
+                auto &surface = it->second;
+                const size_t bytes = surface.cpu_hash_size;
+                const uint64_t surface_end = uint64_t(it->first) + bytes;
+                if (surface.color != ctx.impl->color && bytes && it->first < end && surface_end > begin
+                    && surface_end <= uint64_t(UINT32_MAX) - 4095
+                    && is_valid_addr_range(mem, it->first, Address(surface_end))
+                    && XXH3_64bits(surface.guest.data.get(mem), bytes) != surface.cpu_hash) {
+                    LOG_INFO("Metal: retiring CPU-overwritten color surface at {:#x} before texture {:#x}", it->first, begin);
+                    it = impl->surfaces.erase(it);
+                } else ++it;
+            }
+        }
         const auto find_subrectangle = [&](const SceGxmTexture &texture) {
             auto result=impl->surfaces.end();
             for (auto it=impl->surfaces.begin();it!=impl->surfaces.end();++it) {
