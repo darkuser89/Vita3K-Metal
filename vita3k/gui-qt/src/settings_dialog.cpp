@@ -26,6 +26,7 @@
 #include <emuenv/state.h>
 #include <gui-qt/gui_language.h>
 #include <gui-qt/gui_settings.h>
+#include <gui-qt/metal_filters.h>
 #include <gui-qt/qt_utils.h>
 #include <gui-qt/settings_dialog.h>
 #include <gui-qt/settings_dialog_tooltips.h>
@@ -1484,7 +1485,7 @@ void SettingsDialog::update_gpu_visibility() {
 
         m_ui->screen_filter_box->clear();
         if (is_metal) {
-            m_ui->screen_filter_box->addItems({ QStringLiteral("Nearest"), QStringLiteral("Bilinear") });
+            m_ui->screen_filter_box->addItems(gui::metal_screen_filters());
         } else if (is_vulkan) {
             m_ui->screen_filter_box->addItems({ QStringLiteral("Nearest"), QStringLiteral("Bilinear"),
                 QStringLiteral("Bicubic"), QStringLiteral("FXAA"), QStringLiteral("FSR") });

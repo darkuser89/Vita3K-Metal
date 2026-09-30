@@ -2,11 +2,22 @@
 // Copyright (C) 2026 Vita3K team
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <renderer/metal/screen.h>
+#include <renderer/metal/capabilities.h>
+#include <util/log.h>
 #include <fstream>
 #include <stdexcept>
 #include <vector>
 
 namespace renderer::metal {
+bool supports_metalfx_spatial() {
+    static const bool supported = [] {
+        @autoreleasepool {
+            auto device = MTLCreateSystemDefaultDevice();
+            return device && [MTLFXSpatialScalerDescriptor supportsDevice:device];
+        }
+    }();
+    return supported;
+}
 namespace {
 std::vector<uint32_t> load_spirv(const std::filesystem::path &path) {
     std::ifstream input(path, std::ios::binary | std::ios::ate);
@@ -131,6 +142,10 @@ void ScreenRenderer::initialize_fsr() {
     if (!rcas_pipeline) throw std::runtime_error(error);
 }
 void ScreenRenderer::set_filter(bool linear) {
+    metalfx_scaler = nil;
+    metalfx_input = nil;
+    metalfx_output = nil;
+    metalfx_dimensions = {};
     filter = linear ? Filter::Bilinear : Filter::Nearest;
     auto desc = [MTLSamplerDescriptor new];
     desc.minFilter = desc.magFilter = linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
@@ -151,13 +166,89 @@ void ScreenRenderer::set_filter(std::string_view name) {
         initialize_fsr();
         set_filter(true);
         filter = Filter::FSR;
+    } else if (name == "MetalFX Spatial") {
+        set_filter(true);
+        if ([MTLFXSpatialScalerDescriptor supportsDevice:device.native_device()])
+            filter = Filter::MetalFX;
+        else
+            LOG_WARN("MetalFX Spatial is unavailable on this device; using Bilinear");
     } else {
         set_filter(name != "Nearest");
     }
 }
+id<MTLTexture> ScreenRenderer::prepare_metalfx(id<MTLCommandBuffer> commands, id<MTLTexture> source,
+    uint32_t width, uint32_t height) {
+    // Spatial reconstruction is useful only when enlarging the image. Mixed-axis
+    // downscaling and pixel-perfect cropping use the normal presentation sampler.
+    if (width < source.width || height < source.height || (width == source.width && height == source.height))
+        return source;
+    const std::array<NSUInteger, 4> dimensions{source.width, source.height, width, height};
+    if (metalfx_dimensions != dimensions) {
+        metalfx_dimensions = dimensions;
+        metalfx_scaler = nil;
+        metalfx_input = nil;
+        metalfx_output = nil;
+        auto desc = [MTLFXSpatialScalerDescriptor new];
+        desc.inputWidth = source.width;
+        desc.inputHeight = source.height;
+        desc.outputWidth = width;
+        desc.outputHeight = height;
+        desc.colorTextureFormat = MTLPixelFormatBGRA8Unorm;
+        desc.outputTextureFormat = MTLPixelFormatBGRA8Unorm;
+        // Presentation receives encoded framebuffer values, including UNORM
+        // views of sRGB surfaces. Do not linearize these bytes a second time.
+        desc.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+        auto scaler = [desc newSpatialScalerWithDevice:device.native_device()];
+        if (scaler) {
+            auto texture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:desc.colorTextureFormat
+                width:source.width height:source.height mipmapped:NO];
+            texture.storageMode = MTLStorageModePrivate;
+            texture.usage = scaler.colorTextureUsage | MTLTextureUsageRenderTarget;
+            metalfx_input = [device.native_device() newTextureWithDescriptor:texture];
+            texture.width = width;
+            texture.height = height;
+            texture.usage = scaler.outputTextureUsage | MTLTextureUsageShaderRead;
+            metalfx_output = [device.native_device() newTextureWithDescriptor:texture];
+            if (metalfx_input && metalfx_output) {
+                metalfx_input.label = @"MetalFX Spatial input";
+                metalfx_output.label = @"MetalFX Spatial output";
+                metalfx_scaler = scaler;
+            }
+        }
+        if (!metalfx_scaler) {
+            metalfx_input = nil;
+            metalfx_output = nil;
+            // Keep the failed dimensions to avoid allocations and log spam on
+            // every frame. Resizing or selecting the filter again retries.
+            LOG_WARN("MetalFX Spatial could not initialize {}x{} -> {}x{}; using Bilinear",
+                source.width, source.height, width, height);
+        }
+    }
+    if (!metalfx_scaler) return source;
+    // Normalize arbitrary guest surface formats and texture usage to the
+    // scaler's contract. Producers, conversion, upscale and presentation all
+    // remain ordered on the same command buffer with tracked resources.
+    auto pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = metalfx_input;
+    pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    auto encoder = [commands renderCommandEncoderWithDescriptor:pass];
+    if (!encoder) return source;
+    encoder.label = @"MetalFX Spatial input conversion";
+    render(encoder, source, {0, 0, double(source.width), double(source.height), 0, 1});
+    [encoder endEncoding];
+    metalfx_scaler.inputContentWidth = source.width;
+    metalfx_scaler.inputContentHeight = source.height;
+    metalfx_scaler.colorTexture = metalfx_input;
+    metalfx_scaler.outputTexture = metalfx_output;
+    [metalfx_scaler encodeToCommandBuffer:commands];
+    return metalfx_output;
+}
 id<MTLTexture> ScreenRenderer::prepare(id<MTLCommandBuffer> commands, id<MTLTexture> source,
     uint32_t width, uint32_t height) {
-    if (filter != Filter::FSR || !source || !width || !height) return source;
+    if (!commands || !source || !width || !height) return source;
+    if (filter == Filter::MetalFX) return prepare_metalfx(commands, source, width, height);
+    if (filter != Filter::FSR) return source;
     if (!fsr_intermediate || fsr_intermediate.width != width || fsr_intermediate.height != height) {
         auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
                                                                        width:width height:height mipmapped:NO];

@@ -538,6 +538,19 @@ bool USSETranslatorVisitor::vpck(
 
     // source is float destination is int
     if (!is_float_data_type(inst.opr.dest.type) && is_float_data_type(inst.opr.src1.type)) {
+        // Metal packs the converted value into an 8-bit field. Clamp the
+        // unscaled float first so values above 255 do not wrap to zero when
+        // the field is inserted into the destination register.
+        if (m_spirv_params.native_metal && inst.opr.dest.type == DataType::UINT8 && !scale) {
+            const unsigned count = m_b.isVector(source) ? m_b.getNumComponents(source) : 1;
+            const auto bound = [this, count](float value) {
+                const spv::Id scalar = m_b.makeFloatConstant(value);
+                return count == 1 ? scalar : m_b.makeCompositeConstant(
+                    m_b.makeVectorType(m_b.makeFloatType(32), count), std::vector<spv::Id>(count, scalar));
+            };
+            source = m_b.createBuiltinCall(m_b.getTypeId(source), m_util_funcs.std_builtins,
+                GLSLstd450FClamp, { source, bound(0.f), bound(255.f) });
+        }
         source = utils::convert_to_int(m_b, m_util_funcs, source, inst.opr.dest.type, scale);
     }
 

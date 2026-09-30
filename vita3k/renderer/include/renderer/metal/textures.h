@@ -70,12 +70,15 @@ std::optional<DepthMemoryLayout> depth_memory_layout(const SceGxmDepthStencilSur
 struct DepthStoreReadback {
     id<MTLBuffer> depth = nil;
     id<MTLBuffer> mask = nil;
+    // The shared buffer already contains final guest words (S8D24 or DF32).
+    bool packed_direct = false;
 };
 class SurfaceCaster {
     Device &device;
     std::map<uint32_t,id<MTLRenderPipelineState>> depth_seed_pipelines;
     std::map<uint32_t,id<MTLRenderPipelineState>> mask_seed_pipelines;
     id<MTLComputePipelineState> depth_store_pipeline, depth_store_ms_pipeline;
+    id<MTLComputePipelineState> packed_depth_store_pipeline, packed_depth_store_ms_pipeline;
     id<MTLComputePipelineState> mask_store_pipeline, mask_store_ms_pipeline;
     id<MTLBuffer> depth_store_buffer, mask_store_buffer;
     id<MTLComputePipelineState> pipeline;

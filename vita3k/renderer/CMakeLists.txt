@@ -91,7 +91,7 @@ if(APPLE)
 	target_link_libraries(renderer-metal-runtime PUBLIC shader "-framework Metal" "-framework Foundation")
 	target_link_libraries(renderer PRIVATE renderer-metal-runtime)
 	target_sources(renderer PRIVATE src/vulkan/metal_layer.mm src/metal/state.mm src/metal/overlay.mm src/metal/screen.mm src/metal/buffers.mm src/metal/textures.mm src/metal/polygon_clip.cpp)
-	target_link_libraries(renderer PRIVATE "-framework QuartzCore" "-framework Cocoa")
+	target_link_libraries(renderer PRIVATE "-framework QuartzCore" "-framework Cocoa" "-framework MetalFX")
 endif()
 
 if(X11_FOUND)

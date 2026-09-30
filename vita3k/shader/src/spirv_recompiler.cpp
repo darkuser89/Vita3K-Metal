@@ -2305,6 +2305,18 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
                         b.makeVectorType(b.makeFloatType(32), 4), {o_val, zero, zero, zero}));
                 }
             } else {
+                if (translation_state.is_metal && vo == SCE_GXM_VERTEX_PROGRAM_OUTPUT_COLOR1) {
+                    // Metal otherwise interpolates negative COLOR1 values as
+                    // unbounded floats, which overbrightens Lost Song's 3D
+                    // lighting. Apply the color range after guest arithmetic.
+                    const spv::Id f32 = b.makeFloatType(32);
+                    const spv::Id v4 = b.makeVectorType(f32, 4);
+                    const spv::Id zero = b.makeFloatConstant(0.0f);
+                    const spv::Id one = b.makeFloatConstant(1.0f);
+                    const spv::Id lower = b.makeCompositeConstant(v4, {zero, zero, zero, zero});
+                    const spv::Id upper = b.makeCompositeConstant(v4, {one, one, one, one});
+                    o_val = b.createBuiltinCall(v4, utils.std_builtins, GLSLstd450FClamp, {o_val, lower, upper});
+                }
                 b.createStore(o_val, out_var);
                 capture_output(properties.location, o_val);
             }

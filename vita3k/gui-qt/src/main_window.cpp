@@ -34,6 +34,7 @@
 #include <gui-qt/live_area_widget.h>
 #include <gui-qt/log_widget.h>
 #include <gui-qt/main_window.h>
+#include <gui-qt/metal_filters.h>
 #include <gui-qt/persistent_settings.h>
 #include <gui-qt/pkg_install_dialog.h>
 #include <gui-qt/qt_utils.h>
@@ -1856,7 +1857,7 @@ void MainWindow::setup_status_bar() {
 
     auto get_filter_names = [this]() -> QStringList {
         if (emuenv.cfg.current_config.backend_renderer == "Metal")
-            return { QStringLiteral("Nearest"), QStringLiteral("Bilinear") };
+            return gui::metal_screen_filters();
         if (emuenv.cfg.current_config.backend_renderer == "Vulkan")
             return { QStringLiteral("Nearest"), QStringLiteral("Bilinear"),
                 QStringLiteral("Bicubic"), QStringLiteral("FXAA"), QStringLiteral("FSR") };
@@ -2039,7 +2040,7 @@ void MainWindow::update_accuracy_button() {
 void MainWindow::update_screen_filter_button() {
     auto &cc = emuenv.cfg.current_config;
     const QStringList valid = (cc.backend_renderer == "Metal")
-        ? QStringList{ QStringLiteral("Nearest"), QStringLiteral("Bilinear") }
+        ? gui::metal_screen_filters()
         : (cc.backend_renderer == "Vulkan")
         ? QStringList{ QStringLiteral("Nearest"), QStringLiteral("Bilinear"),
               QStringLiteral("Bicubic"), QStringLiteral("FXAA"), QStringLiteral("FSR") }

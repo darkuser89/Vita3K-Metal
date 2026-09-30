@@ -1437,6 +1437,47 @@ kernel void store_depth_samples_ms(depth2d_ms<float,access::read> input [[textur
     const uint3 q=guest_sample_address(p,config.xy,uint2(input.get_width(),input.get_height()),input.get_num_samples());
     output[p.y*config.x+p.x]={config.w&1 ? input.read(q.xy,q.z) : 0.f,config.w&2 ? stencil.read(q.xy,q.z).x : 0u};
 }
+// The CPU path rounds a double-precision product by 2^24-1. A float product
+// can round differently near half steps, so retain the exact float mantissa.
+uint packed_depth24(float depth) {
+    if (!(depth>0.f)) return 0u;
+    if (depth>=1.f) return 0xffffffu;
+    const uint bits=as_type<uint>(depth);
+    const uint exponent=(bits>>23)&255u;
+    if (!exponent) return 0u;
+    const uint shift=150u-exponent;
+    if (shift>=64u) return 0u;
+    const ulong product=ulong((bits&0x7fffffu)|0x800000u)*0xfffffful;
+    return uint((product+(1ul<<(shift-1u)))>>shift);
+}
+kernel void store_packed_depth_samples(depth2d<float,access::read> input [[texture(0)]],
+    texture2d<uint,access::read> stencil [[texture(1)]], device uint *output [[buffer(0)]],
+    constant uint4 &config [[buffer(1)]], uint2 p [[thread_position_in_grid]]) {
+    if(p.x>=config.x || p.y>=config.y) return;
+    const uint2 native_size=uint2(input.get_width(),input.get_height());
+    const uint2 q=uint2(native_size.x<config.x ? p.x*native_size.x/config.x
+            : (p.x*native_size.x+config.x-1)/config.x,
+        native_size.y<config.y ? p.y*native_size.y/config.y
+            : (p.y*native_size.y+config.y-1)/config.y);
+    const uint offset=config.z
+        ? ((p.y/32u)*(config.z/32u)+p.x/32u)*1024u+(p.y%32u)*32u+p.x%32u
+        : p.y*config.x+p.x;
+    output[offset]=(config.w&4u)
+        ? packed_depth24(input.read(q))|(stencil.read(q).x<<24)
+        : as_type<uint>(input.read(q));
+}
+kernel void store_packed_depth_samples_ms(depth2d_ms<float,access::read> input [[texture(0)]],
+    texture2d_ms<uint,access::read> stencil [[texture(1)]], device uint *output [[buffer(0)]],
+    constant uint4 &config [[buffer(1)]], uint2 p [[thread_position_in_grid]]) {
+    if(p.x>=config.x || p.y>=config.y) return;
+    const uint3 q=guest_sample_address(p,config.xy,uint2(input.get_width(),input.get_height()),input.get_num_samples());
+    const uint offset=config.z
+        ? ((p.y/32u)*(config.z/32u)+p.x/32u)*1024u+(p.y%32u)*32u+p.x%32u
+        : p.y*config.x+p.x;
+    output[offset]=(config.w&4u)
+        ? packed_depth24(input.read(q.xy,q.z))|(stencil.read(q.xy,q.z).x<<24)
+        : as_type<uint>(input.read(q.xy,q.z));
+}
 kernel void store_mask_samples(texture2d<float,access::read> input [[texture(0)]],
     device uint *output [[buffer(0)]], constant uint4 &config [[buffer(1)]],
     uint2 p [[thread_position_in_grid]]) {
@@ -1538,6 +1579,9 @@ fragment float4 restore_clip_float(float4 position [[position]], uint sample [[s
     depth_store_pipeline=cached_compute(device, library, @"store_depth_samples");
     depth_store_ms_pipeline=cached_compute(device, library, @"store_depth_samples_ms");
     if(!depth_store_pipeline || !depth_store_ms_pipeline) throw std::runtime_error("Metal: depth readback pipeline failed");
+    packed_depth_store_pipeline=cached_compute(device, library, @"store_packed_depth_samples");
+    packed_depth_store_ms_pipeline=cached_compute(device, library, @"store_packed_depth_samples_ms");
+    if(!packed_depth_store_pipeline || !packed_depth_store_ms_pipeline) throw std::runtime_error("Metal: packed depth readback pipeline failed");
     mask_store_pipeline=cached_compute(device, library, @"store_mask_samples");
     mask_store_ms_pipeline=cached_compute(device, library, @"store_mask_samples_ms");
     if(!mask_store_pipeline || !mask_store_ms_pipeline) throw std::runtime_error("Metal: mask readback pipeline failed");
@@ -2173,7 +2217,17 @@ bool SurfaceCaster::enqueue_depth_store(id<MTLTexture> texture,const SceGxmDepth
     // readbacks, their tiling conversion, and a second command-buffer wait.
     struct DepthReadback { float depth; uint32_t stencil; };
     static_assert(sizeof(DepthReadback)==8);
-    const size_t bytes=size_t(layout.width)*layout.height*sizeof(DepthReadback);
+    // A complete 32x32 tile has no guest padding when the stride and height
+    // match the visible extent. Scatter on the GPU, then copy its already
+    // guest-ordered words instead of packing every pixel on the CPU.
+    const bool contiguous=layout.stride==layout.width
+        && (!layout.tiled || ((layout.width%32u)==0 && (layout.height%32u)==0));
+    const bool direct_depth=contiguous && layout.depth_bytes==4
+        && layout.depth_size==size_t(layout.width)*layout.height*4
+        && !layout.stencil_size && !masked
+        && (layout.packed || surface.get_format()==SCE_GXM_DEPTH_STENCIL_FORMAT_DF32
+            || surface.get_format()==SCE_GXM_DEPTH_STENCIL_FORMAT_DF32_S8);
+    const size_t bytes=size_t(layout.width)*layout.height*(direct_depth?sizeof(uint32_t):sizeof(DepthReadback));
     if(bytes>device.native_device().maxBufferLength) return false;
     id<MTLBuffer> buffer=depth_store_buffer;
     if(!buffer || buffer.length<bytes) {
@@ -2195,10 +2249,13 @@ bool SurfaceCaster::enqueue_depth_store(id<MTLTexture> texture,const SceGxmDepth
     auto view=[texture newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
     if(!view) throw std::runtime_error("Metal: cannot view stencil for guest storage");
     const uint32_t flags=uint32_t(layout.depth_size!=0)
-        | (uint32_t(layout.stencil_size || (layout.packed && layout.depth_size))<<1);
-    const uint32_t config[]={layout.width,layout.height,0,flags};
+        | (uint32_t(layout.stencil_size || (layout.packed && layout.depth_size))<<1)
+        | (uint32_t(layout.packed)<<2);
+    const uint32_t config[]={layout.width,layout.height,direct_depth && layout.tiled?layout.stride:0,flags};
     auto encoder=[commands computeCommandEncoder];
-    [encoder setComputePipelineState:texture.sampleCount>1?depth_store_ms_pipeline:depth_store_pipeline];
+    [encoder setComputePipelineState:direct_depth
+        ? (texture.sampleCount>1?packed_depth_store_ms_pipeline:packed_depth_store_pipeline)
+        : (texture.sampleCount>1?depth_store_ms_pipeline:depth_store_pipeline)];
     [encoder setTexture:texture atIndex:0];[encoder setTexture:view atIndex:1];
     [encoder setBuffer:buffer offset:0 atIndex:0];[encoder setBytes:config length:sizeof(config) atIndex:1];
     [encoder dispatchThreads:MTLSizeMake(layout.width,layout.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
@@ -2215,11 +2272,16 @@ bool SurfaceCaster::enqueue_depth_store(id<MTLTexture> texture,const SceGxmDepth
     }
     readback.depth=buffer;
     readback.mask=mask_buffer;
+    readback.packed_direct=direct_depth;
     return true;
 }
 void SurfaceCaster::finish_depth_store(const DepthStoreReadback &readback,const SceGxmDepthStencilSurface &surface,
     const DepthMemoryLayout &layout,std::span<uint8_t> depth,std::span<uint8_t> stencil) {
     if(!readback.depth) return;
+    if(readback.packed_direct) {
+        std::memcpy(depth.data(),readback.depth.contents,size_t(layout.width)*layout.height*sizeof(uint32_t));
+        return;
+    }
     // The caller has completed the command buffer. Guest rounding, tiling,
     // stencil overrides and padding remain identical to the original readback.
     struct DepthReadback { float depth; uint32_t stencil; };

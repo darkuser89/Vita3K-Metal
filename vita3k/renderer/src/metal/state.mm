@@ -463,8 +463,13 @@ struct MetalState::Impl {
     uint32_t traced_display_fallbacks = 0;
     uint32_t traced_transfers = 0;
     uint32_t traced_display_frames = 0;
+    bool trace_display_pixel = std::getenv("VITA3K_METAL_TRACE_DISPLAY_PIXEL") != nullptr;
+    uint32_t traced_display_pixels = 0;
     bool trace_textures = std::getenv("VITA3K_METAL_TRACE_TEXTURES") != nullptr;
     bool trace_finish_timing = std::getenv("VITA3K_METAL_TRACE_FINISH_TIMING") != nullptr;
+    std::filesystem::path trace_depth_store_trigger = std::getenv("VITA3K_METAL_TRACE_DEPTH_STORE_TRIGGER")
+        ? std::getenv("VITA3K_METAL_TRACE_DEPTH_STORE_TRIGGER") : "";
+    uint32_t traced_depth_stores = 0;
     uint64_t timed_finishes = 0;
     uint64_t timed_submits = 0;
     uint64_t timed_pending_waits = 0;
@@ -482,7 +487,17 @@ struct MetalState::Impl {
     std::set<std::string> traced_textures;
     bool trace_draws = std::getenv("VITA3K_METAL_TRACE_DRAWS") != nullptr;
     std::set<std::string> traced_draws;
+    uint32_t trace_target_width = std::getenv("VITA3K_METAL_TRACE_TARGET_WIDTH")
+        ? uint32_t(std::strtoul(std::getenv("VITA3K_METAL_TRACE_TARGET_WIDTH"), nullptr, 10)) : 0;
+    uint32_t traced_target_draws = 0;
     std::string trace_pixel = std::getenv("VITA3K_METAL_TRACE_PIXEL") ? std::getenv("VITA3K_METAL_TRACE_PIXEL") : "";
+    std::string trace_pixel_arm_shader = std::getenv("VITA3K_METAL_TRACE_PIXEL_ARM_SHADER")
+        ? std::getenv("VITA3K_METAL_TRACE_PIXEL_ARM_SHADER") : "";
+    bool trace_pixel_armed = trace_pixel_arm_shader.empty();
+    uint32_t trace_pixel_target_address = std::getenv("VITA3K_METAL_TRACE_PIXEL_TARGET_ADDRESS")
+        ? uint32_t(std::strtoul(std::getenv("VITA3K_METAL_TRACE_PIXEL_TARGET_ADDRESS"), nullptr, 0)) : 0;
+    uint32_t trace_pixel_target_width = std::getenv("VITA3K_METAL_TRACE_PIXEL_TARGET_WIDTH")
+        ? uint32_t(std::strtoul(std::getenv("VITA3K_METAL_TRACE_PIXEL_TARGET_WIDTH"), nullptr, 10)) : 0;
     std::filesystem::path trace_pixel_trigger = std::getenv("VITA3K_METAL_TRACE_PIXEL_TRIGGER")
         ? std::getenv("VITA3K_METAL_TRACE_PIXEL_TRIGGER") : "";
     uint32_t traced_pixel_draws = 0;
@@ -494,14 +509,27 @@ struct MetalState::Impl {
     std::set<std::string> dumped_surfaces;
     std::filesystem::path dump_draw_dir = std::getenv("VITA3K_METAL_DUMP_DRAW_DIR") ? std::getenv("VITA3K_METAL_DUMP_DRAW_DIR") : "";
     std::string dump_draw_shader = std::getenv("VITA3K_METAL_DUMP_DRAW_SHADER") ? std::getenv("VITA3K_METAL_DUMP_DRAW_SHADER") : "";
+    uint32_t dump_draw_target_address = std::getenv("VITA3K_METAL_DUMP_DRAW_TARGET_ADDRESS")
+        ? uint32_t(std::strtoul(std::getenv("VITA3K_METAL_DUMP_DRAW_TARGET_ADDRESS"), nullptr, 0)) : 0;
+    uint32_t dump_draw_target_width = std::getenv("VITA3K_METAL_DUMP_DRAW_TARGET_WIDTH")
+        ? uint32_t(std::strtoul(std::getenv("VITA3K_METAL_DUMP_DRAW_TARGET_WIDTH"), nullptr, 10)) : 0;
     std::string dump_draw_texture_format = std::getenv("VITA3K_METAL_DUMP_DRAW_TEXTURE_FORMAT") ? std::getenv("VITA3K_METAL_DUMP_DRAW_TEXTURE_FORMAT") : "";
     uint32_t dump_draw_texture_address = std::getenv("VITA3K_METAL_DUMP_DRAW_TEXTURE_ADDRESS")
         ? uint32_t(std::strtoul(std::getenv("VITA3K_METAL_DUMP_DRAW_TEXTURE_ADDRESS"), nullptr, 0)) : 0;
     uint32_t dump_draw_texture_width = std::getenv("VITA3K_METAL_DUMP_DRAW_TEXTURE_WIDTH")
         ? uint32_t(std::strtoul(std::getenv("VITA3K_METAL_DUMP_DRAW_TEXTURE_WIDTH"), nullptr, 10)) : 0;
     std::string dump_arm_shader = std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_SHADER") ? std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_SHADER") : "";
+    uint32_t dump_arm_target_width = std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_TARGET_WIDTH")
+        ? uint32_t(std::strtoul(std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_TARGET_WIDTH"), nullptr, 10)) : 0;
+    uint32_t dump_arm_shader_skip = std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_SKIP")
+        ? uint32_t(std::min<unsigned long>(std::strtoul(std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_SKIP"), nullptr, 10), 1000000)) : 0;
+    uint32_t dump_arm_shader_matches = 0;
     std::string dump_arm_pixel_shader = std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_PIXEL_SHADER")
         ? std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_PIXEL_SHADER") : "";
+    float dump_arm_pixel_min_rgb = std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_PIXEL_MIN_RGB")
+        ? std::strtof(std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_PIXEL_MIN_RGB"), nullptr) : 0.0f;
+    std::string dump_arm_pixel_rgb = std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_PIXEL_RGB")
+        ? std::getenv("VITA3K_METAL_DUMP_DRAW_ARM_PIXEL_RGB") : "";
     bool dump_pixel_armed = false;
     bool dump_armed = dump_arm_shader.empty();
     bool dump_attachments = std::getenv("VITA3K_METAL_DUMP_DRAW_ATTACHMENTS") != nullptr;
@@ -511,6 +539,9 @@ struct MetalState::Impl {
     uint32_t dump_stream_stride = std::getenv("VITA3K_METAL_DUMP_DRAW_STREAM_STRIDE")
         ? uint32_t(std::strtoul(std::getenv("VITA3K_METAL_DUMP_DRAW_STREAM_STRIDE"), nullptr, 10)) : 0;
     bool draw_dumped = false;
+    uint32_t dump_draw_saved = 0;
+    uint32_t dump_draw_limit = std::getenv("VITA3K_METAL_DUMP_DRAW_LIMIT")
+        ? uint32_t(std::clamp<unsigned long>(std::strtoul(std::getenv("VITA3K_METAL_DUMP_DRAW_LIMIT"), nullptr, 10), 1, 16)) : 1;
     uint32_t dump_draw_matches = 0;
     uint32_t dump_draw_skip = std::getenv("VITA3K_METAL_DUMP_DRAW_SKIP")
         ? uint32_t(std::min<unsigned long>(std::strtoul(std::getenv("VITA3K_METAL_DUMP_DRAW_SKIP"), nullptr, 10), 1000000)) : 0;
@@ -804,7 +835,8 @@ uint32_t MetalState::get_features_mask() {
 }
 int MetalState::get_supported_filters() {
     return int(Filter::NEAREST) | int(Filter::BILINEAR) | int(Filter::BICUBIC)
-        | int(Filter::FXAA) | int(Filter::FSR);
+        | int(Filter::FXAA) | int(Filter::FSR)
+        | ([MTLFXSpatialScalerDescriptor supportsDevice:impl->device->native_device()] ? int(Filter::METALFX_SPATIAL) : 0);
 }
 void MetalState::set_screen_filter(const std::string_view &filter) {
     if (!impl->screen) impl->screen = std::make_unique<ScreenRenderer>(*impl->device, std::filesystem::path(static_assets.string()));
@@ -1209,6 +1241,17 @@ bool MetalState::end_scene(MetalContext &ctx, bool allow_deferred) {
                         ctx.impl->sample_scale,depth,stencil,ctx.impl->mask),
                         "Metal: cannot publish guest depth/stencil storage");
                 stored_depth = true;
+                if (!impl->trace_depth_store_trigger.empty()
+                    && std::filesystem::exists(impl->trace_depth_store_trigger)
+                    && impl->traced_depth_stores++ < 128)
+                    LOG_INFO("Metal depth publication: format={} size={}x{} stride={} tiled={} packed={} depth_bytes={} depth_size={} stencil_size={} samples={} inline={} direct_packed_eligible={}",
+                        uint32_t(ctx.impl->guest_depth.get_format()), layout.width, layout.height,
+                        layout.stride, layout.tiled, layout.packed, layout.depth_bytes,
+                        layout.depth_size, layout.stencil_size, ctx.impl->depth.sampleCount,
+                        bool(pending_depth_store.depth), layout.packed && !layout.tiled
+                            && layout.stride == layout.width && layout.depth_bytes == 4
+                            && layout.depth_size && !layout.stencil_size
+                            && ctx.impl->guest_depth.get_format() == SCE_GXM_DEPTH_STENCIL_FORMAT_S8D24);
             }
             if (cached_depth!=impl->depth_surfaces.end() && cached_depth->second.texture==ctx.impl->depth) {
                 auto &entry=cached_depth->second;
@@ -2335,11 +2378,19 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         const bool fragment_disabled = !record.is_maskupdate
             && (cull_front || front_fragment_disabled) && (cull_back || back_fragment_disabled);
         const bool fragment_resources = !record.is_maskupdate && !fragment_disabled;
-        if (!impl->dump_armed && fragment_resources && impl->dump_arm_shader == hex_string(fp->renderer_data->hash))
+        if (!impl->trace_pixel_armed && fragment_resources
+            && impl->trace_pixel_arm_shader == hex_string(fp->renderer_data->hash)
+            && (!impl->trace_pixel_target_width || ctx.impl->width == impl->trace_pixel_target_width))
+            impl->trace_pixel_armed = true;
+        if (!impl->dump_armed && fragment_resources && impl->dump_arm_shader == hex_string(fp->renderer_data->hash)
+            && (!impl->dump_arm_target_width || ctx.impl->width == impl->dump_arm_target_width)
+            && impl->dump_arm_shader_matches++ >= impl->dump_arm_shader_skip)
             impl->dump_armed = true;
         const bool capture_draw = !impl->dump_draw_dir.empty() && !impl->draw_dumped && impl->dump_armed
-            && (impl->dump_arm_pixel_shader.empty() || impl->dump_pixel_armed)
+            && ((impl->dump_arm_pixel_shader.empty() && impl->dump_arm_pixel_rgb.empty()) || impl->dump_pixel_armed)
             && (impl->dump_draw_shader.empty() || impl->dump_draw_shader == hex_string(fp->renderer_data->hash))
+            && (!impl->dump_draw_target_address || ctx.impl->guest_color.data.address() == impl->dump_draw_target_address)
+            && (!impl->dump_draw_target_width || ctx.impl->width == impl->dump_draw_target_width)
             && (!impl->dump_draw_texture_address || (fp->renderer_data->textures_used[0]
                 && (ctx.textures[0].data_addr << 2) == impl->dump_draw_texture_address))
             && (!impl->dump_draw_texture_width || (fp->renderer_data->textures_used[0]
@@ -2350,10 +2401,12 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             && (!impl->dump_stream_stride || (!vp->streams.empty() && vp->streams[0].stride == impl->dump_stream_stride))
             && (impl->dump_trigger_file.empty() || std::filesystem::exists(impl->dump_trigger_file))
             && impl->dump_draw_matches++ >= impl->dump_draw_skip;
+        const auto draw_capture_dir = impl->dump_draw_limit == 1 ? impl->dump_draw_dir
+            : impl->dump_draw_dir / fmt::format("candidate-{:02}", impl->dump_draw_saved + 1);
         std::ofstream draw_metadata;
         std::ofstream texture_metadata;
         auto dump_bytes = [&](const std::string &name, const void *bytes, size_t size) {
-            std::ofstream out(impl->dump_draw_dir/name, std::ios::binary);
+            std::ofstream out(draw_capture_dir/name, std::ios::binary);
             out.write(static_cast<const char *>(bytes), size);
             require(bool(out), "Metal: cannot write draw diagnostic " + name);
         };
@@ -2361,8 +2414,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         // readers remain usable. Snapshot only completed single-sample images.
         auto dump_attachment = [&](const char *name, id<MTLTexture> source) {
             if (!capture_draw || !impl->dump_attachments || !source) return;
-            std::filesystem::create_directories(impl->dump_draw_dir);
-            std::ofstream metadata(impl->dump_draw_dir/"attachments.txt",std::ios::app);
+            std::filesystem::create_directories(draw_capture_dir);
+            std::ofstream metadata(draw_capture_dir/"attachments.txt",std::ios::app);
             const size_t bytes=size_t(source.width)*source.height*16;
             if (source.sampleCount>1 || bytes>64*1024*1024) {
                 metadata << "skipped " << name << ' ' << source.width << ' ' << source.height << '\n';
@@ -2380,6 +2433,54 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             dump_bytes(std::string(name)+".rgba32f",pixels.data(),pixels.size());
             metadata << name << ' ' << source.width << ' ' << source.height << ' ' << uint32_t(source.pixelFormat) << '\n';
             require(bool(metadata),"Metal: cannot write attachment metadata");
+        };
+        auto dump_depth_attachment = [&](const char *name) {
+            id<MTLTexture> source = ctx.impl->depth;
+            if (!capture_draw || !impl->dump_attachments || !source) return;
+            std::filesystem::create_directories(draw_capture_dir);
+            std::ofstream metadata(draw_capture_dir/"attachments.txt",std::ios::app);
+            const size_t expanded_width=size_t(source.width)*(source.sampleCount>1 ? source.sampleCount/2 : 1);
+            const size_t expanded_height=size_t(source.height)*(source.sampleCount>1 ? 2 : 1);
+            const size_t bytes=expanded_width*expanded_height*sizeof(float);
+            if (bytes>64*1024*1024) {
+                metadata << "skipped " << name << ' ' << expanded_width << ' ' << expanded_height << '\n';
+                return;
+            }
+            if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+            auto snapshot=impl->caster->depth_snapshot(source,false,1,0,0,true);
+            std::vector<uint8_t> pixels(bytes);
+            [snapshot getBytes:pixels.data() bytesPerRow:expanded_width*sizeof(float)
+                fromRegion:MTLRegionMake2D(0,0,expanded_width,expanded_height) mipmapLevel:0];
+            dump_bytes(std::string(name)+".f32",pixels.data(),pixels.size());
+            metadata << name << ' ' << expanded_width << ' ' << expanded_height
+                << " samples " << source.sampleCount
+                << " guest_format " << uint32_t(record.depth_stencil_surface.get_format())
+                << " background " << record.depth_stencil_surface.background_depth
+                << " force_load " << bool(record.depth_stencil_surface.force_load)
+                << " force_store " << bool(record.depth_stencil_surface.force_store) << '\n';
+            require(bool(metadata),"Metal: cannot write depth attachment metadata");
+        };
+        auto dump_stencil_attachment = [&](const char *name) {
+            id<MTLTexture> source = ctx.impl->depth;
+            if (!capture_draw || !impl->dump_attachments || !source) return;
+            std::filesystem::create_directories(draw_capture_dir);
+            std::ofstream metadata(draw_capture_dir/"attachments.txt",std::ios::app);
+            const size_t expanded_width=size_t(source.width)*(source.sampleCount>1 ? source.sampleCount/2 : 1);
+            const size_t expanded_height=size_t(source.height)*(source.sampleCount>1 ? 2 : 1);
+            const size_t bytes=expanded_width*expanded_height;
+            if (bytes>64*1024*1024) {
+                metadata << "skipped " << name << ' ' << expanded_width << ' ' << expanded_height << '\n';
+                return;
+            }
+            if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+            auto snapshot=impl->caster->stencil_snapshot(source,false,1,0,0,true);
+            std::vector<uint8_t> pixels(bytes);
+            [snapshot getBytes:pixels.data() bytesPerRow:expanded_width
+                fromRegion:MTLRegionMake2D(0,0,expanded_width,expanded_height) mipmapLevel:0];
+            dump_bytes(std::string(name)+".u8",pixels.data(),pixels.size());
+            metadata << name << ' ' << expanded_width << ' ' << expanded_height
+                << " samples " << source.sampleCount << '\n';
+            require(bool(metadata),"Metal: cannot write stencil attachment metadata");
         };
         auto clip = scissors(record, ctx.impl->width, ctx.impl->height, res_multiplier);
         // A zero-area scissor discards every fragment but still runs the
@@ -2429,6 +2530,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         }
         if (capture_draw) finish(ctx); // Publish every producer before diagnostic texture reads.
         dump_attachment("color-before",ctx.impl->color);
+        dump_attachment("mask-before",ctx.impl->mask);
+        dump_depth_attachment("depth-before");
+        dump_stencil_attachment("stencil-before");
         ctx.shader_hints.metal_samples = ctx.impl->samples;
         ctx.shader_hints.metal_missing_vertex_outputs = fragment_resources
             ? (uint32_t(gxp::get_fragment_inputs(*fp->program.get(mem)))
@@ -3193,18 +3297,23 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             && uint64_t(ctx.impl->pass_visibility_offset) + query_capacity > ctx.impl->pass_visibility_buffer.length)
             begin_pass(ctx, record.is_maskupdate);
         if (capture_draw) {
-            std::filesystem::create_directories(impl->dump_draw_dir);
-            draw_metadata.open(impl->dump_draw_dir/"draw.txt");
-            texture_metadata.open(impl->dump_draw_dir/"textures.txt");
+            std::filesystem::create_directories(draw_capture_dir);
+            draw_metadata.open(draw_capture_dir/"draw.txt");
+            texture_metadata.open(draw_capture_dir/"textures.txt");
             texture_metadata << "version 2\n";
             draw_metadata.precision(17);
             draw_metadata << "version 1\nscale " << res_multiplier << "\nsize " << ctx.impl->width << ' ' << ctx.impl->height
                           << "\nfragment " << hex_string(fp->renderer_data->hash)
                           << "\nvertex " << hex_string(vp->renderer_data->hash)
                           << "\noutput_register_size " << record.color_surface.outputRegisterSize << '\n';
-            std::ofstream attachment_info(impl->dump_draw_dir/"attachments.txt",std::ios::app);
+            std::ofstream attachment_info(draw_capture_dir/"attachments.txt",std::ios::app);
             attachment_info << "target " << ctx.impl->guest_color.data.address() << " recorded " << record.color_surface.data.address()
                 << " same_native " << (ctx.impl->color == ctx.impl->render_color) << '\n';
+            attachment_info << "mask_state valid " << ctx.impl->mask_constant_valid
+                << " constant " << ctx.impl->mask_constant_value
+                << " descriptor " << record.depth_stencil_surface.mask
+                << " depth_disabled " << record.depth_stencil_surface.disabled()
+                << " writing " << record.writing_mask << '\n';
             auto shader_features = features;
             shader_features.enable_memory_mapping = true;
             auto msl = shader::metal::convert_gxp(*vp->program.get(mem), hex_string(vp->renderer_data->hash), shader_features, ctx.shader_hints, false);
@@ -3486,6 +3595,22 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             };
             ctx.impl->depth_written |= writes_stencil(front) || writes_stencil(back);
         }
+        if (capture_draw && impl->dump_attachments) {
+            std::ofstream metadata(draw_capture_dir/"attachments.txt",std::ios::app);
+            metadata << "draw_state depth_key";
+            for (const uint32_t value : depth_key) metadata << ' ' << value;
+            metadata << " front_ref " << unsigned(record.front_stencil_state_values.ref)
+                << " back_ref " << unsigned(record.back_stencil_state_values.ref)
+                << " cull " << uint32_t(record.cull_mode)
+                << " two_sided " << uint32_t(record.two_sided)
+                << " front_disabled " << front_fragment_disabled
+                << " back_disabled " << back_fragment_disabled
+                << " clip_count " << clip.size();
+            for (const auto &rect : clip)
+                metadata << " clip " << rect.x << ',' << rect.y << ',' << rect.width << ',' << rect.height;
+            metadata << '\n';
+            require(bool(metadata),"Metal: cannot write draw-state metadata");
+        }
         const auto native_depth_state = [&](const DepthKey &key) -> id<MTLDepthStencilState> {
             auto [found, inserted] = impl->depth_states.try_emplace(key);
             if (inserted) {
@@ -3561,6 +3686,25 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 uint32_t(blend.colorFunc), uint32_t(blend.alphaFunc), uint32_t(blend.colorSrc), uint32_t(blend.colorDst),
                 uint32_t(blend.alphaSrc), uint32_t(blend.alphaDst), uint32_t(blend.colorMask));
             if (impl->traced_draws.insert(detail).second) LOG_INFO("Metal draw binding: {}", detail);
+        }
+        if (impl->trace_target_width == ctx.impl->width && impl->traced_target_draws < 10000) {
+            const uint32_t sequence = impl->traced_target_draws++;
+            const bool has_source = fragment_resources && fp->renderer_data->textures_used[0];
+            const Address source = has_source ? ctx.textures[0].data_addr << 2 : 0;
+            uint64_t source_hash = 0;
+            bool source_hash_valid = false;
+            if (source) {
+                const size_t bytes = texture_storage_size(ctx.textures[0]);
+                const uint64_t end = uint64_t(source) + bytes;
+                if (bytes && bytes <= 1024 * 1024 && end <= uint64_t(UINT32_MAX) - 4095
+                    && is_valid_addr_range(mem, source, Address(end))) {
+                    source_hash = XXH3_64bits(Ptr<uint8_t>(source).get(mem), bytes);
+                    source_hash_valid = true;
+                }
+            }
+            LOG_INFO("Metal target-width draw: seq={} target={:#x} size={}x{} fs={} source0={:#x} source_hash_valid={} source_hash={:#x}",
+                sequence, ctx.impl->guest_color.data.address(), ctx.impl->width, ctx.impl->height,
+                hex_string(fp->renderer_data->hash), source, source_hash_valid, source_hash);
         }
         if (capture_draw) draw_metadata << "viewport " << viewport.originX << ' ' << viewport.originY << ' '
             << viewport.width << ' ' << viewport.height << ' ' << viewport.znear << ' ' << viewport.zfar << '\n';
@@ -3890,6 +4034,18 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                         << uint32_t(guest.colorFormat) << ' ' << uint32_t(guest.surfaceType) << ' '
                         << prepared << ' ' << uploaded_view << '\n';
                     dump_attachment(fmt::format("{}-producer-{}",stage,slot).c_str(),producer->second.color);
+                }
+                if (std::getenv("VITA3K_METAL_DUMP_RAW_TEXTURE") && !prepared
+                    && surface == impl->surfaces.end() && slot == 0) {
+                    const size_t bytes = texture_storage_size(texture);
+                    const uint64_t end = uint64_t(texture_address) + bytes;
+                    if (bytes && bytes <= 1024 * 1024 && end <= uint64_t(UINT32_MAX) - 4095
+                        && is_valid_addr_range(mem, texture_address, Address(end))) {
+                        const auto name = fmt::format("{}-guest-texture-{}.bin", stage, slot);
+                        dump_bytes(name, Ptr<uint8_t>(texture_address).get(mem), bytes);
+                        texture_metadata << "guest_texture " << stage << ' ' << slot << ' '
+                            << texture_address << ' ' << bytes << ' ' << name << '\n';
+                    }
                 }
                 const bool is_cube=native.textureType==MTLTextureTypeCube;
                 const uint32_t faces=is_cube ? 6 : 1;
@@ -4431,8 +4587,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             dump_bytes("indices.bin",indices,native_count*index_size);
             draw_metadata << "draw " << type << ' ' << index_size << ' ' << native_count << ' ' << instances << '\n';
             require(bool(draw_metadata) && bool(texture_metadata),"Metal: cannot write draw metadata");
-            impl->draw_dumped = true;
-            LOG_INFO("Metal vertex draw saved: {}",impl->dump_draw_dir.string());
+            impl->draw_dumped = ++impl->dump_draw_saved >= impl->dump_draw_limit;
+            LOG_INFO("Metal vertex draw saved: {}",draw_capture_dir.string());
         }
         const uint32_t visibility_entries = ctx.impl->visibility_stride / sizeof(uint32_t);
         const uint64_t visibility_group = ctx.impl->visibility_address && visibility_faces_differ
@@ -4597,8 +4753,14 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         if (capture_draw && impl->dump_attachments) {
             finish(ctx);
             dump_attachment("color-after",ctx.impl->color);
+            dump_attachment("mask-after",ctx.impl->mask);
+            dump_depth_attachment("depth-after");
+            dump_stencil_attachment("stencil-after");
         }
-        if (!impl->trace_pixel.empty() && impl->traced_pixel_draws < 1000
+        if (!impl->trace_pixel.empty() && impl->trace_pixel_armed && impl->traced_pixel_draws < 1000
+            && (!impl->trace_pixel_target_address
+                || ctx.impl->guest_color.data.address() == impl->trace_pixel_target_address)
+            && (!impl->trace_pixel_target_width || ctx.impl->width == impl->trace_pixel_target_width)
             && (impl->trace_pixel_trigger.empty() || std::filesystem::exists(impl->trace_pixel_trigger))) {
             unsigned x = 0, y = 0;
             if (std::sscanf(impl->trace_pixel.c_str(), "%u,%u", &x, &y) == 2
@@ -4618,8 +4780,22 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                             impl->traced_pixel_draws, ctx.impl->guest_color.data.address(),
                             hex_string(fp->renderer_data->hash), x, y, pixel[0], pixel[1], pixel[2], pixel[3]);
                         if (!impl->dump_arm_pixel_shader.empty()
-                            && impl->dump_arm_pixel_shader == hex_string(fp->renderer_data->hash))
+                            && impl->dump_arm_pixel_shader == hex_string(fp->renderer_data->hash)
+                            && std::max({pixel[0], pixel[1], pixel[2]}) > impl->dump_arm_pixel_min_rgb)
                             impl->dump_pixel_armed = true;
+                        if (!impl->dump_pixel_armed && !impl->dump_arm_pixel_rgb.empty()) {
+                            float target_r = 0, target_g = 0, target_b = 0, tolerance = 0;
+                            if (std::sscanf(impl->dump_arm_pixel_rgb.c_str(), "%f,%f,%f,%f",
+                                    &target_r, &target_g, &target_b, &tolerance) == 4
+                                && tolerance >= 0 && std::abs(pixel[0] - target_r) <= tolerance
+                                && std::abs(pixel[1] - target_g) <= tolerance
+                                && std::abs(pixel[2] - target_b) <= tolerance) {
+                                impl->dump_draw_shader = hex_string(fp->renderer_data->hash);
+                                impl->dump_pixel_armed = true;
+                                LOG_INFO("Metal pixel-color draw capture armed: fs={} xy={},{}",
+                                    impl->dump_draw_shader, x, y);
+                            }
+                        }
                         std::copy(std::begin(pixel), std::end(pixel), impl->last_traced_pixel);
                         impl->has_traced_pixel = true;
                     }
@@ -4732,6 +4908,35 @@ void MetalState::render_frame(DisplayState &display, const GxmState &, MemState 
         id<MTLTexture> source = nil;
         const auto region = has_frame
             ? find_display_surface_region(impl->surfaces, next, res_multiplier, false) : std::nullopt;
+        if (impl->trace_display_pixel && region && ++impl->traced_display_pixels % 30 == 0
+            && impl->traced_display_pixels <= 900
+            && (region->color.pixelFormat == MTLPixelFormatRGBA8Unorm
+                || region->color.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB)) {
+            const uint32_t x = region->width / 2;
+            const uint32_t y = region->line + region->available_rows / 2;
+            uint8_t rgba[4]{};
+            [region->color getBytes:rgba bytesPerRow:4
+                fromRegion:MTLRegionMake2D(x, y, 1, 1) mipmapLevel:0];
+            LOG_INFO("Metal display pixel: base={:#x} region={}x{} line={} row={} source={}x{} center={},{} rgba={},{},{},{}",
+                next.base.address(), region->width, region->height, region->line, region->available_rows,
+                uint32_t(region->color.width), uint32_t(region->color.height), x, y,
+                rgba[0], rgba[1], rgba[2], rgba[3]);
+            unsigned comparable = 0;
+            for (const auto &[address, surface] : impl->surfaces) {
+                if (!surface.color || surface.color.width != region->color.width
+                    || surface.color.height != region->color.height
+                    || surface.color.pixelFormat != region->color.pixelFormat) continue;
+                if (comparable++ >= 8) break;
+                const uint32_t probe_x = std::min<uint32_t>(region->width / 8, uint32_t(surface.color.width) - 1);
+                const uint32_t probe_y = std::min<uint32_t>(region->height / 2, uint32_t(surface.color.height) - 1);
+                uint8_t probe[4]{};
+                [surface.color getBytes:probe bytesPerRow:4
+                    fromRegion:MTLRegionMake2D(probe_x, probe_y, 1, 1) mipmapLevel:0];
+                LOG_INFO("Metal display candidate pixel: selected={:#x} cached={:#x} revision={} xy={},{} rgba={},{},{},{}",
+                    next.base.address(), address, surface.revision, probe_x, probe_y,
+                    probe[0], probe[1], probe[2], probe[3]);
+            }
+        }
         if (impl->trace_batches && impl->traced_display_frames++ % 60 == 0 && impl->traced_display_frames < 600) {
             Address cached_address = 0;
             if (region) for (const auto &[address, surface] : impl->surfaces)
