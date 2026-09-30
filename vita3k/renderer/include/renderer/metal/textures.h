@@ -50,6 +50,8 @@ struct CubeSurface {
 struct SurfaceRect { uint32_t x, y, width, height; };
 struct SurfaceMemoryRange { size_t offset, size; };
 std::optional<SurfaceRect> surface_subrectangle(const SceGxmColorSurface &, const SceGxmTexture &);
+// A larger linear descriptor can sample only the rendered prefix of its storage.
+std::optional<std::pair<float,float>> surface_texture_viewport(const SceGxmColorSurface &, const SceGxmTexture &);
 // Match a representable depth view in the allocation's guest sample coordinates.
 std::optional<SurfaceRect> depth_subrectangle(const SceGxmDepthStencilSurface &, uint32_t width, uint32_t height,
     SceGxmMultisampleMode, const SceGxmTexture &);

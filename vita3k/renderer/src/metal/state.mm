@@ -2562,6 +2562,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         // A mip chain or cube can span several independently rendered surfaces.
         // Publish incompatible aliases and preserve native pixels for matching levels.
         std::array<id<MTLTexture>, SCE_GXM_MAX_TEXTURE_UNITS*2> prepared_images{};
+        std::array<std::optional<std::pair<float,float>>, SCE_GXM_MAX_TEXTURE_UNITS*2> surface_viewports{};
         std::array<shader::metal::TextureMipInfo,SCE_GXM_MAX_TEXTURE_UNITS*2> texture_mip_info{};
         for (uint32_t index=0;index<SCE_GXM_MAX_TEXTURE_UNITS*2;++index) {
             const bool vertex=index>=SCE_GXM_MAX_TEXTURE_UNITS;
@@ -2631,6 +2632,13 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             const auto texture_base=gxm::get_base_format(gxm::get_format(texture));
             bool incompatible_alias=false;
             auto source=impl->surfaces.find(texture_address);
+            // Persona 4 describes a 1024x1024 texture over a 960x544 target.
+            // Sample its rendered prefix directly, preserving guest texel
+            // coordinates without reading the unallocated trailing rows.
+            if (!cube && features.use_texture_viewport && source!=impl->surfaces.end()) {
+                surface_viewports[index]=surface_texture_viewport(source->second.guest,texture);
+                if (surface_viewports[index]) continue;
+            }
             if (source!=impl->surfaces.end() && surface_memory_size(source->second.guest)) {
                 const bool direct_rg32_alias=(texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
                     || texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)
@@ -2667,8 +2675,17 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             const Address address=texture.data_addr<<2;
             const size_t storage=texture_storage_size(upload), face_stride=cube?storage/6:storage;
             const uint64_t end=uint64_t(address)+storage;
-            require(address && end<=uint64_t(UINT32_MAX)-4095 && is_valid_addr_range(mem,address,Address(end)),
-                "Metal: texture subresources extend beyond mapped guest memory");
+            if (!address || end>uint64_t(UINT32_MAX)-4095
+                || !is_valid_addr_range(mem,address,Address(end))) {
+                if (source!=impl->surfaces.end()) {
+                    const auto &s=source->second.guest;
+                    LOG_ERROR("Metal invalid texture source: address={:#x}, size={}x{}, stride={}, format={:#x}, type={}",
+                        s.data.address(),s.width,s.height,s.strideInPixels,uint32_t(s.colorFormat),uint32_t(s.surfaceType));
+                }
+                throw std::runtime_error(fmt::format("Metal: texture subresources extend beyond mapped guest memory: address={:#x}, bytes={}, type={:#x}, format={:#x}, size={}x{}, mips={}, cube={}, stage={}, slot={}",
+                    address,storage,uint32_t(upload.texture_type()),uint32_t(gxm::get_format(upload)),
+                    gxm::get_width(upload),gxm::get_height(upload),uint32_t(upload.true_mip_count()),cube,vertex?"vertex":"fragment",slot));
+            }
             std::vector<Surface *> overlaps;
             for (auto &[base,surface]:impl->surfaces) {
                 const size_t bytes=surface_memory_size(surface.guest);
@@ -3860,6 +3877,10 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 dump_bytes(fmt::format("{}-texture-{}.gxm",vertex ? "vertex" : "fragment",slot),&texture,sizeof(texture));
             }
             auto &mip_info=texture_mip_info[index];
+            if (surface_viewports[index]) {
+                if (vertex) vertex_info.set_viewport_ratio(slot,*surface_viewports[index]);
+                else fragment_info.set_viewport_ratio(slot,*surface_viewports[index]);
+            }
             // The strided descriptor stores its row pitch in the min/mip/LOD
             // fields. Match the hardware sampler when sampling an aliased
             // surface through the reconstructed guest grid.

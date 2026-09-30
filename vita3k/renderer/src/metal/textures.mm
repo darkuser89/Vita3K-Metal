@@ -313,6 +313,29 @@ bool depth_texture_matches(const SceGxmDepthStencilSurface &surface, uint32_t wi
         && rect->width==uint64_t(width)*(multisample==SCE_GXM_MULTISAMPLE_4X ? 2 : 1)
         && rect->height==uint64_t(height)*(multisample!=SCE_GXM_MULTISAMPLE_NONE ? 2 : 1);
 }
+std::optional<std::pair<float,float>> surface_texture_viewport(const SceGxmColorSurface &surface, const SceGxmTexture &texture) {
+    const auto type=texture.texture_type();
+    if (!surface.data || !surface.width || !surface.height || surface.strideInPixels<surface.width
+        || surface.surfaceType!=SCE_GXM_COLOR_SURFACE_LINEAR
+        || (type!=SCE_GXM_TEXTURE_LINEAR && type!=SCE_GXM_TEXTURE_LINEAR_STRIDED)
+        || (type!=SCE_GXM_TEXTURE_LINEAR_STRIDED && texture.true_mip_count()>1)
+        || (uint64_t(texture.data_addr)<<2)!=surface.data.address()) return std::nullopt;
+    SceGxmTextureFormat mapped{};
+    const auto format=gxm::get_format(texture);
+    if (!gxm::convert_color_format_to_texture_format(surface.colorFormat,mapped)
+        || gxm::get_base_format(mapped)!=gxm::get_base_format(format)
+        || (gxm::get_base_format(mapped)==SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8 && mapped!=format)) return std::nullopt;
+    const uint32_t bits=gxm::bits_per_pixel(gxm::get_base_format(format));
+    if (!bits || bits%8) return std::nullopt;
+    const uint32_t width=gxm::get_width(texture),height=gxm::get_height(texture);
+    const uint64_t stride=type==SCE_GXM_TEXTURE_LINEAR_STRIDED?gxm::get_stride_in_bytes(texture)
+        : uint64_t((width+7)&~7u)*(bits/8);
+    if (stride!=uint64_t(surface.strideInPixels)*(bits/8)
+        || width<surface.width || height<surface.height
+        || (width==surface.width && height==surface.height)) return std::nullopt;
+    return std::pair{float(width)/surface.width,float(height)/surface.height};
+}
+
 std::optional<SurfaceRect> surface_subrectangle(const SceGxmColorSurface &surface, const SceGxmTexture &texture) {
     const auto type=texture.texture_type();
     if (!surface.data || !surface.width || !surface.height || surface.strideInPixels<surface.width
