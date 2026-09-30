@@ -453,6 +453,7 @@ struct MetalState::Impl {
     uint32_t traced_scene_ends = 0;
     uint32_t traced_draw_flushes = 0;
     uint32_t traced_mid_scene_flushes = 0;
+    uint32_t traced_display_fallbacks = 0;
     bool trace_textures = std::getenv("VITA3K_METAL_TRACE_TEXTURES") != nullptr;
     bool trace_finish_timing = std::getenv("VITA3K_METAL_TRACE_FINISH_TIMING") != nullptr;
     uint64_t timed_finishes = 0;
@@ -592,30 +593,57 @@ fragment void macroblock_clear_fragment() {}
 }
 struct DisplaySurfaceRegion {
     id<MTLTexture> color = nil;
-    uint32_t line = 0, width = 0, height = 0, available_rows = 0;
+    uint32_t line = 0, width = 0, height = 0, available_rows = 0, destination_line = 0;
 };
 static std::optional<DisplaySurfaceRegion> find_display_surface_region(
     const std::map<Address, Surface> &surfaces, const DisplayFrameInfo &frame,
     float scale, bool allow_legacy_pitch) {
-    auto it = surfaces.upper_bound(frame.base.address());
-    if (it == surfaces.begin()) return std::nullopt;
-    --it;
-    id<MTLTexture> color = it->second.color;
-    if (!color || (!frame.pitch && !allow_legacy_pitch)) return std::nullopt;
-    const uint64_t delta = uint64_t(frame.base.address()) - it->first;
-    const uint32_t pitch = frame.pitch ? frame.pitch : it->second.guest.strideInPixels;
-    const uint64_t stride_bytes = uint64_t(it->second.guest.strideInPixels)
-        * gxm::bits_per_pixel(gxm::get_base_format(it->second.guest.colorFormat)) / 8;
-    const uint64_t pitch_bytes = uint64_t(pitch) * 4;
-    if (!pitch_bytes || (frame.pitch && stride_bytes != pitch_bytes)
-        || delta % pitch_bytes || (delta && !frame.pitch)) return std::nullopt;
-    const uint64_t scaled_line = uint64_t((delta / pitch_bytes) * scale);
-    const uint32_t width = frame.image_size.x > 0 ? uint32_t(frame.image_size.x * scale) : uint32_t(color.width);
-    const uint32_t height = frame.image_size.y > 0 ? uint32_t(frame.image_size.y * scale) : uint32_t(color.height);
-    if (!width || !height || width > color.width || height > 16384 || scaled_line >= color.height)
-        return std::nullopt;
-    return DisplaySurfaceRegion{color, uint32_t(scaled_line), width, height,
-        std::min(height, uint32_t(color.height - scaled_line))};
+    const auto upper = surfaces.upper_bound(frame.base.address());
+    auto match = [&](auto it) -> std::optional<DisplaySurfaceRegion> {
+        id<MTLTexture> color = it->second.color;
+        if (!color || (!frame.pitch && !allow_legacy_pitch)) return std::nullopt;
+        const int64_t delta = int64_t(frame.base.address()) - it->first;
+        const uint32_t pitch = frame.pitch ? frame.pitch : it->second.guest.strideInPixels;
+        const uint64_t stride_bytes = uint64_t(it->second.guest.strideInPixels)
+            * gxm::bits_per_pixel(gxm::get_base_format(it->second.guest.colorFormat)) / 8;
+        const uint64_t pitch_bytes = uint64_t(pitch) * 4;
+        if (!pitch_bytes || (frame.pitch && stride_bytes != pitch_bytes)
+            || delta % int64_t(pitch_bytes) || (delta && !frame.pitch)) return std::nullopt;
+        const int64_t row_delta = delta / int64_t(pitch_bytes);
+        const uint64_t scaled_line = uint64_t(std::max<int64_t>(row_delta, 0) * scale);
+        const uint64_t destination_line = uint64_t(std::max<int64_t>(-row_delta, 0) * scale);
+        const uint32_t width = frame.image_size.x > 0 ? uint32_t(frame.image_size.x * scale) : uint32_t(color.width);
+        const uint32_t height = frame.image_size.y > 0 ? uint32_t(frame.image_size.y * scale) : uint32_t(color.height);
+        if (!width || !height || width > color.width || height > 16384
+            || scaled_line >= color.height || destination_line >= height)
+            return std::nullopt;
+        return DisplaySurfaceRegion{color, uint32_t(scaled_line), width, height,
+            std::min(uint32_t(height - destination_line), uint32_t(color.height - scaled_line)), uint32_t(destination_line)};
+    };
+    if (upper != surfaces.begin()) {
+        if (auto region = match(std::prev(upper))) return region;
+    }
+    // Some games render a shorter image inside the display allocation, for
+    // example 540 rows starting two rows into a 544-row framebuffer.
+    if (upper != surfaces.end()) return match(upper);
+    return std::nullopt;
+}
+static std::vector<uint32_t> display_border_pixels(const DisplayFrameInfo &frame,
+    const DisplaySurfaceRegion &region, MemState *mem, uint32_t first_row, uint32_t rows) {
+    std::vector<uint32_t> pixels(size_t(region.width) * rows, 0xff000000u);
+    if (!rows || !mem || !frame.base || frame.image_size.x <= 0 || frame.image_size.y <= 0
+        || frame.pitch < uint32_t(frame.image_size.x)) return pixels;
+    const uint64_t end = uint64_t(frame.base.address()) + uint64_t(frame.pitch) * frame.image_size.y * 4;
+    if (end > uint64_t(UINT32_MAX) - 4095
+        || !is_valid_addr_range(*mem, frame.base.address(), Address(end))) return pixels;
+    const auto *guest = static_cast<const uint32_t *>(frame.base.get(*mem));
+    for (uint32_t y = 0; y < rows; ++y) {
+        const size_t guest_y = uint64_t(first_row + y) * frame.image_size.y / region.height;
+        for (uint32_t x = 0; x < region.width; ++x)
+            pixels[size_t(y) * region.width + x] = guest[guest_y * frame.pitch
+                + uint64_t(x) * frame.image_size.x / region.width];
+    }
+    return pixels;
 }
 MetalContext::MetalContext() : impl(std::make_unique<Impl>()) {}
 MetalContext::~MetalContext() = default;
@@ -4504,17 +4532,24 @@ std::vector<uint32_t> MetalState::read_display_frame(DisplayState &display, uint
     height = region->height;
     const uint32_t line = region->line;
     const uint32_t rows = region->available_rows;
-    std::vector<uint32_t> result(size_t(width) * height);
+    std::vector<uint32_t> result(size_t(width) * height, 0xff000000u);
+    auto *mem = context ? static_cast<MetalContext *>(context)->impl->mem : nullptr;
+    for (const auto [begin, count] : {std::pair{0u, region->destination_line},
+             std::pair{region->destination_line + rows, height - region->destination_line - rows}}) {
+        const auto border = display_border_pixels(next, *region, mem, begin, count);
+        std::copy(border.begin(), border.end(), result.begin() + size_t(begin) * width);
+    }
+    auto *destination = result.data() + size_t(region->destination_line) * width;
     if (color.pixelFormat == MTLPixelFormatRGBA16Float) {
         std::vector<__fp16> pixels(size_t(width) * rows * 4);
         [color getBytes:pixels.data() bytesPerRow:width * 8 fromRegion:MTLRegionMake2D(0, line, width, rows) mipmapLevel:0];
-        auto *bytes = reinterpret_cast<uint8_t *>(result.data());
+        auto *bytes = reinterpret_cast<uint8_t *>(destination);
         for (size_t i = 0; i < pixels.size(); ++i) {
             const float value = pixels[i];
             bytes[i] = std::isnan(value) ? 0 : uint8_t(std::lround(std::clamp(value, 0.0f, 1.0f) * 255));
         }
     } else {
-        [color getBytes:result.data() bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(0, line, width, rows) mipmapLevel:0];
+        [color getBytes:destination bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(0, line, width, rows) mipmapLevel:0];
     }
     return result;
 }
@@ -4564,12 +4599,58 @@ void MetalState::render_frame(DisplayState &display, const GxmState &, MemState 
             ? find_display_surface_region(impl->surfaces, next, res_multiplier, false) : std::nullopt;
         if (region) {
             source = region->color;
-            if (region->line || region->width != source.width || region->available_rows != source.height) {
+            if (region->destination_line || region->available_rows != region->height) {
+                auto padded = make_texture(*impl->device, source.pixelFormat, region->width, region->height,
+                    MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView);
+                if (source.pixelFormat == MTLPixelFormatRGBA8Unorm || source.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB
+                    || source.pixelFormat == MTLPixelFormatRGBA16Float) {
+                    for (const auto [begin, count] : {std::pair{0u, region->destination_line},
+                             std::pair{region->destination_line + region->available_rows,
+                                 region->height - region->destination_line - region->available_rows}}) {
+                        if (!count) continue;
+                        const auto border = display_border_pixels(next, *region, &mem, begin, count);
+                        if (source.pixelFormat == MTLPixelFormatRGBA16Float) {
+                            std::vector<__fp16> half(border.size() * 4);
+                            const auto *bytes = reinterpret_cast<const uint8_t *>(border.data());
+                            for (size_t i = 0; i < half.size(); ++i) half[i] = float(bytes[i]) / 255.f;
+                            [padded replaceRegion:MTLRegionMake2D(0, begin, region->width, count) mipmapLevel:0
+                                withBytes:half.data() bytesPerRow:region->width * 8];
+                        } else {
+                            [padded replaceRegion:MTLRegionMake2D(0, begin, region->width, count) mipmapLevel:0
+                                withBytes:border.data() bytesPerRow:region->width * 4];
+                        }
+                    }
+                } else {
+                    auto clear = [MTLRenderPassDescriptor renderPassDescriptor];
+                    clear.colorAttachments[0].texture = padded;
+                    clear.colorAttachments[0].loadAction = MTLLoadActionClear;
+                    clear.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+                    clear.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    [[impl->screen_commands renderCommandEncoderWithDescriptor:clear] endEncoding];
+                }
+                auto blit = [impl->screen_commands blitCommandEncoder];
+                [blit copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, region->line, 0)
+                    sourceSize:MTLSizeMake(region->width, region->available_rows, 1) toTexture:padded destinationSlice:0
+                    destinationLevel:0 destinationOrigin:MTLOriginMake(0, region->destination_line, 0)];
+                [blit endEncoding];
+                source = padded;
+            } else if (region->line || region->width != source.width || region->available_rows != source.height) {
                 if (!impl->caster) impl->caster = std::make_unique<SurfaceCaster>(*impl->device);
                 source = impl->caster->enqueue_subrectangle(source, uint32_t(source.width), uint32_t(source.height),
                     SurfaceRect{0, region->line, region->width, region->available_rows}, impl->screen_commands);
             }
         } else if (has_frame) {
+            if (impl->trace_batches && impl->traced_display_fallbacks++ < 16) {
+                LOG_INFO("Metal display fallback: base={:#x} pitch={} size={}x{} surfaces={}",
+                    next.base.address(), next.pitch, next.image_size.x, next.image_size.y, impl->surfaces.size());
+                unsigned reported = 0;
+                for (const auto &[address, surface] : impl->surfaces) {
+                    if (reported++ == 16) break;
+                    LOG_INFO("Metal display candidate: base={:#x} stride={} size={}x{} format={:#x} native={}x{}",
+                        address, surface.guest.strideInPixels, surface.guest.width, surface.guest.height,
+                        uint32_t(surface.guest.colorFormat), uint32_t(surface.color.width), uint32_t(surface.color.height));
+                }
+            }
             source = make_texture(*impl->device, MTLPixelFormatRGBA8Unorm, next.image_size.x, next.image_size.y, MTLTextureUsageShaderRead);
             [source replaceRegion:MTLRegionMake2D(0, 0, next.image_size.x, next.image_size.y) mipmapLevel:0 withBytes:next.base.get(mem) bytesPerRow:next.pitch * 4];
         }
