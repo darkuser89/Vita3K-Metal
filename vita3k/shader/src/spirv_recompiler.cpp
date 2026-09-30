@@ -531,7 +531,23 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
             spv::Id pa_iter_var = spv::NoResult;
 
             // TODO how about centroid?
-            if (input_id == 0xD000) {
+            if (translation_state.is_metal && (input_id & 0x40000000)) {
+                // Sprite coordinates come from the point rasterizer, not a
+                // vertex output. Share the builtin with non-dependent texture
+                // queries and widen it for the PA register copy below.
+                if (coords[10].first == spv::NoResult) {
+                    coords[10].first = b.createVariable(spv::NoPrecision, spv::StorageClassInput,
+                        b.makeVectorType(f32, 2), "gl_PointCoord");
+                    b.addDecoration(coords[10].first, spv::DecorationBuiltIn, spv::BuiltInPointCoord);
+                    translation_state.interfaces.push_back(coords[10].first);
+                    coords[10].second = static_cast<int>(DataType::F32);
+                }
+                const auto point_coord = b.createLoad(coords[10].first, spv::NoPrecision);
+                pa_iter_var = b.createCompositeConstruct(v4, {
+                    b.createCompositeExtract(point_coord, f32, 0),
+                    b.createCompositeExtract(point_coord, f32, 1),
+                    b.makeFloatConstant(0.0f), b.makeFloatConstant(1.0f) });
+            } else if (input_id == 0xD000) {
                 pa_iter_var = b.createLoad(translation_state.frag_coord_id, spv::NoPrecision);
 
                 if (translation_state.is_metal) {
