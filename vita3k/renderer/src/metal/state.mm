@@ -3401,7 +3401,20 @@ MetalTextureCache::MetalTextureCache(MetalState &state) : impl(std::make_unique<
 }
 MetalTextureCache::~MetalTextureCache() = default;
 void MetalTextureCache::cache_and_bind_image(const SceGxmTexture &texture, MemState &mem) {
-    TextureCache::cache_and_bind_texture(texture_image_descriptor(texture),mem);
+    const SceGxmTexture image = texture_image_descriptor(texture);
+    if (image.data_addr) {
+        const Address address = image.data_addr << 2;
+        const size_t bytes = texture_storage_size(image);
+        const uint64_t end = uint64_t(address) + bytes;
+        // A queued bind can outlive the guest allocation. The shared cache
+        // hashes the first mip before Metal's later upload checks run.
+        if (!bytes || end > uint64_t(UINT32_MAX) - 4095
+            || !is_valid_addr_range(mem, address, Address(end))) {
+            LOG_WARN_ONCE("Metal: texture source at 0x{:08X} ({} bytes) is no longer allocated", address, bytes);
+            return;
+        }
+    }
+    TextureCache::cache_and_bind_texture(image, mem);
 }
 id<MTLTexture> current_texture(const MetalTextureCache &cache) {
     return cache.impl->textures[cache.impl->current];
