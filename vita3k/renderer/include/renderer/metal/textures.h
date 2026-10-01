@@ -145,6 +145,7 @@ class SurfaceCaster {
     id<MTLComputePipelineState> packed_depth_snapshot_pipeline;
     id<MTLComputePipelineState> multisample_pipeline, multisample_depth_pipeline;
     id<MTLComputePipelineState> multisample_integer_pipeline;
+    id<MTLComputePipelineState> raw_multisample_resolve_pipeline;
     id<MTLLibrary> multisample_library;
     std::map<std::pair<uint32_t,uint32_t>,id<MTLRenderPipelineState>> seed_pipelines;
     std::map<std::pair<uint32_t,uint32_t>,id<MTLRenderPipelineState>> clip_pipelines;
@@ -202,6 +203,9 @@ public:
         uint32_t guest_width = 0, uint32_t guest_height = 0, id<MTLCommandBuffer> pending_commands = nil);
     void seed_multisample(id<MTLTexture> source, id<MTLTexture> destination, float scale, bool expanded,
         uint32_t guest_width = 0, uint32_t guest_height = 0, id<MTLCommandBuffer> pending_commands = nil);
+    // Keep identical F16 sample words; use the normal float resolve for mixed samples.
+    void resolve_raw_multisample(id<MTLTexture> source, id<MTLTexture> resolved,
+        id<MTLTexture> destination, id<MTLCommandBuffer> commands);
     void restore_clipped_multisample(id<MTLTexture> source, id<MTLTexture> destination,
         const SceGxmColorSurface &surface, id<MTLCommandBuffer> commands,
         const MTLSamplePosition *sample_positions = nullptr);

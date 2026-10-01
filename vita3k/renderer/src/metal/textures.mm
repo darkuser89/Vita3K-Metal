@@ -1628,6 +1628,19 @@ kernel void expand_integer_samples(texture2d_ms<uint,access::read> input [[textu
         uint2(input.get_width(),input.get_height()),guest_size,input.get_num_samples());
     output.write(input.read(q.xy,q.z),p);
 }
+kernel void resolve_raw_f16_samples(texture2d_ms<uint,access::read> input [[texture(0)]],
+    texture2d<uint,access::read> resolved [[texture(1)]],
+    texture2d<uint,access::write> output [[texture(2)]], uint2 p [[thread_position_in_grid]]) {
+    if (p.x>=output.get_width() || p.y>=output.get_height()) return;
+    const uint4 first=input.read(p,0);
+    bool identical=true;
+    for (uint sample=1;sample<input.get_num_samples();++sample)
+        identical=identical && all(input.read(p,sample)==first);
+    // Pixel-frequency GXM shading writes the same raw word to every covered
+    // sample. Preserve it without the float MSAA resolve canonicalizing NaNs.
+    // Mixed coverage keeps Metal's normal resolved color for that pixel.
+    output.write(identical ? first : resolved.read(p),p);
+}
 kernel void expand_depth(depth2d_ms<float,access::read> input [[texture(0)]],
     texture2d<float,access::write> output [[texture(1)]], constant uint2 &guest_size [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
     if (p.x>=output.get_width() || p.y>=output.get_height()) return;
@@ -1955,7 +1968,37 @@ fragment uint4 publication_words(float4 position [[position]],
     multisample_pipeline=cached_compute(device, library, @"expand_samples");
     multisample_depth_pipeline=cached_compute(device, library, @"expand_depth");
     multisample_integer_pipeline=cached_compute(device, library, @"expand_integer_samples");
-    if (!multisample_pipeline || !multisample_depth_pipeline || !multisample_integer_pipeline) throw std::runtime_error("Metal: multisample copy pipeline failed");
+    raw_multisample_resolve_pipeline=cached_compute(device, library, @"resolve_raw_f16_samples");
+    if (!multisample_pipeline || !multisample_depth_pipeline || !multisample_integer_pipeline
+        || !raw_multisample_resolve_pipeline) throw std::runtime_error("Metal: multisample copy pipeline failed");
+}
+void SurfaceCaster::resolve_raw_multisample(id<MTLTexture> source, id<MTLTexture> resolved,
+    id<MTLTexture> destination, id<MTLCommandBuffer> commands) {
+    if (!source || !resolved || !destination || !commands
+        || source.textureType!=MTLTextureType2DMultisample
+        || (source.sampleCount!=2 && source.sampleCount!=4)
+        || resolved.textureType!=MTLTextureType2D || destination.textureType!=MTLTextureType2D
+        || source.pixelFormat!=MTLPixelFormatRGBA16Float
+        || resolved.pixelFormat!=MTLPixelFormatRGBA16Float
+        || destination.pixelFormat!=MTLPixelFormatRGBA16Float
+        || source.width!=resolved.width || source.height!=resolved.height
+        || source.width!=destination.width || source.height!=destination.height
+        || commands.status!=MTLCommandBufferStatusNotEnqueued)
+        throw std::runtime_error("Metal: invalid raw F16 sample resolve");
+    source=[source newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Uint];
+    resolved=[resolved newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Uint];
+    destination=[destination newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Uint];
+    if (!source || !resolved || !destination)
+        throw std::runtime_error("Metal: cannot view raw F16 sample bits");
+    auto encoder=[commands computeCommandEncoder];
+    if (!encoder) throw std::runtime_error("Metal: cannot encode raw F16 sample resolve");
+    [encoder setComputePipelineState:raw_multisample_resolve_pipeline];
+    [encoder setTexture:source atIndex:0];
+    [encoder setTexture:resolved atIndex:1];
+    [encoder setTexture:destination atIndex:2];
+    [encoder dispatchThreads:MTLSizeMake(destination.width,destination.height,1)
+        threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+    [encoder endEncoding];
 }
 void SurfaceCaster::expand_multisample(id<MTLTexture> source, id<MTLTexture> destination, float scale,
     uint32_t guest_width, uint32_t guest_height, id<MTLCommandBuffer> pending_commands) {

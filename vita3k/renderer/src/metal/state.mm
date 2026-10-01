@@ -815,6 +815,14 @@ static void restore_color_outside_clip(MetalContext &ctx, SurfaceCaster *caster)
     }
     ctx.impl->color_clip_restore_pending = false;
 }
+static bool needs_raw_color_resolve(const MetalContext &ctx) {
+    return ctx.impl->commands && ctx.impl->raw_render_color && ctx.impl->raw_color
+        && ctx.impl->color && ctx.impl->samples>1 && !ctx.impl->expanded_color;
+}
+static void resolve_raw_color_samples(MetalContext &ctx, SurfaceCaster &caster) {
+    caster.resolve_raw_multisample(ctx.impl->raw_render_color,ctx.impl->color,
+        ctx.impl->raw_color,ctx.impl->commands);
+}
 struct MetalState::Impl {
     static constexpr size_t STREAM_SNAPSHOT_RING_SIZE = 64u * 1024u * 1024u;
     static constexpr size_t STREAM_SNAPSHOT_MAX_BYTES = 16u * 1024u;
@@ -1515,6 +1523,10 @@ bool MetalState::finish(MetalContext &ctx, bool publish_color, bool wait_without
     if (ctx.impl->color_clip_samplewise && ctx.impl->color_clip_restore_pending && !impl->caster)
         impl->caster = std::make_unique<SurfaceCaster>(*impl->device);
     restore_color_outside_clip(ctx, impl->caster.get());
+    if (needs_raw_color_resolve(ctx)) {
+        if (!impl->caster) impl->caster = std::make_unique<SurfaceCaster>(*impl->device);
+        resolve_raw_color_samples(ctx,*impl->caster);
+    }
     const auto wait_pending_batch = [&](bool recycle_uploads) {
         auto batch = std::move(ctx.impl->pending_batches.front());
         ctx.impl->pending_batches.pop_front();
@@ -1766,6 +1778,10 @@ void MetalState::mid_scene_flush(MetalContext &ctx, bool wait_for_completion) {
         if (ctx.impl->color_clip_samplewise && ctx.impl->color_clip_restore_pending && !impl->caster)
             impl->caster = std::make_unique<SurfaceCaster>(*impl->device);
         restore_color_outside_clip(ctx, impl->caster.get());
+        if (needs_raw_color_resolve(ctx)) {
+            if (!impl->caster) impl->caster = std::make_unique<SurfaceCaster>(*impl->device);
+            resolve_raw_color_samples(ctx,*impl->caster);
+        }
     }
 }
 static std::pair<std::span<uint8_t>,std::span<uint8_t>> depth_memory_spans(MemState &mem,
@@ -2981,7 +2997,7 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                             require(impl->caster->patch_multisample(entry.multisample_color,surface,ctx.impl->sample_scale,cpu,changes),
                                 "Metal: CPU surface import could not preserve multisample storage");
                         }
-                        if (ctx.impl->expanded_color && !entry.raw_multisample_dirty && entry.raw_multisample_color
+                        if (samples>1 && !entry.raw_multisample_dirty && entry.raw_multisample_color
                             && entry.raw_multisample_color.width==width && entry.raw_multisample_color.height==height
                             && entry.raw_multisample_color.sampleCount==samples) {
                             if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
@@ -3001,7 +3017,7 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                 }
             }
             if (new_color || samples==1) entry.multisample_dirty=true;
-            if (new_color || !ctx.impl->expanded_color) entry.raw_multisample_dirty=true;
+            if (new_color || samples==1) entry.raw_multisample_dirty=true;
             if (samples>1) {
                 entry.multisample_scale=ctx.impl->sample_scale;
                 if (entry.multisample_color && entry.multisample_color.width==width && entry.multisample_color.height==height
@@ -3024,31 +3040,30 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
             }
             ctx.impl->render_color=samples>1 ? entry.multisample_color : entry.color;
             if (gxm::get_base_format(surface.colorFormat)==SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16) {
-                if (samples==1 || ctx.impl->expanded_color) {
-                    if (!entry.raw_color) {
-                        entry.raw_color=make_texture(*impl->device,format,color_width,color_height,
-                            MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView|MTLTextureUsageShaderWrite);
-                        seed_raw_color=true;
-                    }
-                    ctx.impl->raw_color=entry.raw_color;
-                    ctx.impl->raw_render_color=entry.raw_color;
-                    if (samples>1) {
-                        if (!entry.raw_multisample_color || entry.raw_multisample_color.width!=width
-                            || entry.raw_multisample_color.height!=height || entry.raw_multisample_color.sampleCount!=samples) {
-                            entry.raw_multisample_color=make_texture(*impl->device,format,width,height,
-                                MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView,samples);
-                            entry.raw_multisample_dirty=true;
-                        }
-                        ctx.impl->raw_render_color=entry.raw_multisample_color;
-                        seed_raw_samples=entry.raw_multisample_dirty;
-                    }
-                    ctx.impl->raw_attachment=[ctx.impl->raw_render_color newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Uint];
-                    require(ctx.impl->raw_attachment!=nil,"Metal: raw F16 attachment view failed");
-                } else {
-                    // Downscaled color averages native samples. Raw register
-                    // words have no equivalent arithmetic resolve yet.
-                    entry.raw_color_invalidated=true;
+                const bool new_raw_color=!entry.raw_color;
+                if (new_raw_color) {
+                    entry.raw_color=make_texture(*impl->device,format,color_width,color_height,
+                        MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView|MTLTextureUsageShaderWrite);
                 }
+                if (new_raw_color || entry.raw_color_invalidated) {
+                    seed_raw_color=true;
+                    entry.raw_multisample_dirty=true;
+                    entry.raw_color_invalidated=false;
+                }
+                ctx.impl->raw_color=entry.raw_color;
+                ctx.impl->raw_render_color=entry.raw_color;
+                if (samples>1) {
+                    if (!entry.raw_multisample_color || entry.raw_multisample_color.width!=width
+                        || entry.raw_multisample_color.height!=height || entry.raw_multisample_color.sampleCount!=samples) {
+                        entry.raw_multisample_color=make_texture(*impl->device,format,width,height,
+                            MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView,samples);
+                        entry.raw_multisample_dirty=true;
+                    }
+                    ctx.impl->raw_render_color=entry.raw_multisample_color;
+                    seed_raw_samples=entry.raw_multisample_dirty;
+                }
+                ctx.impl->raw_attachment=[ctx.impl->raw_render_color newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Uint];
+                require(ctx.impl->raw_attachment!=nil,"Metal: raw F16 attachment view failed");
             }
             entry.guest = surface;
             // Disabled surface synchronization does not acknowledge writes
@@ -3211,7 +3226,9 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
             // ordered in this buffer; a separately submitted seed runs too soon.
             if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
             impl->caster->seed_multisample(ctx.impl->raw_color,ctx.impl->raw_render_color,
-                ctx.impl->sample_scale,true,surface.width,surface.height,ctx.impl->commands);
+                ctx.impl->sample_scale,ctx.impl->expanded_color,
+                ctx.impl->expanded_color ? surface.width : 0,
+                ctx.impl->expanded_color ? surface.height : 0,ctx.impl->commands);
             impl->surfaces.at(surface.data.address()).raw_multisample_dirty=false;
         }
         // Treat the descriptor's clip as a color-output boundary. Preserve
@@ -5216,7 +5233,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
                 if (!ctx.impl->commands) ctx.impl->commands=scene_command_buffer(*impl->device);
                 impl->caster->seed_multisample(surface.raw_color,ctx.impl->raw_render_color,
-                    ctx.impl->sample_scale,true,surface.guest.width,surface.guest.height,ctx.impl->commands);
+                    ctx.impl->sample_scale,ctx.impl->expanded_color,
+                    ctx.impl->expanded_color ? surface.guest.width : 0,
+                    ctx.impl->expanded_color ? surface.guest.height : 0,ctx.impl->commands);
                 surface.raw_multisample_dirty=false;
             }
         }
