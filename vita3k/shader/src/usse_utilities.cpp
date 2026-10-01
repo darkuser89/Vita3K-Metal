@@ -1053,6 +1053,9 @@ static spv::Id apply_modifiers(spv::Builder &b, const SpirvUtilFunctions &utils,
 
     // Apply modifier flags
     if (flags & shader::usse::RegisterFlags::Negative) {
+        if (utils.native_metal && !is_int && !is_uint)
+            return b.createUnaryOp(spv::OpFNegate, dest_type, result);
+
         // Negate the value
         spv::Id c0 = spv::NoResult;
         spv::Op sub_op = spv::OpAny;
