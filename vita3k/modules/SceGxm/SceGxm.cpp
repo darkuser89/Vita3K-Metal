@@ -2181,6 +2181,12 @@ EXPORT(int, sceGxmCreateContext, const SceGxmContextParams *params, Ptr<SceGxmCo
     if (!params || !context)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
+    // Plus permits only one immediate GXM context. Keep that guest-visible
+    // limit in the native Metal path without changing the Vulkan backend.
+    if (emuenv.renderer->current_backend == renderer::Backend::Metal
+        && !emuenv.gxm.immediate_contexts.empty())
+        return RET_ERROR(SCE_GXM_ERROR_ALREADY_INITIALIZED);
+
     if (params->hostMemSize < sizeof(SceGxmContext)) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
     }
