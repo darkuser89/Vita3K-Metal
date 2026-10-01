@@ -120,6 +120,11 @@ public:
         reset_repeat_increase();
     }
 
+    void seed_metal_fragment_input_pa(std::uint32_t register_count) {
+        for (std::uint32_t reg = 0; reg < register_count; ++reg)
+            m_vpck_written_bytes[(static_cast<std::uint32_t>(RegisterBank::PRIMATTR) << 24) | (reg & 0xFFFFFF)] = 0xF;
+    }
+
 private:
     //
     // Translation helpers

@@ -26,7 +26,7 @@ inline constexpr uint32_t TEXTURE_COUNT = 16;
 inline constexpr uint32_t COLOR_ATTACHMENT_TEXTURE = 16;
 inline constexpr uint32_t MASK_TEXTURE = 17;
 inline constexpr uint32_t RAW_COLOR_ATTACHMENT_TEXTURE = 18;
-inline constexpr uint32_t SHADER_ABI_VERSION = 38;
+inline constexpr uint32_t SHADER_ABI_VERSION = 39;
 
 enum class Stage { Vertex, Fragment, Compute };
 

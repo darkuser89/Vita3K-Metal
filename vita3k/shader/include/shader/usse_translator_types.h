@@ -49,6 +49,8 @@ using SamplerMap = std::map<uint32_t, SamplerInfo>;
 
 struct SpirvShaderParameters {
     bool native_metal = false;
+    // Fragment PA words initialized by vertex linkage before USSE execution.
+    std::uint32_t metal_fragment_input_pa_regs = 0;
     bool native_cube_float_filter = false;
     spv::Id native_texture_info = 0;
     spv::Id native_frag_coord = 0;
