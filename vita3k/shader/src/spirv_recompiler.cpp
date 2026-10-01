@@ -1138,19 +1138,30 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
     spv::Id pa_arr_type = b.makeArrayType(f32_v4_type, b.makeIntConstant(REG_PA_COUNT / 4), 0);
     spv::Id sa_arr_type = b.makeArrayType(f32_v4_type, b.makeIntConstant(REG_SA_COUNT / 4), 0);
     spv::Id i_arr_type = b.makeArrayType(f32_v4_type, b.makeIntConstant(REG_I_COUNT / 4), 0);
-    spv::Id temp_arr_type = b.makeArrayType(f32_v4_type, b.makeIntConstant(REG_TEMP_COUNT / 4), 0);
+    uint32_t temp_reg_words = REG_TEMP_COUNT;
+    if (translation_state.is_metal) {
+        const uint64_t declared_words = (uint64_t(program.temp_reg_count1) + 3) & ~uint64_t(3);
+        temp_reg_words = static_cast<uint32_t>(std::min<uint64_t>(512, std::max<uint64_t>(REG_TEMP_COUNT, declared_words)));
+    }
+    spv::Id temp_arr_type = b.makeArrayType(f32_v4_type, b.makeIntConstant(temp_reg_words / 4), 0);
     spv::Id index_arr_type = b.makeArrayType(i32_type, b.makeIntConstant(REG_INDEX_COUNT / 4), 0);
     spv::Id pred_arr_type = b.makeArrayType(b_type, b.makeIntConstant(REG_PRED_COUNT / 4), 0);
     spv::Id o_arr_type = b.makeArrayType(f32_v4_type, b.makeIntConstant(REG_O_COUNT / 4), 0);
 
-    // Create register banks
-    spv_params.ins = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, pa_arr_type, "pa");
-    spv_params.uniforms = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, sa_arr_type, "sa");
-    spv_params.internals = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, i_arr_type, "internals");
-    spv_params.temps = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, temp_arr_type, "r");
-    spv_params.predicates = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, pred_arr_type, "p");
-    spv_params.indexes = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, index_arr_type, "idx");
-    spv_params.outs = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, o_arr_type, "outs");
+    // Metal must not read an undefined register when a guest shader only
+    // writes part of a bank. Keep the other backend's register initialization.
+    const auto make_bank = [&](spv::Id type, const char *name) {
+        if (translation_state.is_metal)
+            return b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, type, name, b.makeNullConstant(type));
+        return b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, type, name);
+    };
+    spv_params.ins = make_bank(pa_arr_type, "pa");
+    spv_params.uniforms = make_bank(sa_arr_type, "sa");
+    spv_params.internals = make_bank(i_arr_type, "internals");
+    spv_params.temps = make_bank(temp_arr_type, "r");
+    spv_params.predicates = make_bank(pred_arr_type, "p");
+    spv_params.indexes = make_bank(index_arr_type, "idx");
+    spv_params.outs = make_bank(o_arr_type, "outs");
 
     SamplerMap samplers;
 
