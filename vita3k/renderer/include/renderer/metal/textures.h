@@ -139,7 +139,7 @@ class SurfaceCaster {
     id<MTLComputePipelineState> packed_depth_store_pipeline, packed_depth_store_ms_pipeline;
     id<MTLComputePipelineState> mask_store_pipeline, mask_store_ms_pipeline;
     id<MTLBuffer> depth_store_buffer, mask_store_buffer;
-    id<MTLComputePipelineState> pipeline, halfword_unpack_pipeline;
+    id<MTLComputePipelineState> pipeline, halfword_unpack_pipeline, byte_halfword_pipeline;
     id<MTLComputePipelineState> word_buffer_pipeline, halfword_buffer_pipeline;
     id<MTLComputePipelineState> x8_word_decode_pipeline;
     id<MTLComputePipelineState> cube_pipeline, component_cast_pipeline;
@@ -189,6 +189,8 @@ public:
         SceGxmTextureBaseFormat texture, uint32_t texture_swizzle, uint32_t word_offset, uint32_t guest_width = 0,
         uint32_t guest_height = 0, id<MTLCommandBuffer> pending_commands = nil,
         bool separate_word = false);
+    id<MTLTexture> halfword_texture_from_rgba8(id<MTLTexture> source, SceGxmColorFormat color,
+        SceGxmTextureBaseFormat texture, id<MTLCommandBuffer> pending_commands = nil);
     bool load_depth_memory(id<MTLTexture>, const SceGxmDepthStencilSurface &, const DepthMemoryLayout &, float scale,
         std::span<const uint8_t> depth, std::span<const uint8_t> stencil,
         id<MTLCommandBuffer> commands = nil);
@@ -275,6 +277,9 @@ id<MTLSamplerState> make_sampler(Device &device, const SceGxmTexture &texture, u
 bool surface_format_cast_supported(SceGxmColorFormat, SceGxmTextureBaseFormat,
     uint32_t texture_swizzle = UINT32_MAX);
 bool surface_word_target_supported(SceGxmTextureBaseFormat);
+bool surface_halfword_target_supported(SceGxmTextureBaseFormat);
+std::optional<SurfaceRect> surface_halfword_subrectangle(const SceGxmColorSurface &,
+    const SceGxmTexture &);
 bool surface_format_cast_enqueueable(SceGxmColorFormat, SceGxmTextureBaseFormat,
     uint32_t texture_swizzle = UINT32_MAX);
 // Plus carries 64-bit float surface aliases through four UNORM16 halves to

@@ -293,6 +293,7 @@ struct Surface {
     std::map<std::array<uint32_t, 3>, id<MTLTexture>> rgba8_casts;
     std::map<std::array<uint32_t, 4>, id<MTLTexture>> word_casts;
     std::map<std::array<uint32_t, 6>, id<MTLTexture>> word_rect_casts;
+    std::map<std::array<uint32_t, 6>, id<MTLTexture>> halfword_rect_casts;
     bool has_word_offset_view = false;
     std::map<std::array<uint32_t,4>,id<MTLTexture>> subrectangles;
     SceGxmColorSurface guest{};
@@ -2323,7 +2324,7 @@ bool MetalState::transfer_fill(MemState &mem, const SceGxmTransferImage &image, 
         update_cpu_snapshot(surface,
             {static_cast<const uint8_t *>(surface.guest.data.get(mem)),update.bytes},update.ranges);
         ++surface.revision;
-        surface.rgba8_casts.clear(); surface.word_casts.clear(); surface.word_rect_casts.clear(); surface.subrectangles.clear();
+        surface.rgba8_casts.clear(); surface.word_casts.clear(); surface.word_rect_casts.clear(); surface.halfword_rect_casts.clear(); surface.subrectangles.clear();
         if (surface.multisample_color && !surface.multisample_dirty) {
             if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
             require(impl->caster->patch_multisample(surface.multisample_color,surface.guest,surface.multisample_scale,
@@ -2796,7 +2797,7 @@ bool MetalState::transfer_image(MemState &mem, const SceGxmTransferImage &source
         update_cpu_snapshot(surface,
             {static_cast<const uint8_t *>(surface.guest.data.get(mem)),update.bytes},ranges);
         ++surface.revision;
-        surface.rgba8_casts.clear(); surface.word_casts.clear(); surface.word_rect_casts.clear(); surface.subrectangles.clear();
+        surface.rgba8_casts.clear(); surface.word_casts.clear(); surface.word_rect_casts.clear(); surface.halfword_rect_casts.clear(); surface.subrectangles.clear();
         if (surface.multisample_color && !surface.multisample_dirty) {
             if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
             require(impl->caster->patch_multisample(surface.multisample_color,surface.guest,surface.multisample_scale,
@@ -2894,7 +2895,7 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                 entry.rendered_width = entry.rendered_height = 0;
             }
             ++entry.revision;
-            entry.rgba8_casts.clear(); entry.word_casts.clear(); entry.word_rect_casts.clear(); entry.subrectangles.clear();
+            entry.rgba8_casts.clear(); entry.word_casts.clear(); entry.word_rect_casts.clear(); entry.halfword_rect_casts.clear(); entry.subrectangles.clear();
             auto format = color_format(surface.colorFormat, impl->device->native_device());
             if (surface.gamma) {
                 // Vulkan uses an sRGB view only for RGBA8. For other render
@@ -4429,6 +4430,17 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             }
             return impl->surfaces.end();
         };
+        const auto find_halfword_subrectangle = [&](const SceGxmTexture &texture) {
+            auto found=impl->surfaces.upper_bound(texture.data_addr<<2);
+            while (found!=impl->surfaces.begin()) {
+                --found;
+                if (surface_texture_layout_overlap(found->second.guest,texture))
+                    return texture_surface_usable(found->second)
+                        && surface_halfword_subrectangle(found->second.guest,texture)
+                        ? found : impl->surfaces.end();
+            }
+            return impl->surfaces.end();
+        };
         const auto find_direct_surface = [&](const SceGxmTexture &texture) {
             const auto found = find_texture_surface(texture.data_addr << 2);
             if (found == impl->surfaces.end()) return found;
@@ -4708,6 +4720,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             auto source=find_texture_surface(texture_address);
             const auto word_owner=find_word_subrectangle(texture);
             if (word_owner!=impl->surfaces.end()) source=word_owner;
+            const auto halfword_owner=find_halfword_subrectangle(texture);
+            if (halfword_owner!=impl->surfaces.end()) source=halfword_owner;
             // Persona 4 describes a 1024x1024 texture over a 960x544 target.
             // Sample its rendered prefix directly, preserving guest texel
             // coordinates without reading the unallocated trailing rows.
@@ -4719,9 +4733,10 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 const bool direct_word_alias=rgba16_linear_alias(source->second,texture,texture_address)
                     || rg32_linear_alias(source->second,texture,texture_address)
                     || surface_word_subrectangle(source->second.guest,texture).has_value();
+                const bool direct_halfword_alias=surface_halfword_subrectangle(source->second.guest,texture).has_value();
                 // A native surface can only be sampled directly when both
                 // its byte layout and format match the guest texture view.
-                incompatible_alias=!direct_word_alias
+                incompatible_alias=!direct_word_alias && !direct_halfword_alias
                     && !surface_subrectangle(source->second.guest,texture);
             }
             if (surface_word_target_supported(texture_base)) {
@@ -4751,6 +4766,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                         || surface_format_cast_enqueueable(owner->second.guest.colorFormat,
                             texture_base, texture.swizzle_format));
                 direct_precise_surface |= word_owner!=impl->surfaces.end();
+                direct_precise_surface |= halfword_owner!=impl->surfaces.end();
             }
             if (!cube && single_mip
                 && ((!incompatible_alias && features.use_texture_viewport) || direct_precise_surface)) continue;
@@ -5062,7 +5078,10 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 const auto word_region=find_word_subrectangle(texture);
                 const bool region_alias=word_region!=impl->surfaces.end()
                     && word_region->first==ctx.impl->guest_color.data.address();
-                if (address==ctx.impl->guest_color.data.address() || word_alias || region_alias) {
+                const auto halfword_region=find_halfword_subrectangle(texture);
+                const bool halfword_alias=halfword_region!=impl->surfaces.end()
+                    && halfword_region->first==ctx.impl->guest_color.data.address();
+                if (address==ctx.impl->guest_color.data.address() || word_alias || region_alias || halfword_alias) {
                     needs_feedback=true;
                     const auto active=impl->surfaces.find(ctx.impl->guest_color.data.address());
                     const bool packed_rg32=ctx.impl->color.pixelFormat==MTLPixelFormatRG32Float
@@ -5179,6 +5198,36 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR,texture.gamma_mode,ctx.impl->commands);
             }
             prepared_images[index]=sampling_view(native,gxm::get_format(texture),nullptr);
+        }
+        // Split RGBA8 storage into guest-ordered 16-bit texels before a
+        // partial crop. The cast stays on the GPU, including active feedback.
+        for (uint32_t index=0;index<SCE_GXM_MAX_TEXTURE_UNITS*2;++index) {
+            const bool vertex=index>=SCE_GXM_MAX_TEXTURE_UNITS;
+            if ((!vertex && !fragment_resources) || prepared_images[index]) continue;
+            const auto &program=vertex?static_cast<const ShaderProgram &>(*vp->vertex_program)
+                : static_cast<const ShaderProgram &>(*fp->fragment_program);
+            if (!program.textures_used[index%SCE_GXM_MAX_TEXTURE_UNITS]) continue;
+            const auto &texture=ctx.textures[index];
+            auto found=find_halfword_subrectangle(texture);
+            if (found==impl->surfaces.end()) continue;
+            auto &entry=found->second;
+            const auto rect=*surface_halfword_subrectangle(entry.guest,texture);
+            const auto base=gxm::get_base_format(gxm::get_format(texture));
+            auto &crop=entry.halfword_rect_casts[{rect.x,rect.y,rect.width,rect.height,
+                uint32_t(base),uint32_t(texture.swizzle_format)}];
+            if (!crop) {
+                const bool active=entry.color==ctx.impl->color && !record.is_maskupdate;
+                if (active) require(color_feedback!=nil,"Metal: missing cropped halfword feedback snapshot");
+                auto source=active ? (raw_color_feedback ? raw_color_feedback : color_feedback)
+                    : raw_surface_color(entry);
+                prepare_inline_commands();
+                if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+                auto full=impl->caster->halfword_texture_from_rgba8(source,entry.guest.colorFormat,
+                    base,ctx.impl->commands);
+                crop=impl->caster->enqueue_subrectangle(full,entry.guest.width*2,
+                    entry.guest.height,rect,ctx.impl->commands);
+            }
+            prepared_images[index]=sampling_view(crop,gxm::get_format(texture),nullptr);
         }
         // Carry direct 64-bit float aliases through normalized halfwords. A
         // bit-exact copy alone is insufficient: sampling an RG32Float view
@@ -7165,7 +7214,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         }
         if (!record.is_maskupdate && ctx.impl->guest_color.data) {
             auto surface=impl->surfaces.find(ctx.impl->guest_color.data.address());
-            if (surface!=impl->surfaces.end()) { ++surface->second.revision; surface->second.rgba8_casts.clear(); surface->second.word_casts.clear(); surface->second.word_rect_casts.clear(); surface->second.subrectangles.clear(); }
+            if (surface!=impl->surfaces.end()) { ++surface->second.revision; surface->second.rgba8_casts.clear(); surface->second.word_casts.clear(); surface->second.word_rect_casts.clear(); surface->second.halfword_rect_casts.clear(); surface->second.subrectangles.clear(); }
         }
         // Keep small draws together to avoid a GPU completion wait every 64
         // draws; the upload-byte cap still bounds retained resources.
