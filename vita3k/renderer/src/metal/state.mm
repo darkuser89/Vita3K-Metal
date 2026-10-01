@@ -291,7 +291,7 @@ struct Surface {
     bool multisample_dirty = true;
     float multisample_scale = 1;
     std::map<std::array<uint32_t, 3>, id<MTLTexture>> rgba8_casts;
-    std::map<std::array<uint32_t, 3>, id<MTLTexture>> word_casts;
+    std::map<std::array<uint32_t, 4>, id<MTLTexture>> word_casts;
     bool has_word_offset_view = false;
     std::map<std::array<uint32_t,4>,id<MTLTexture>> subrectangles;
     SceGxmColorSurface guest{};
@@ -4435,6 +4435,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 : uint64_t(align(gxm::get_width(texture),8))*4;
             return surface.color.pixelFormat==MTLPixelFormatRG32Float
                 && surface_word_target_supported(gxm::get_base_format(gxm::get_format(texture)))
+                && (gxm::get_base_format(gxm::get_format(texture))!=SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10
+                    || texture.swizzle_format<8)
                 && (texture_address==surface.guest.data.address()
                     || uint64_t(texture_address)==uint64_t(surface.guest.data.address())+4)
                 && guest.surfaceType==SCE_GXM_COLOR_SURFACE_LINEAR
@@ -4453,6 +4455,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 : uint64_t(align(gxm::get_width(texture),8))*4;
             return guest.surfaceType==SCE_GXM_COLOR_SURFACE_LINEAR
                 && surface_word_target_supported(gxm::get_base_format(gxm::get_format(texture)))
+                && (gxm::get_base_format(gxm::get_format(texture))!=SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10
+                    || texture.swizzle_format<8)
                 && gxm::get_base_format(guest.colorFormat)==SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16
                 && surface.color.pixelFormat==MTLPixelFormatRGBA16Float
                 && (texture_address==guest.data.address()
@@ -6104,8 +6108,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             auto surface = prepared ? impl->surfaces.end() : find_direct_surface(texture);
             const auto subrectangle_surface=prepared ? impl->surfaces.end() : find_subrectangle(texture);
             if (subrectangle_surface!=impl->surfaces.end()) surface=subrectangle_surface;
-            // Uncharted's signed normal/gloss alias starts at the second word
-            // of its interleaved RG32 color/normal target.
+            // A 4-byte texture may begin at the second word of an 8-byte
+            // RG32 or F16x4 color target.
             if (!prepared && surface == impl->surfaces.end() && texture_address >= 4
                 && surface_word_target_supported(texture_base)) {
                 auto previous = find_texture_surface(texture_address - 4);
@@ -6279,10 +6283,12 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 const uint32_t word_offset=(texture_address-surface->first)/4;
                 const bool separate_word=res_multiplier!=1 && entry.has_word_offset_view;
                 const bool guest_grid=vertex && res_multiplier<1 && !separate_word;
-                auto &cast=entry.word_casts[{word_offset,uint32_t(texture_base),uint32_t(guest_grid)}];
+                auto &cast=entry.word_casts[{word_offset,uint32_t(texture_base),uint32_t(guest_grid),
+                    uint32_t(texture.swizzle_format)}];
                 if (!cast) {
                     if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
                     cast=impl->caster->word_texture_from_rg32(native,texture_base,
+                        texture.swizzle_format,
                         (entry.guest.colorFormat & SCE_GXM_COLOR_SWIZZLE_MASK)==SCE_GXM_COLOR_SWIZZLE2_RG,
                         word_offset,guest_grid ? entry.guest.width : 0,
                         guest_grid ? entry.guest.height : 0,nil,separate_word);
@@ -6305,13 +6311,14 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 const uint32_t word_offset=(texture_address-surface->first)/4;
                 const bool separate_word=res_multiplier!=1 && entry.has_word_offset_view;
                 const bool guest_grid=vertex && res_multiplier<1 && !separate_word;
-                auto &cast=entry.word_casts[{word_offset,uint32_t(texture_base),uint32_t(guest_grid)}];
+                auto &cast=entry.word_casts[{word_offset,uint32_t(texture_base),uint32_t(guest_grid),
+                    uint32_t(texture.swizzle_format)}];
                 if (!cast) {
                     if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
                     if (native==entry.color) native=raw_surface_color(entry);
                     else if (native==color_feedback && raw_color_feedback) native=raw_color_feedback;
                     cast=impl->caster->word_texture_from_rgba16(native,entry.guest.colorFormat,
-                        texture_base,word_offset,
+                        texture_base,texture.swizzle_format,word_offset,
                         guest_grid ? entry.guest.width : 0,guest_grid ? entry.guest.height : 0,
                         nil,separate_word);
                 }
