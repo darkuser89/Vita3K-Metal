@@ -489,7 +489,11 @@ static spv::Id pack_native_f16_bits(spv::Builder &b, spv::Id value) {
     const auto less = [&](spv::Id a, uint32_t d) { return b.createBinOp(spv::OpULessThan, boolean2, a, c(d)); };
     const auto select = [&](spv::Id p, spv::Id a, spv::Id d) { return b.createOp(spv::OpSelect, u2, {p, a, d}); };
     const auto raw = b.createUnaryOp(spv::OpBitcast, u2, value);
-    const auto magnitude = op(spv::OpBitwiseAnd, raw, c(0x7fffffff));
+    const auto raw_magnitude = op(spv::OpBitwiseAnd, raw, c(0x7fffffff));
+    // Plus saturates every non-NaN input, including infinity, before F16
+    // packing. Keep NaN payloads in the native bit path below.
+    const auto magnitude = select(less(raw_magnitude, 0x7f800001),
+        select(less(raw_magnitude, 0x477fe001), raw_magnitude, c(0x477fe000)), raw_magnitude);
     const auto sign = op(spv::OpBitwiseAnd, op(spv::OpShiftRightLogical, raw, c(16)), c(0x8000));
     const auto odd = op(spv::OpBitwiseAnd, op(spv::OpShiftRightLogical, magnitude, c(13)), c(1));
     const auto rounded = op(spv::OpIAdd, magnitude, op(spv::OpIAdd, c(0xfff), odd));
