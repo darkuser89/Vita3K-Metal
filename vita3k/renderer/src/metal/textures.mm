@@ -449,12 +449,16 @@ std::optional<SurfaceRect> surface_byte_subrectangle(const SceGxmColorSurface &s
     const uint32_t mode=(uint32_t(surface.colorFormat)&SCE_GXM_COLOR_SWIZZLE_MASK)>>20;
     const bool channels=source==SCE_GXM_COLOR_BASE_FORMAT_U8U8
         || source==SCE_GXM_COLOR_BASE_FORMAT_S8S8;
+    const bool packed_direct=(source==SCE_GXM_COLOR_BASE_FORMAT_U5U6U5 && mode==1)
+        || (source==SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4 && mode==2)
+        || (source==SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5 && (mode==1 || mode==2));
     const bool word=source==SCE_GXM_COLOR_BASE_FORMAT_U16
         || source==SCE_GXM_COLOR_BASE_FORMAT_S16
-        || source==SCE_GXM_COLOR_BASE_FORMAT_F16;
+        || source==SCE_GXM_COLOR_BASE_FORMAT_F16 || packed_direct;
     if (!surface.data || !surface.width || !surface.height || surface.width>UINT32_MAX/2
         || surface.strideInPixels<surface.width || surface.surfaceType!=SCE_GXM_COLOR_SURFACE_LINEAR
-        || (!channels && !word) || (channels && mode>=4) || (word && mode>=2)
+        || (!channels && !word) || (channels && mode>=4)
+        || (word && !packed_direct && mode>=2)
         || (target!=SCE_GXM_TEXTURE_BASE_FORMAT_U8 && target!=SCE_GXM_TEXTURE_BASE_FORMAT_S8)
         || (type!=SCE_GXM_TEXTURE_LINEAR && type!=SCE_GXM_TEXTURE_LINEAR_STRIDED)
         || (type!=SCE_GXM_TEXTURE_LINEAR_STRIDED && texture.true_mip_count()>1)) return std::nullopt;
@@ -543,13 +547,15 @@ std::optional<SurfaceRect> surface_32_small_subrectangle(const SceGxmColorSurfac
         || source==SCE_GXM_COLOR_BASE_FORMAT_S16S16
         || source==SCE_GXM_COLOR_BASE_FORMAT_F16F16;
     const bool r32=source==SCE_GXM_COLOR_BASE_FORMAT_F32;
+    const bool packed_direct=(source==SCE_GXM_COLOR_BASE_FORMAT_F11F11F10 && mode<2)
+        || (source==SCE_GXM_COLOR_BASE_FORMAT_U2U10U10U10 && mode==0);
     const auto components=texture_components(target);
     const uint32_t bytes=components.count*components.bytes;
     if (bytes!=1 && bytes!=2) return std::nullopt;
     const uint32_t ratio=4/bytes;
     if (!surface.data || !surface.width || !surface.height
         || surface.strideInPixels<surface.width || surface.surfaceType!=SCE_GXM_COLOR_SURFACE_LINEAR
-        || (!rg16 && !r32) || (rg16 && mode>=2) || (r32 && mode!=0)
+        || (!rg16 && !r32 && !packed_direct) || (rg16 && mode>=2) || (r32 && mode!=0)
         || (bytes==2 && !surface_halfword_target_supported(target))
         || (bytes==1 && target!=SCE_GXM_TEXTURE_BASE_FORMAT_U8
             && target!=SCE_GXM_TEXTURE_BASE_FORMAT_S8)
@@ -3087,20 +3093,30 @@ id<MTLTexture> SurfaceCaster::byte_texture_from_16bit_surface(id<MTLTexture> sou
     SceGxmColorFormat color, SceGxmTextureBaseFormat texture,
     id<MTLCommandBuffer> pending_commands) {
     const auto base=gxm::get_base_format(color);
+    const uint32_t mode=(uint32_t(color)&SCE_GXM_COLOR_SWIZZLE_MASK)>>20;
     const bool channels=base==SCE_GXM_COLOR_BASE_FORMAT_U8U8
         || base==SCE_GXM_COLOR_BASE_FORMAT_S8S8;
+    const bool packed_direct=(base==SCE_GXM_COLOR_BASE_FORMAT_U5U6U5 && mode==1)
+        || (base==SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4 && mode==2)
+        || (base==SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5 && (mode==1 || mode==2));
     const bool word=base==SCE_GXM_COLOR_BASE_FORMAT_U16
         || base==SCE_GXM_COLOR_BASE_FORMAT_S16
-        || base==SCE_GXM_COLOR_BASE_FORMAT_F16;
-    const uint32_t mode=(uint32_t(color)&SCE_GXM_COLOR_SWIZZLE_MASK)>>20;
+        || base==SCE_GXM_COLOR_BASE_FORMAT_F16 || packed_direct;
     if (!source || !source.width || !source.height || (!channels && !word)
         || (channels && (mode>=4 || (source.pixelFormat!=MTLPixelFormatRG8Unorm
             && source.pixelFormat!=MTLPixelFormatRG8Snorm
             && source.pixelFormat!=MTLPixelFormatRG8Uint)))
-        || (word && (mode>=2 || (source.pixelFormat!=MTLPixelFormatR16Unorm
+        || (word && !packed_direct && (mode>=2 || (source.pixelFormat!=MTLPixelFormatR16Unorm
             && source.pixelFormat!=MTLPixelFormatR16Snorm
             && source.pixelFormat!=MTLPixelFormatR16Float
             && source.pixelFormat!=MTLPixelFormatR16Uint)))
+        || (packed_direct && !((base==SCE_GXM_COLOR_BASE_FORMAT_U5U6U5
+                && source.pixelFormat==MTLPixelFormatB5G6R5Unorm)
+            || (base==SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4
+                && source.pixelFormat==MTLPixelFormatABGR4Unorm)
+            || (base==SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5
+                && source.pixelFormat==(mode<2 ? MTLPixelFormatBGR5A1Unorm
+                    : MTLPixelFormatA1BGR5Unorm))))
         || (texture!=SCE_GXM_TEXTURE_BASE_FORMAT_U8
             && texture!=SCE_GXM_TEXTURE_BASE_FORMAT_S8)
         || (pending_commands && pending_commands.status!=MTLCommandBufferStatusNotEnqueued))
@@ -3206,11 +3222,13 @@ id<MTLTexture> SurfaceCaster::small_texture_from_wide_surface(id<MTLTexture> sou
         || base==SCE_GXM_COLOR_BASE_FORMAT_F16F16;
     const bool r32=base==SCE_GXM_COLOR_BASE_FORMAT_F32;
     const uint32_t mode=(uint32_t(color)&SCE_GXM_COLOR_SWIZZLE_MASK)>>20;
+    const bool packed_direct=(base==SCE_GXM_COLOR_BASE_FORMAT_F11F11F10 && mode<2)
+        || (base==SCE_GXM_COLOR_BASE_FORMAT_U2U10U10U10 && mode==0);
     const bool packed=texture==SCE_GXM_TEXTURE_BASE_FORMAT_U5U6U5
         || texture==SCE_GXM_TEXTURE_BASE_FORMAT_U4U4U4U4
         || texture==SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5;
     if (!source || !source.width || !source.height
-        || (!f16x4 && !f32x2 && !rg16 && !r32)
+        || (!f16x4 && !f32x2 && !rg16 && !r32 && !packed_direct)
         || (f16x4 && (mode>=std::size(four)
             || (source.pixelFormat!=MTLPixelFormatRGBA16Float
                 && source.pixelFormat!=MTLPixelFormatRGBA16Uint)))
@@ -3222,6 +3240,10 @@ id<MTLTexture> SurfaceCaster::small_texture_from_wide_surface(id<MTLTexture> sou
             && source.pixelFormat!=MTLPixelFormatRG16Uint)))
         || (r32 && (mode!=0 || (source.pixelFormat!=MTLPixelFormatR32Float
             && source.pixelFormat!=MTLPixelFormatR32Uint)))
+        || (packed_direct && !((base==SCE_GXM_COLOR_BASE_FORMAT_F11F11F10
+                && source.pixelFormat==MTLPixelFormatRG11B10Float)
+            || (base==SCE_GXM_COLOR_BASE_FORMAT_U2U10U10U10
+                && source.pixelFormat==MTLPixelFormatBGR10A2Unorm)))
         || (bytes!=1 && bytes!=2)
         || (bytes==1 && texture!=SCE_GXM_TEXTURE_BASE_FORMAT_U8
             && texture!=SCE_GXM_TEXTURE_BASE_FORMAT_S8)
@@ -3229,7 +3251,7 @@ id<MTLTexture> SurfaceCaster::small_texture_from_wide_surface(id<MTLTexture> sou
         || (texture==SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5 && texture_swizzle>=8)
         || (pending_commands && pending_commands.status!=MTLCommandBufferStatusNotEnqueued))
         throw std::runtime_error("Metal: invalid wide surface small cast");
-    const auto mapping=surface_memory_mapping(color);
+    const auto mapping=packed_direct ? identity : surface_memory_mapping(color);
     const uint32_t source_components=f16x4 ? 4 : (f32x2 || rg16 ? 2 : 1);
     const uint32_t component_bytes=f16x4 || rg16 ? 2 : 4;
     const uint32_t source_bytes=source_components*component_bytes;
