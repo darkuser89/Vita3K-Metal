@@ -1795,12 +1795,13 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
             b.createBinOp(spv::OpFOrdNotEqual, b.makeBoolType(), replay_face, b.makeFloatConstant(0.0f)),
             b.createBinOp(spv::OpFOrdGreaterThan, b.makeBoolType(), replay_face, b.makeFloatConstant(0.0f)),
             native_front);
-        const auto back_face = b.createTriOp(spv::OpSelect, u32,
-            effective_front, b.makeUintConstant(0), b.makeUintConstant(1));
+        spv_params.native_effective_front_facing_id = b.createVariable(spv::NoPrecision,
+            spv::StorageClassPrivate, b.makeBoolType(), "sgx_effective_front_facing");
+        b.createStore(effective_front, spv_params.native_effective_front_facing_id);
         const auto values = b.createCompositeConstruct(f32_v4_type, {
             b.createUnaryOp(spv::OpBitcast, f32_type, local_x),
             b.createUnaryOp(spv::OpBitcast, f32_type, local_y),
-            b.createUnaryOp(spv::OpBitcast, f32_type, tile_xy), b.createUnaryOp(spv::OpBitcast, f32_type, back_face)});
+            b.createUnaryOp(spv::OpBitcast, f32_type, tile_xy), b.makeFloatConstant(0.0f)});
         spv_params.native_global_regs = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate,
             b.makeArrayType(f32_v4_type, b.makeIntConstant(1), 0), "sgx_fragment_globals");
         b.createStore(values, utils::create_access_chain(b, spv::StorageClassPrivate,

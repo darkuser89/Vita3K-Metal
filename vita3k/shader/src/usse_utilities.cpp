@@ -1089,6 +1089,26 @@ spv::Id load(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunc
         if (shift_offset != 0)
             throw std::runtime_error("Metal: unsupported global register context");
         const auto global = op.num;
+        if (global == GLOBAL_REG_FRONT_FACING && params.native_effective_front_facing_id) {
+            // Plus defines g16 as one on the front face. Construct the value
+            // in the requested type: bitcasting uint(1) through a float bank
+            // would produce a denormal instead of 1.0 for F32 instructions.
+            const bool signed_type = is_signed_integer_data_type(op.type);
+            const bool unsigned_type = is_unsigned_integer_data_type(op.type);
+            const spv::Id scalar_type = signed_type ? b.makeIntType(32)
+                : (unsigned_type ? b.makeUintType(32) : type_f32);
+            const spv::Id one = signed_type ? b.makeIntConstant(1)
+                : (unsigned_type ? b.makeUintConstant(1) : b.makeFloatConstant(1.0f));
+            const spv::Id zero = signed_type ? b.makeIntConstant(0)
+                : (unsigned_type ? b.makeUintConstant(0) : b.makeFloatConstant(0.0f));
+            const auto is_front = b.createLoad(params.native_effective_front_facing_id, spv::NoPrecision);
+            spv::Id value = b.createTriOp(spv::OpSelect, scalar_type, is_front, one, zero);
+            const auto components = dest_mask_to_comp_count(dest_mask);
+            if (components > 1)
+                value = b.createCompositeConstruct(b.makeVectorType(scalar_type, static_cast<int>(components)),
+                    std::vector<spv::Id>(components, value));
+            return apply_modifiers(b, utils, op.flags, value);
+        }
         if ((global == 17 || global == 45) && params.thread_buffer) {
             // The USC spill prologue selects (4 * CORENUMBER + PIPENUMBER)
             // from shared hardware scratch storage. Our thread-buffer LDR/STR
@@ -1102,7 +1122,6 @@ spv::Id load(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunc
             if (!params.native_global_regs)
                 throw std::runtime_error("Metal: unsupported global register context");
             switch (global) {
-            case 16: op.num = 3; break;
             case 23: op.num = 0; break;
             case 24: op.num = 1; break;
             case 43: op.num = 2; break;

@@ -395,6 +395,8 @@ struct AttributeInputSource {
     bool regformat;
 };
 
+constexpr uint32_t GLOBAL_REG_FRONT_FACING = 16;
+
 struct LiteralInputSource {
     // The constant data
     float data;

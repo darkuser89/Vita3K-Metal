@@ -55,8 +55,10 @@ struct SpirvShaderParameters {
     spv::Id native_texture_info = 0;
     spv::Id native_frag_coord = 0;
     float native_texture_lod_bias[SCE_GXM_MAX_TEXTURE_UNITS] = {};
-    // Native fragment emulation of SGX global registers 16, 23, 24 and 43.
+    // Native fragment emulation of SGX global registers 23, 24 and 43.
     spv::Id native_global_regs = 0;
+    // Effective front face, including point replay, for the typed g16 load.
+    spv::Id native_effective_front_facing_id = 0;
     // Mapped to 'pa' (primary attribute) USSE registers
     // for vertex: vertex inputs (vertex attributes)
     // for fragment: fragment inputs (linkage from vertex stage)
