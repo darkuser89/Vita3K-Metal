@@ -27,6 +27,9 @@ inline uint32_t packed_10_native_word(uint32_t guest, uint32_t mode) {
 inline float sampler_lod_bias(const SceGxmTexture &texture) {
     return texture.texture_type() == SCE_GXM_TEXTURE_LINEAR_STRIDED ? 0.f : (float(texture.lod_bias) - 31.f) / 8.f;
 }
+inline uint32_t metal_lod_min(const SceGxmTexture &texture) {
+    return (texture.lod_min0 << 2) | texture.lod_min1;
+}
 inline uint32_t sampler_metadata_flags(const SceGxmTexture &texture) {
     const auto linear=[](uint32_t filter) {
         return filter==SCE_GXM_TEXTURE_FILTER_LINEAR || filter==SCE_GXM_TEXTURE_FILTER_MIPMAP_LINEAR;
@@ -36,7 +39,7 @@ inline uint32_t sampler_metadata_flags(const SceGxmTexture &texture) {
         |(uint32_t(linear(texture.mag_filter))<<1)
         |((strided ? 0u : texture.mip_filter)<<2)
         |(texture.uaddr_mode<<3)|(texture.vaddr_mode<<6)
-        |((strided ? 0u : (texture.lod_min0|(texture.lod_min1<<2)))<<9);
+        |((strided ? 0u : metal_lod_min(texture))<<9);
 }
 class Device;
 struct MetalTextureCache;

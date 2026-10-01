@@ -1240,7 +1240,7 @@ id<MTLSamplerState> make_sampler(Device &device, const SceGxmTexture &texture, u
     desc.minFilter = sampler_filter(texture.texture_type() == SCE_GXM_TEXTURE_LINEAR_STRIDED ? texture.mag_filter : texture.min_filter);
     desc.magFilter = sampler_filter(texture.mag_filter);
     desc.mipFilter = texture.true_mip_count() > 1 ? (texture.mip_filter ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNearest) : MTLSamplerMipFilterNotMipmapped;
-    desc.lodMinClamp = texture.texture_type() == SCE_GXM_TEXTURE_LINEAR_STRIDED ? 0.f : float(texture.lod_min0 | (texture.lod_min1 << 2));
+    desc.lodMinClamp = texture.texture_type() == SCE_GXM_TEXTURE_LINEAR_STRIDED ? 0.f : float(metal_lod_min(texture));
     desc.sAddressMode = sampler_address_mode(texture.uaddr_mode);
     desc.tAddressMode = sampler_address_mode(texture.vaddr_mode);
     // Vulkan's unspecified VkSamplerCreateInfo::borderColor defaults to

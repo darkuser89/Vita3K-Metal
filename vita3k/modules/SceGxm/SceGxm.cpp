@@ -5593,6 +5593,8 @@ EXPORT(uint32_t, sceGxmTextureGetLodMin, const SceGxmTexture *texture) {
         return 0;
     }
 
+    if (emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return (texture->lod_min0 << 2) | texture->lod_min1;
     return texture->lod_min0 | (texture->lod_min1 << 2);
 }
 
@@ -5918,8 +5920,13 @@ EXPORT(int, sceGxmTextureSetLodMin, SceGxmTexture *texture, uint32_t lodMin) {
         return RET_ERROR(SCE_GXM_ERROR_UNSUPPORTED);
     }
 
-    texture->lod_min0 = lodMin & 3;
-    texture->lod_min1 = lodMin >> 2;
+    if (emuenv.renderer->current_backend == renderer::Backend::Metal) {
+        texture->lod_min0 = lodMin >> 2;
+        texture->lod_min1 = lodMin & 3;
+    } else {
+        texture->lod_min0 = lodMin & 3;
+        texture->lod_min1 = lodMin >> 2;
+    }
 
     return 0;
 }
