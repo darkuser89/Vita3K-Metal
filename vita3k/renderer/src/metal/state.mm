@@ -3415,6 +3415,7 @@ struct MetalTextureCache::Impl {
     MetalState &state;
     std::array<id<MTLTexture>, TextureCacheSize> textures{};
     std::array<bool, TextureCacheSize> placeholders{};
+    std::array<bool, TextureCacheSize> expanded_packed{};
     size_t current = 0;
     uint32_t width = 0, height = 0, mips = 1;
     bool cube = false;
@@ -3495,6 +3496,7 @@ void MetalTextureCache::select(size_t index, const SceGxmTexture &texture) {
 void MetalTextureCache::configure_texture(const SceGxmTexture &) {
     impl->textures[impl->current] = nil;
     impl->placeholders[impl->current] = false;
+    impl->expanded_packed[impl->current] = false;
     impl->imported_views[impl->current] = {};
     impl->width = gxm::get_width(impl->source);
     impl->height = gxm::get_height(impl->source);
@@ -3538,6 +3540,7 @@ void MetalTextureCache::import_configure_impl(SceGxmTextureBaseFormat format, ui
     impl->gamma = srgb ? (format == SCE_GXM_TEXTURE_BASE_FORMAT_U8U8 ? 3 : 1) : 0;
     impl->textures[impl->current] = nil;
     impl->placeholders[impl->current] = false;
+    impl->expanded_packed[impl->current] = false;
 }
 void MetalTextureCache::upload_texture_impl(SceGxmTextureBaseFormat format, uint32_t width, uint32_t height,
     uint32_t mip, const void *pixels, int face, uint32_t stride) {
@@ -3750,12 +3753,27 @@ void MetalTextureCache::upload_texture_impl(SceGxmTextureBaseFormat format, uint
     }
     // Each upload gets fresh storage; pending draws may still reference an older version.
     if (mip == 0 && slice == 0) {
+        impl->expanded_packed[impl->current] = false;
+        impl->textures[impl->current] = nil;
         MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:native width:impl->width height:impl->height mipmapped:NO];
         desc.textureType = impl->cube ? MTLTextureTypeCube : MTLTextureType2D;
         desc.mipmapLevelCount = impl->mips;
         desc.storageMode = MTLStorageModeShared;
         desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-        impl->textures[impl->current] = [impl->state.impl->device->native_device() newTextureWithDescriptor:desc];
+        const bool packed = format == SCE_GXM_TEXTURE_BASE_FORMAT_U5U6U5
+            || format == SCE_GXM_TEXTURE_BASE_FORMAT_U4U4U4U4
+            || format == SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5;
+        const bool force_packed_fallback = packed && std::getenv("VITA3K_METAL_FORCE_PACKED_FALLBACK");
+        if (!force_packed_fallback)
+            impl->textures[impl->current] = [impl->state.impl->device->native_device() newTextureWithDescriptor:desc];
+        if (!impl->textures[impl->current] && packed) {
+            // Mac-family GPUs can lack packed 16-bit texture formats. Expand
+            // the native channel order to RGBA8; sampling_view still applies
+            // the guest's swizzle to those channels.
+            desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
+            impl->textures[impl->current] = [impl->state.impl->device->native_device() newTextureWithDescriptor:desc];
+            impl->expanded_packed[impl->current] = impl->textures[impl->current] != nil;
+        }
         if (!impl->textures[impl->current]) {
             placeholder("native format or allocation");
             return;
@@ -3763,6 +3781,43 @@ void MetalTextureCache::upload_texture_impl(SceGxmTextureBaseFormat format, uint
     }
     id<MTLTexture> texture = impl->textures[impl->current];
     require(texture != nil, "Metal: texture upload allocation failed");
+    std::vector<uint8_t> expanded_packed;
+    if (impl->expanded_packed[impl->current]) {
+        expanded_packed.resize(size_t(width) * height * 4);
+        const auto *source = static_cast<const uint8_t *>(pixels);
+        const size_t source_pitch = size_t(std::max(stride, width)) * 2;
+        const auto channel5 = [](uint32_t value) { return uint8_t((value << 3) | (value >> 2)); };
+        for (uint32_t y = 0; y < height; ++y)
+            for (uint32_t x = 0; x < width; ++x) {
+                uint16_t word;
+                std::memcpy(&word, source + y * source_pitch + x * 2, sizeof(word));
+                auto *rgba = expanded_packed.data() + (size_t(y) * width + x) * 4;
+                if (format == SCE_GXM_TEXTURE_BASE_FORMAT_U5U6U5) {
+                    rgba[0] = channel5((word >> 11) & 31);
+                    rgba[1] = uint8_t(((word >> 5) & 63) * 255 / 63);
+                    rgba[2] = channel5(word & 31);
+                    rgba[3] = 255;
+                } else if (format == SCE_GXM_TEXTURE_BASE_FORMAT_U4U4U4U4) {
+                    for (uint32_t c = 0; c < 4; ++c) {
+                        const uint8_t nibble = (word >> (12 - c * 4)) & 15;
+                        rgba[c] = (nibble << 4) | nibble;
+                    }
+                } else if (native == MTLPixelFormatA1BGR5Unorm) {
+                    rgba[0] = channel5((word >> 11) & 31);
+                    rgba[1] = channel5((word >> 6) & 31);
+                    rgba[2] = channel5((word >> 1) & 31);
+                    rgba[3] = word & 1 ? 255 : 0;
+                } else {
+                    rgba[0] = channel5((word >> 10) & 31);
+                    rgba[1] = channel5((word >> 5) & 31);
+                    rgba[2] = channel5(word & 31);
+                    rgba[3] = word & 0x8000 ? 255 : 0;
+                }
+            }
+        pixels = expanded_packed.data();
+        bytes = 4;
+        stride = width;
+    }
     const auto pitch = block_bytes ? ((std::max(stride,width)+block_width-1)/block_width)*block_bytes : std::max(stride,width)*bytes;
     const auto rows = block_bytes ? (height+block_height-1)/block_height : height;
     [texture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:mip slice:slice withBytes:pixels bytesPerRow:pitch bytesPerImage:pitch * rows];
