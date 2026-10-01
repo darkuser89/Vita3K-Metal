@@ -1080,7 +1080,7 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
 }
 
 // For uniform buffer resigned in registers
-static void copy_uniform_block_to_register(spv::Builder &builder, spv::Id sa_bank, spv::Id block, spv::Id ite, const int start, const int vec4_count) {
+static void copy_uniform_block_to_register(spv::Builder &builder, spv::Id sa_bank, spv::Id block, spv::Id ite, const int start, const int vec4_count, const int trailing_floats = 0) {
     int start_in_vec4_granularity = start / 4;
 
     utils::make_for_loop(builder, ite, builder.makeIntConstant(0), builder.makeIntConstant(vec4_count), [&]() {
@@ -1116,6 +1116,15 @@ static void copy_uniform_block_to_register(spv::Builder &builder, spv::Id sa_ban
             builder.createStore(to_copy_2, dest_friend);
         }
     });
+
+    for (int i = 0; i < trailing_floats; i++) {
+        const spv::Id source = utils::create_access_chain(builder, spv::StorageClassStorageBuffer, block,
+            { builder.makeIntConstant(vec4_count), builder.makeIntConstant(i) });
+        const int reg = start + vec4_count * 4 + i;
+        const spv::Id dest = utils::create_access_chain(builder, spv::StorageClassPrivate, sa_bank,
+            { builder.makeIntConstant(reg / 4), builder.makeIntConstant(reg % 4) });
+        builder.createStore(builder.createLoad(source, spv::NoPrecision), dest);
+    }
 }
 
 static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProgram &program, utils::SpirvUtilFunctions &utils,
@@ -1423,7 +1432,14 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
                 const uint32_t reg_block_size_in_f32v = std::min<uint32_t>(buffer.reg_block_size + 3, REG_SA_COUNT) / 4;
                 const auto spv_buffer = utils::create_access_chain(b, spv::StorageClassStorageBuffer, spv_params.buffer_container,
                     { b.makeIntConstant(spv_params.buffers.at(host_idx).index_in_container) });
-                copy_uniform_block_to_register(b, spv_params.uniforms, spv_buffer, ite_copy, buffer.reg_start_offset, reg_block_size_in_f32v);
+                if (translation_state.is_metal) {
+                    const uint32_t copy_size = std::min<uint32_t>(buffer.reg_block_size, REG_SA_COUNT - buffer.reg_start_offset);
+                    copy_uniform_block_to_register(b, spv_params.uniforms, spv_buffer, ite_copy,
+                        buffer.reg_start_offset, copy_size / 4, copy_size % 4);
+                } else {
+                    copy_uniform_block_to_register(b, spv_params.uniforms, spv_buffer, ite_copy,
+                        buffer.reg_start_offset, reg_block_size_in_f32v);
+                }
             }
         }
     }
