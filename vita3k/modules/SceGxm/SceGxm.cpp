@@ -2147,6 +2147,8 @@ EXPORT(int, sceGxmColorSurfaceSetGammaMode, SceGxmColorSurface *surface, SceGxmC
 
 EXPORT(void, sceGxmColorSurfaceSetScaleMode, SceGxmColorSurface *surface, SceGxmColorSurfaceScaleMode scaleMode) {
     TRACY_FUNC(sceGxmColorSurfaceSetScaleMode, surface, scaleMode);
+    if (!surface && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return;
     assert(surface);
     surface->downscale = scaleMode == SCE_GXM_COLOR_SURFACE_SCALE_MSAA_DOWNSCALE;
 }
