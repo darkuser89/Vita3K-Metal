@@ -3460,6 +3460,8 @@ struct MetalTextureCache::Impl {
     MetalState &state;
     std::array<id<MTLTexture>, TextureCacheSize> textures{};
     std::array<bool, TextureCacheSize> placeholders{};
+    std::array<id<MTLTexture>, 2> invalid_source_placeholders{};
+    id<MTLTexture> invalid_source_binding = nil;
     std::array<bool, TextureCacheSize> expanded_packed{};
     size_t current = 0;
     uint32_t width = 0, height = 0, mips = 1;
@@ -3477,6 +3479,20 @@ struct MetalTextureCache::Impl {
         for (const auto &[key,context]:astc_contexts) astcenc_context_free(context);
     }
 };
+static id<MTLTexture> sampled_placeholder(Device &device, bool cube) {
+    auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:1 height:1 mipmapped:NO];
+    desc.textureType = cube ? MTLTextureTypeCube : MTLTextureType2D;
+    desc.storageMode = MTLStorageModeShared;
+    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    id<MTLTexture> result = [device.native_device() newTextureWithDescriptor:desc];
+    require(result != nil, "Metal: cannot allocate 1x1 fallback texture");
+    const uint8_t magenta[4] = {255, 0, 255, 255};
+    for (uint32_t side = 0; side < (cube ? 6u : 1u); ++side)
+        [result replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:side
+            withBytes:magenta bytesPerRow:4 bytesPerImage:4];
+    return result;
+}
 MetalTextureCache::MetalTextureCache(MetalState &state) : impl(std::make_unique<Impl>(state)) {
     support_e5rgb9 = true;
     support_dxt_software_import = true;
@@ -3484,23 +3500,29 @@ MetalTextureCache::MetalTextureCache(MetalState &state) : impl(std::make_unique<
 }
 MetalTextureCache::~MetalTextureCache() = default;
 void MetalTextureCache::cache_and_bind_image(const SceGxmTexture &texture, MemState &mem) {
+    impl->invalid_source_binding = nil;
     const SceGxmTexture image = texture_image_descriptor(texture);
-    if (image.data_addr) {
-        const Address address = image.data_addr << 2;
-        const size_t bytes = texture_storage_size(image);
-        const uint64_t end = uint64_t(address) + bytes;
-        // A queued bind can outlive the guest allocation. The shared cache
-        // hashes the first mip before Metal's later upload checks run.
-        if (!bytes || end > uint64_t(UINT32_MAX) - 4095
-            || !is_valid_addr_range(mem, address, Address(end))) {
-            LOG_WARN_ONCE("Metal: texture source at 0x{:08X} ({} bytes) is no longer allocated", address, bytes);
-            return;
-        }
+    const uint64_t address = uint64_t(image.data_addr) << 2;
+    const size_t bytes = address ? texture_storage_size(image) : 0;
+    const uint64_t end = address + bytes;
+    // A queued bind can outlive its guest allocation. Keep this fallback
+    // separate from cache entries so an invalid bind cannot reuse or replace
+    // a valid image that a later draw still needs.
+    if (!address || !bytes || end > uint64_t(UINT32_MAX) - 4095
+        || !is_valid_addr_range(mem, Address(address), Address(end))) {
+        LOG_WARN_ONCE("Metal: texture source at 0x{:08X} ({} bytes) is not allocated", address, bytes);
+        const bool cube = image.texture_type() == SCE_GXM_TEXTURE_CUBE
+            || image.texture_type() == SCE_GXM_TEXTURE_CUBE_ARBITRARY;
+        auto &placeholder = impl->invalid_source_placeholders[cube ? 1 : 0];
+        if (!placeholder) placeholder = sampled_placeholder(*impl->state.impl->device, cube);
+        impl->invalid_source_binding = placeholder;
+        return;
     }
     TextureCache::cache_and_bind_texture(image, mem);
 }
 id<MTLTexture> current_texture(const MetalTextureCache &cache) {
-    return cache.impl->textures[cache.impl->current];
+    return cache.impl->invalid_source_binding ? cache.impl->invalid_source_binding
+        : cache.impl->textures[cache.impl->current];
 }
 static std::optional<SceGxmColorFormat> repacked_u2_color(SceGxmTextureFormat format) {
     const uint32_t mode = (uint32_t(format) & SCE_GXM_TEXTURE_SWIZZLE_MASK) >> 12;
@@ -3510,6 +3532,7 @@ static std::optional<SceGxmColorFormat> repacked_u2_color(SceGxmTextureFormat fo
         | ((mode & 3) << 20));
 }
 id<MTLTexture> current_texture_view(const MetalTextureCache &cache, SceGxmTextureFormat format) {
+    if (cache.impl->invalid_source_binding) return cache.impl->invalid_source_binding;
     if (cache.impl->placeholders[cache.impl->current]) return current_texture(cache);
     const auto &view = cache.impl->imported_views[cache.impl->current];
     const auto color = view.active ? std::nullopt : repacked_u2_color(format);
@@ -3518,6 +3541,7 @@ id<MTLTexture> current_texture_view(const MetalTextureCache &cache, SceGxmTextur
 }
 void MetalTextureCache::select(size_t index, const SceGxmTexture &texture) {
     require(index < TextureCacheSize, "Metal: texture cache index out of bounds");
+    impl->invalid_source_binding = nil;
     impl->current = index;
     impl->source = texture;
     impl->width = gxm::get_width(texture); impl->height = gxm::get_height(texture);
@@ -3594,18 +3618,7 @@ void MetalTextureCache::upload_texture_impl(SceGxmTextureBaseFormat format, uint
     if (impl->placeholders[impl->current]) return;
     const auto placeholder = [&](const char *reason) {
         LOG_WARN_ONCE("Metal: substituting a 1x1 texture for invalid or unsupported image ({})", reason);
-        auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-            width:1 height:1 mipmapped:NO];
-        desc.textureType = impl->cube ? MTLTextureTypeCube : MTLTextureType2D;
-        desc.storageMode = MTLStorageModeShared;
-        desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-        id<MTLTexture> safe = [impl->state.impl->device->native_device() newTextureWithDescriptor:desc];
-        require(safe != nil, "Metal: cannot allocate 1x1 fallback texture");
-        const uint8_t magenta[4] = {255, 0, 255, 255};
-        for (uint32_t side = 0; side < (impl->cube ? 6u : 1u); ++side)
-            [safe replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:side
-                withBytes:magenta bytesPerRow:4 bytesPerImage:4];
-        impl->textures[impl->current] = safe;
+        impl->textures[impl->current] = sampled_placeholder(*impl->state.impl->device, impl->cube);
         impl->placeholders[impl->current] = true;
     };
     constexpr uint32_t max_dim = 16384;
