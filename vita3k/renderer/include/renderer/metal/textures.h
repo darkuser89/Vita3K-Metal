@@ -137,6 +137,7 @@ class SurfaceCaster {
     id<MTLComputePipelineState> pipeline;
     id<MTLComputePipelineState> cube_pipeline, component_cast_pipeline;
     id<MTLComputePipelineState> depth_pipeline, stencil_pipeline, stencil_ms_pipeline, rg_gamma_pipeline;
+    id<MTLComputePipelineState> scaled_snapshot_pipeline;
     id<MTLComputePipelineState> packed_depth_snapshot_pipeline;
     id<MTLComputePipelineState> multisample_pipeline, multisample_depth_pipeline;
     id<MTLComputePipelineState> multisample_integer_pipeline;
@@ -230,6 +231,10 @@ public:
     id<MTLTexture> cube_snapshot(id<MTLTexture> uploaded, std::span<const CubeSurface> surfaces, float scale,
         id<MTLCommandBuffer> pending_commands = nil);
     id<MTLTexture> snapshot_subrectangle(id<MTLTexture> source, uint32_t width, uint32_t height, SurfaceRect);
+    // A smaller same-aspect depth view samples the whole source grid. Copy
+    // storage words with nearest coordinates so signed bytes and float bits survive.
+    id<MTLTexture> scaled_snapshot(id<MTLTexture> source, uint32_t width, uint32_t height,
+        id<MTLCommandBuffer> pending_commands = nil);
     // Only destination_rect is initialized. With a command buffer, queue the
     // blit after its producers; otherwise submit and wait for guest publication.
     id<MTLTexture> resample_publication(id<MTLTexture> source, uint32_t width, uint32_t height,

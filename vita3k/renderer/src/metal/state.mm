@@ -633,6 +633,22 @@ static void fill_half_pixel_strips(MetalContext &ctx) {
     fill(ctx.impl->raw_color);
 }
 
+static id<MTLTexture> depth_alias_view(SurfaceCaster &caster, id<MTLTexture> source,
+    uint32_t memory_width, uint32_t memory_height, SurfaceRect rect, id<MTLCommandBuffer> commands) {
+    // A smaller view at the beginning of the same aspect ratio addresses the
+    // whole depth image with 0..1 UVs. Plus scales it instead of cropping it.
+    const bool full_view = rect.x == 0 && rect.y == 0
+        && rect.width < memory_width && rect.height < memory_height
+        && uint64_t(memory_width) * rect.height == uint64_t(memory_height) * rect.width;
+    if (full_view) {
+        const auto width = std::max<uint32_t>(1, uint64_t(source.width) * rect.width / memory_width);
+        const auto height = std::max<uint32_t>(1, uint64_t(source.height) * rect.height / memory_height);
+        return caster.scaled_snapshot(source, width, height, commands);
+    }
+    return commands ? caster.enqueue_subrectangle(source, memory_width, memory_height, rect, commands)
+                    : caster.snapshot_subrectangle(source, memory_width, memory_height, rect);
+}
+
 static void end_pass(MetalContext &ctx) {
     if (ctx.impl->encoder) {
         [ctx.impl->encoder endEncoding];
@@ -4905,7 +4921,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                         auto &crop=found->second.subrectangles[
                             {uint32_t(base),rect.x,rect.y,rect.width,rect.height}];
                         if (crop) continue;
-                        crop=impl->caster->enqueue_subrectangle(found->second.snapshots.at(base),
+                        crop=depth_alias_view(*impl->caster,found->second.snapshots.at(base),
                             guest_width,guest_height,rect,ctx.impl->commands);
                         ++inline_depth_crops;
                     }
@@ -4971,7 +4987,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     }
                     if (cropped) {
                         auto &crop=entry.subrectangles[crop_key];
-                        crop=impl->caster->enqueue_subrectangle(snapshot,guest_width,guest_height,
+                        crop=depth_alias_view(*impl->caster,snapshot,guest_width,guest_height,
                             *rect,ctx.impl->commands);
                         ++inline_depth_crops;
                     }
@@ -5851,9 +5867,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                         native = snapshot;
                         if (cropped) {
                             auto &crop=entry.subrectangles[{uint32_t(base),rect->x,rect->y,rect->width,rect->height}];
-                            if (!crop) crop=snapshot_commands
-                                ? impl->caster->enqueue_subrectangle(snapshot,memory_width,memory_height,*rect,snapshot_commands)
-                                : impl->caster->snapshot_subrectangle(snapshot,memory_width,memory_height,*rect);
+                            if (!crop) crop=depth_alias_view(*impl->caster,snapshot,memory_width,memory_height,
+                                *rect,snapshot_commands);
                             native=crop;
                         }
                         if (snapshot_commands) {

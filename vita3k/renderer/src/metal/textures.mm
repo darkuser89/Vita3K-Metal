@@ -1462,6 +1462,14 @@ kernel void copy_depth(texture2d<float, access::read> input [[texture(0)]],
     texture2d<float, access::write> output [[texture(1)]], uint2 p [[thread_position_in_grid]]) {
     if (p.x < output.get_width() && p.y < output.get_height()) output.write(input.read(p),p);
 }
+kernel void scale_snapshot_words(texture2d<uint, access::read> input [[texture(0)]],
+    texture2d<uint, access::write> output [[texture(1)]], uint2 p [[thread_position_in_grid]]) {
+    if (p.x >= output.get_width() || p.y >= output.get_height()) return;
+    const uint2 source_size(input.get_width(), input.get_height());
+    const uint2 target_size(output.get_width(), output.get_height());
+    const uint2 source_pixel = min(((p * 2u + 1u) * source_size) / (target_size * 2u), source_size - 1u);
+    output.write(input.read(source_pixel), p);
+}
 float stencil_value(uint value, uint signed_mode) {
     value &= 255u;
     if (!signed_mode) return float(value)/255.f;
@@ -1824,6 +1832,8 @@ fragment uint4 publication_words(float4 position [[position]],
     if (!pipeline) throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal: surface cast pipeline failed");
     depth_pipeline = cached_compute(device, library, @"copy_depth");
     if (!depth_pipeline) throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal: depth copy pipeline failed");
+    scaled_snapshot_pipeline = cached_compute(device, library, @"scale_snapshot_words");
+    if (!scaled_snapshot_pipeline) throw std::runtime_error("Metal: depth-view scaling pipeline failed");
     packed_depth_snapshot_pipeline = cached_compute(device, library, @"copy_packed_depth");
     if (!packed_depth_snapshot_pipeline) throw std::runtime_error("Metal: packed depth snapshot pipeline failed");
     stencil_pipeline = cached_compute(device, library, @"copy_stencil");
@@ -2123,6 +2133,38 @@ id<MTLTexture> SurfaceCaster::snapshot_subrectangle(id<MTLTexture> source, uint3
     auto result=enqueue_subrectangle(source,width,height,rect,commands);
     std::string error;
     if (!device.submit_and_wait(commands,error)) throw std::runtime_error(error);
+    return result;
+}
+id<MTLTexture> SurfaceCaster::scaled_snapshot(id<MTLTexture> source, uint32_t width, uint32_t height,
+    id<MTLCommandBuffer> pending_commands) {
+    if (!source || source.textureType != MTLTextureType2D || source.sampleCount != 1
+        || !width || !height || width > source.width || height > source.height
+        || (pending_commands && pending_commands.status != MTLCommandBufferStatusNotEnqueued))
+        throw std::runtime_error("Metal: invalid scaled depth snapshot");
+    const auto bits = sample_bits_format(source.pixelFormat);
+    if (bits == MTLPixelFormatInvalid)
+        throw std::runtime_error("Metal: unsupported scaled depth snapshot format");
+    auto input = [source newTextureViewWithPixelFormat:bits];
+    if (!input) throw std::runtime_error("Metal: cannot view depth snapshot words");
+    auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:source.pixelFormat
+        width:width height:height mipmapped:NO];
+    desc.storageMode = MTLStorageModeShared;
+    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+    auto result = [device.native_device() newTextureWithDescriptor:desc];
+    auto output = [result newTextureViewWithPixelFormat:bits];
+    if (!result || !output) throw std::runtime_error("Metal: cannot allocate scaled depth snapshot");
+    auto commands = pending_commands ? pending_commands : surface_command_buffer(device, @"Vita3K scaled depth view");
+    auto encoder = [commands computeCommandEncoder];
+    if (!encoder) throw std::runtime_error("Metal: cannot encode scaled depth view");
+    [encoder setComputePipelineState:scaled_snapshot_pipeline];
+    [encoder setTexture:input atIndex:0];
+    [encoder setTexture:output atIndex:1];
+    [encoder dispatchThreads:MTLSizeMake(width,height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+    [encoder endEncoding];
+    if (!pending_commands) {
+        std::string error;
+        if (!device.submit_and_wait(commands,error)) throw std::runtime_error(error);
+    }
     return result;
 }
 id<MTLTexture> SurfaceCaster::enqueue_subrectangle(id<MTLTexture> source, uint32_t width, uint32_t height,
@@ -3120,7 +3162,7 @@ id<MTLTexture> SurfaceCaster::stencil_snapshot(id<MTLTexture> source, bool signe
         signed_normalized ? MTLPixelFormatR8Snorm : MTLPixelFormatR8Unorm
         width:source.width*(ms ? source.sampleCount/2 : 1)
         height:source.height*(ms ? 2 : 1) mipmapped:NO];
-    desc.usage=MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite;
+    desc.usage=MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite|MTLTextureUsagePixelFormatView;
     desc.storageMode=MTLStorageModeShared;
     auto result=[device.native_device() newTextureWithDescriptor:desc];
     if (!result) throw std::runtime_error("Metal: cannot allocate stencil snapshot");
