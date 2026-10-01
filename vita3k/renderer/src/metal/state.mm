@@ -3182,10 +3182,10 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                 entry.mask=nil;
                 entry.sample_rate_copy=nil;entry.sample_rate_mask=nil;
                 entry.sample_grid_width=entry.sample_grid_height=0;
-                // Preserve the existing native 2X layout. Plus doubles both
-                // target axes, so mismatched source grids need a separate port.
+                // The expanded color attachment defines the sample grid even
+                // when its extent differs from the render target's base extent.
+                // Retain that grid for a later downscaled depth continuation.
                 if (ctx.impl->expanded_color && ctx.impl->depth_layout
-                    && uint64_t(target->width)*2==color_width && uint64_t(target->height)*2==color_height
                     && ctx.impl->depth_layout->width==uint32_t(color_width/res_multiplier)
                     && ctx.impl->depth_layout->height==uint32_t(color_height/res_multiplier)) {
                     entry.sample_grid_width=color_width;entry.sample_grid_height=color_height;
