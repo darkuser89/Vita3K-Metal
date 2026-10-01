@@ -4372,9 +4372,11 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     // Preserve Plus's interior-alias threshold. Small uniforms
                     // inside a former surface allocation are often unrelated.
                     const uint64_t begin = binding.address;
+                    const uint64_t read_size = std::min<uint64_t>(binding.size,
+                        uint64_t(program.uniform_buffer_sizes.at(block)) * 4);
                     reads_color = begin == color_begin
-                        || (binding.size >= 16 * 1024 && begin >= color_begin
-                            && begin + binding.size <= color_end);
+                        || (read_size >= 16 * 1024 && begin >= color_begin
+                            && begin + read_size <= color_end);
                     if (reads_color) break;
                 }
             }
