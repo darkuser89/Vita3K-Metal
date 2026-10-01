@@ -1417,7 +1417,10 @@ void destroy_all_contexts(EmuEnvState &emuenv, const bool force_backend_destroy)
 void shutdown(EmuEnvState &emuenv) {
     emuenv.display.abort = true;
     emuenv.renderer->notification_ready.notify_all();
-    emuenv.gxm.display_queue.abort();
+    if (emuenv.renderer->current_backend == renderer::Backend::Metal)
+        emuenv.gxm.display_queue.abort_synchronized();
+    else
+        emuenv.gxm.display_queue.abort();
     if (emuenv.renderer->current_backend == renderer::Backend::Metal)
         renderer::request_metal_render_abort(*emuenv.renderer);
     else
@@ -5543,7 +5546,10 @@ EXPORT(int, sceGxmTerminate) {
     gxm::destroy_all_render_targets(emuenv, false);
     if (native_metal && !emuenv.gxm.render_targets.empty())
         return RET_ERROR(SCE_GXM_ERROR_DRIVER);
-    emuenv.gxm.display_queue.abort();
+    if (native_metal)
+        emuenv.gxm.display_queue.abort_synchronized();
+    else
+        emuenv.gxm.display_queue.abort();
     emuenv.kernel.get_thread(emuenv.gxm.display_queue_thread)->exit_delete();
     return 0;
 }
