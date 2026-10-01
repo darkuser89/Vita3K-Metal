@@ -2226,6 +2226,20 @@ EXPORT(int, sceGxmCreateDeferredContext, SceGxmDeferredContextParams *params, Pt
     ctx->state.vdm_memory_callback = params->vdmCallback;
     ctx->state.memory_callback_userdata = params->userData;
 
+    if (emuenv.renderer->current_backend == renderer::Backend::Metal) {
+        // Plus accepts buffers supplied when the deferred context is created.
+        // A game need not repeat them through the SetDeferredContext exports.
+        const bool has_vdm = params->vdmBufferMem && params->vdmBufferMemSize;
+        const bool has_vertex = params->vertexBufferMem && params->vertexBufferMemSize;
+        const bool has_fragment = params->fragmentBufferMem && params->fragmentBufferMemSize;
+        ctx->state.vdm_buffer = has_vdm ? params->vdmBufferMem : Ptr<void>();
+        ctx->state.vdm_buffer_size = has_vdm ? params->vdmBufferMemSize : 0;
+        ctx->state.vertex_ring_buffer = has_vertex ? params->vertexBufferMem : Ptr<void>();
+        ctx->state.vertex_ring_buffer_size = has_vertex ? params->vertexBufferMemSize : 0;
+        ctx->state.fragment_ring_buffer = has_fragment ? params->fragmentBufferMem : Ptr<void>();
+        ctx->state.fragment_ring_buffer_size = has_fragment ? params->fragmentBufferMemSize : 0;
+    }
+
     ctx->state.type = SCE_GXM_CONTEXT_TYPE_DEFERRED;
 
     // Create a generic context. This is only used for storing command list
