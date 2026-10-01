@@ -150,8 +150,10 @@ bool is_valid_addr(const MemState &state, Address addr) {
 }
 
 bool is_valid_addr_range(const MemState &state, Address start, Address end) {
+    if (end < start)
+        return false;
     const uint32_t start_page = start / STANDARD_PAGE_SIZE;
-    const uint32_t end_page = (end + STANDARD_PAGE_SIZE - 1) / STANDARD_PAGE_SIZE;
+    const uint32_t end_page = uint32_t((uint64_t(end) + STANDARD_PAGE_SIZE - 1) / STANDARD_PAGE_SIZE);
     return state.allocator.free_slot_count(start_page, end_page) == 0;
 }
 
