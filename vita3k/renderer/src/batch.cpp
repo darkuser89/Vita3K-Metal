@@ -192,7 +192,7 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
             return;
 
         // Try to wait for a batch (about 2 or 3ms, game should be fast for this)
-        auto cmd_list = state.command_buffer_queue.top(3);
+        auto cmd_list = state.command_buffer_queue.top(state.current_backend == Backend::Metal ? 3000 : 3);
 
         if (!cmd_list || !is_cmd_ready(mem, *cmd_list)) {
             // beginning of the game or homebrew not using gxm
