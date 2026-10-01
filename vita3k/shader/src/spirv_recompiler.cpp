@@ -1392,6 +1392,12 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
 
 
     for (const auto &buffer : program_input.uniform_buffers) {
+        // Metal reads uniform blocks through guest addresses. Ignore blocks
+        // that cannot name a host buffer or start outside the SA register bank.
+        if (translation_state.is_metal
+            && (buffer.index >= SCE_GXM_REAL_MAX_UNIFORM_BUFFER || buffer.reg_start_offset >= REG_SA_COUNT))
+            continue;
+
         int host_idx = convert_buffer_idx_to_host(buffer.index);
         if (buffer.reg_block_size > 0) {
             if (features.enable_memory_mapping) {
