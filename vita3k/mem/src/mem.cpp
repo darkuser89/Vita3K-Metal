@@ -352,6 +352,11 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
     if (!is_valid_addr(state, vaddr)) {
         return false;
     }
+    // init() reserves the entire first host page as the null guard. On macOS
+    // this is often larger than one guest page, so an untracked fault in its
+    // later 4 KiB slots must never make the host page writable.
+    if (vaddr < state.host_page_size)
+        return false;
     if (LOG_PROTECT) {
         fmt::print("Access: {}\n", log_hex(vaddr));
     }
