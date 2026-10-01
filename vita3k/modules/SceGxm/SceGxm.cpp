@@ -6061,8 +6061,15 @@ EXPORT(int, sceGxmTextureSetUAddrModeSafe, SceGxmTexture *texture, SceGxmTexture
     if (!texture)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
-    if (!verify_texture_mode(texture, mode))
+    if (!verify_texture_mode(texture, mode)) {
+        if (emuenv.renderer->current_backend == renderer::Backend::Metal
+            && (texture->texture_type() == SCE_GXM_TEXTURE_CUBE
+                || texture->texture_type() == SCE_GXM_TEXTURE_CUBE_ARBITRARY)) {
+            texture->uaddr_mode = SCE_GXM_TEXTURE_ADDR_CLAMP;
+            return 0;
+        }
         return RET_ERROR(SCE_GXM_ERROR_UNSUPPORTED);
+    }
 
     texture->uaddr_mode = mode;
     return 0;
@@ -6085,8 +6092,15 @@ EXPORT(int, sceGxmTextureSetVAddrModeSafe, SceGxmTexture *texture, SceGxmTexture
     if (!texture)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
-    if (!verify_texture_mode(texture, mode))
+    if (!verify_texture_mode(texture, mode)) {
+        if (emuenv.renderer->current_backend == renderer::Backend::Metal
+            && (texture->texture_type() == SCE_GXM_TEXTURE_CUBE
+                || texture->texture_type() == SCE_GXM_TEXTURE_CUBE_ARBITRARY)) {
+            texture->vaddr_mode = SCE_GXM_TEXTURE_ADDR_CLAMP;
+            return 0;
+        }
         return RET_ERROR(SCE_GXM_ERROR_UNSUPPORTED);
+    }
 
     texture->vaddr_mode = mode;
     return 0;
