@@ -522,7 +522,7 @@ bool TextureCache::import_configure_texture() {
         is_srgb = ddspp::is_srgb(dds_descriptor->format);
         swap_rb = dds_swap_rb(dds_descriptor->format);
 
-        if (texture::is_astc_format(base_format) && !support_astc) {
+        if (texture::is_astc_format(base_format) && !support_astc && !support_astc_software_import) {
             LOG_ERROR_ONCE("ASTC textures are not support by this device");
             return false;
         }

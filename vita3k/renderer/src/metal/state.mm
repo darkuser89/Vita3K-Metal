@@ -22,6 +22,7 @@
 #include <overlay/display_manager.h>
 #include <util/log.h>
 #include <util/bytes.h>
+#include <astcenc.h>
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -41,6 +42,7 @@
 #include <numeric>
 #include <set>
 #include <stdexcept>
+#include <tuple>
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 extern "C" {
@@ -3417,16 +3419,21 @@ struct MetalTextureCache::Impl {
     bool cube = false;
     uint32_t gamma = 0;
     std::array<ImportedTextureView, TextureCacheSize> imported_views{};
+    std::map<std::tuple<uint32_t,uint32_t,bool>,astcenc_context *> astc_contexts;
     SceGxmTexture source{};
     std::filesystem::path dump_dir = std::getenv("VITA3K_METAL_DUMP_TEXTURE_DIR") ? std::getenv("VITA3K_METAL_DUMP_TEXTURE_DIR") : "";
     uint32_t dump_limit = std::getenv("VITA3K_METAL_DUMP_TEXTURE_LIMIT")
         ? uint32_t(std::min<unsigned long>(std::strtoul(std::getenv("VITA3K_METAL_DUMP_TEXTURE_LIMIT"), nullptr, 10), 4096)) : 64;
     std::set<std::string> dumped_textures;
     explicit Impl(MetalState &state) : state(state) {}
+    ~Impl() {
+        for (const auto &[key,context]:astc_contexts) astcenc_context_free(context);
+    }
 };
 MetalTextureCache::MetalTextureCache(MetalState &state) : impl(std::make_unique<Impl>(state)) {
     support_e5rgb9 = true;
     support_dxt_software_import = true;
+    support_astc_software_import = true;
 }
 MetalTextureCache::~MetalTextureCache() = default;
 void MetalTextureCache::cache_and_bind_image(const SceGxmTexture &texture, MemState &mem) {
@@ -3572,6 +3579,41 @@ void MetalTextureCache::upload_texture_impl(SceGxmTextureBaseFormat format, uint
         break;
 #undef TEX
     default: throw std::runtime_error("Metal: unsupported decoded texture format " + std::to_string(format));
+    }
+    std::vector<uint8_t> decoded_astc;
+    if (renderer::texture::is_astc_format(format) && !support_astc) {
+        const auto [block_x,block_y]=gxm::get_block_size(format);
+        const auto key=std::tuple{block_x,block_y,impl->gamma==1};
+        auto &context=impl->astc_contexts[key];
+        if (!context) {
+            astcenc_config config{};
+            const auto profile=impl->gamma==1 ? ASTCENC_PRF_LDR_SRGB : ASTCENC_PRF_LDR;
+            require(astcenc_config_init(profile,block_x,block_y,1,ASTCENC_PRE_FASTEST,
+                ASTCENC_FLG_DECOMPRESS_ONLY,&config)==ASTCENC_SUCCESS,
+                "Metal: ASTC decoder configuration failed");
+            require(astcenc_context_alloc(&config,1,&context,nullptr)==ASTCENC_SUCCESS,
+                "Metal: ASTC decoder allocation failed");
+        }
+        const size_t blocks_x=(width+block_x-1)/block_x;
+        const size_t blocks_y=(height+block_y-1)/block_y;
+        const size_t source_blocks_x=(std::max(stride,width)+block_x-1)/block_x;
+        std::vector<uint8_t> compressed(blocks_x*blocks_y*16);
+        const auto *source=static_cast<const uint8_t *>(pixels);
+        for (size_t row=0;row<blocks_y;++row)
+            std::memcpy(compressed.data()+row*blocks_x*16,
+                source+row*source_blocks_x*16,blocks_x*16);
+        decoded_astc.resize(size_t(width)*height*4);
+        void *slice=decoded_astc.data();
+        astcenc_image image{width,height,1,ASTCENC_TYPE_U8,&slice};
+        const astcenc_swizzle swizzle{ASTCENC_SWZ_R,ASTCENC_SWZ_G,ASTCENC_SWZ_B,ASTCENC_SWZ_A};
+        const auto result=astcenc_decompress_image(context,compressed.data(),compressed.size(),
+            &image,&swizzle,0);
+        require(result==ASTCENC_SUCCESS,"Metal: ASTC decompression failed");
+        pixels=decoded_astc.data();
+        stride=width;
+        native=MTLPixelFormatRGBA8Unorm;
+        block_bytes=0;
+        bytes=4;
     }
     const uint32_t slice = face > 0 ? face - 1 : 0;
     if (!impl->dump_dir.empty() && !mip && format == SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8 && impl->dumped_textures.size() < impl->dump_limit) {

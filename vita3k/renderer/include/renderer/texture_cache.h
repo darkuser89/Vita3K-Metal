@@ -149,6 +149,8 @@ public:
     bool support_dxt_software_import = false;
     // format for replaced texture, supported mostly by smartphone GPUs
     bool support_astc = false;
+    // Metal can decode ASTC DDS replacements when its GPU lacks ASTC textures.
+    bool support_astc_software_import = false;
     // some smartphone GPUs do not support linear filtering on depth surfaces
     bool support_depth_linear_filtering = true;
     // powerVR only

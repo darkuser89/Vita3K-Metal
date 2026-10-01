@@ -56,6 +56,21 @@ if(ANDROID)
 endif()
 
 if(APPLE)
+    # Mac-family Metal 3 devices cannot sample ASTC. Build Arm's scalar
+    # decompressor for the CPU upload fallback; native Apple GPUs keep their
+    # compressed texture path. Pin the source for reproducible builds.
+    include(FetchContent)
+    set(ASTCENC_CLI OFF CACHE BOOL "" FORCE)
+    set(ASTCENC_DECOMPRESSOR ON CACHE BOOL "" FORCE)
+    set(ASTCENC_UNIVERSAL_BUILD OFF CACHE BOOL "" FORCE)
+    set(ASTCENC_ISA_NONE ON CACHE BOOL "" FORCE)
+    set(ASTCENC_WERROR OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(astcenc
+        GIT_REPOSITORY https://github.com/ARM-software/astc-encoder.git
+        GIT_TAG baff485b0ff36d2f95d28961605106502c653966)
+    FetchContent_MakeAvailable(astcenc)
+    target_link_libraries(renderer PRIVATE astcdec-none-static)
+
     # Content-derived revision prevents stale translations after local compiler
     # edits as well as upstream recompiler or SPIRV-Cross updates.
     file(GLOB_RECURSE METAL_CACHE_INPUTS CONFIGURE_DEPENDS
