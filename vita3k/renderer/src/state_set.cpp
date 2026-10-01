@@ -39,6 +39,8 @@
 
 #include <config/state.h>
 
+#include <array>
+
 namespace renderer {
 COMMAND_SET_STATE(region_clip) {
     TRACY_FUNC_COMMANDS_SET_STATE(region_clip);
@@ -708,6 +710,27 @@ COMMAND(handle_set_state) {
         { GXMState::VisibilityIndex, cmd_set_state_visibility_index },
         { GXMState::VisibilityBackIndex, cmd_set_state_visibility_back_index }
     };
+
+#ifdef __APPLE__
+    // Plus uses an indexed handler table. Keep the other backends' dispatch
+    // unchanged, while avoiding a tree lookup for every native Metal state
+    // command. Build from the shared map so Metal-only handlers stay included.
+    static const auto metal_handlers = [] {
+        std::array<StateChangeHandlerFunc *, static_cast<size_t>(GXMState::TotalState)> result{};
+        for (const auto &[state, handler] : handlers)
+            result[static_cast<size_t>(state)] = handler;
+        return result;
+    }();
+    if (renderer.current_backend == Backend::Metal) {
+        const size_t index = static_cast<size_t>(gxm_state_to_set);
+        const auto handler = index < metal_handlers.size() ? metal_handlers[index] : nullptr;
+        if (handler)
+            handler(renderer, mem, config, helper, render_context);
+        else
+            LOG_ERROR("Unknown state set command {}", static_cast<uint16_t>(gxm_state_to_set));
+        return;
+    }
+#endif
 
     auto result = handlers.find(gxm_state_to_set);
 
