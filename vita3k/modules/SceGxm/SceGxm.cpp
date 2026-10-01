@@ -4694,6 +4694,13 @@ EXPORT(int, sceGxmSetUniformDataF, void *uniformBuffer, const SceGxmProgramParam
     if (parameter->category != SceGxmParameterCategory::SCE_GXM_PARAMETER_CATEGORY_UNIFORM)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
 
+    const bool native_metal = emuenv.renderer->current_backend == renderer::Backend::Metal;
+    if (native_metal) {
+        const uint64_t parameter_components = uint64_t(parameter->component_count) * std::max<uint32_t>(parameter->array_size, 1);
+        if (uint64_t(componentOffset) + componentCount > parameter_components)
+            return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+    }
+
     size_t size = 0;
     size_t offset = 0;
     bool is_float = false;
@@ -4799,14 +4806,23 @@ EXPORT(int, sceGxmSetUniformDataF, void *uniformBuffer, const SceGxmProgramParam
         int component_left_to_copy = componentCount;
 
         while (component_left_to_copy > 0) {
-            memcpy(dest, source, component_to_copy_remain_per_elem * comp_size);
+            if (native_metal) {
+                const int copy_count = std::min(component_to_copy_remain_per_elem, component_left_to_copy);
+                memcpy(dest, source, copy_count * comp_size);
+                dest += comp_size * copy_count + (copy_count == component_to_copy_remain_per_elem ? align_bytes : 0);
+                source += copy_count * comp_size;
+                component_left_to_copy -= copy_count;
+                component_to_copy_remain_per_elem = parameter->component_count;
+            } else {
+                memcpy(dest, source, component_to_copy_remain_per_elem * comp_size);
 
-            // Add and align destination
-            dest += comp_size * component_to_copy_remain_per_elem + align_bytes;
-            source += component_to_copy_remain_per_elem * comp_size;
+                // Add and align destination
+                dest += comp_size * component_to_copy_remain_per_elem + align_bytes;
+                source += component_to_copy_remain_per_elem * comp_size;
 
-            component_left_to_copy -= component_to_copy_remain_per_elem;
-            component_to_copy_remain_per_elem = std::min<int>(4, component_to_copy_remain_per_elem);
+                component_left_to_copy -= component_to_copy_remain_per_elem;
+                component_to_copy_remain_per_elem = std::min<int>(4, component_to_copy_remain_per_elem);
+            }
         }
     }
 
