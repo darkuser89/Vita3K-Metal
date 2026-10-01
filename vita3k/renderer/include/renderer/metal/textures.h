@@ -56,6 +56,7 @@ struct SurfaceRect { uint32_t x, y, width, height; };
 struct PublicationClip { SurfaceRect guest, source; };
 struct SurfaceMemoryRange { size_t offset, size; };
 std::optional<SurfaceRect> surface_subrectangle(const SceGxmColorSurface &, const SceGxmTexture &);
+std::optional<SurfaceRect> surface_word_subrectangle(const SceGxmColorSurface &, const SceGxmTexture &);
 bool surface_texture_layout_overlap(const SceGxmColorSurface &, const SceGxmTexture &);
 bool surface_texture_needs_native_resolution(SceGxmColorFormat, const SceGxmTexture &, float scale, bool use_texture_viewport);
 // Select the owner by overlap/byte pitch/tiling before checking the complete

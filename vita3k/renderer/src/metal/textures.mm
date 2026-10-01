@@ -385,6 +385,35 @@ bool surface_texture_layout_overlap(const SceGxmColorSurface &surface, const Sce
         && address - surface.data.address() < owned_bytes;
 }
 
+std::optional<SurfaceRect> surface_word_subrectangle(const SceGxmColorSurface &surface,
+    const SceGxmTexture &texture) {
+    const auto source=gxm::get_base_format(surface.colorFormat);
+    const auto target=gxm::get_base_format(gxm::get_format(texture));
+    const auto type=texture.texture_type();
+    if (!surface.data || !surface.width || !surface.height || surface.width>UINT32_MAX/2
+        || surface.strideInPixels<surface.width || surface.surfaceType!=SCE_GXM_COLOR_SURFACE_LINEAR
+        || (source!=SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16
+            && source!=SCE_GXM_COLOR_BASE_FORMAT_F32F32)
+        || !surface_word_target_supported(target)
+        || (target==SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10 && texture.swizzle_format>=8)
+        || (target==SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8 && texture.swizzle_format>=2)
+        || (type!=SCE_GXM_TEXTURE_LINEAR && type!=SCE_GXM_TEXTURE_LINEAR_STRIDED)
+        || (type!=SCE_GXM_TEXTURE_LINEAR_STRIDED && texture.true_mip_count()>1)) return std::nullopt;
+    const uint64_t width=gxm::get_width(texture),height=gxm::get_height(texture);
+    const uint64_t pitch=uint64_t(surface.strideInPixels)*8;
+    const uint64_t texture_pitch=type==SCE_GXM_TEXTURE_LINEAR_STRIDED
+        ? gxm::get_stride_in_bytes(texture) : ((width+7)&~uint64_t(7))*4;
+    const uint64_t address=uint64_t(texture.data_addr)<<2;
+    if (!width || !height || texture_pitch!=pitch || address<surface.data.address()) return std::nullopt;
+    const uint64_t offset=address-surface.data.address();
+    if (offset%4 || offset>=pitch*surface.height) return std::nullopt;
+    const uint64_t x=(offset%pitch)/4,y=offset/pitch;
+    // A cropped word view must stay inside visible pixels on every row;
+    // stride padding belongs to guest RAM, not the cached GPU attachment.
+    if (x+width>uint64_t(surface.width)*2 || y+height>surface.height) return std::nullopt;
+    return SurfaceRect{uint32_t(x),uint32_t(y),uint32_t(width),uint32_t(height)};
+}
+
 std::optional<SurfaceRect> surface_subrectangle(const SceGxmColorSurface &surface, const SceGxmTexture &texture) {
     const auto type=texture.texture_type();
     if (!surface.data || !surface.width || !surface.height || surface.strideInPixels<surface.width
