@@ -3414,6 +3414,7 @@ void set_viewport(MetalContext &ctx, float x, float y, float sx, float sy) {
 struct MetalTextureCache::Impl {
     MetalState &state;
     std::array<id<MTLTexture>, TextureCacheSize> textures{};
+    std::array<bool, TextureCacheSize> placeholders{};
     size_t current = 0;
     uint32_t width = 0, height = 0, mips = 1;
     bool cube = false;
@@ -3463,6 +3464,7 @@ static std::optional<SceGxmColorFormat> repacked_u2_color(SceGxmTextureFormat fo
         | ((mode & 3) << 20));
 }
 id<MTLTexture> current_texture_view(const MetalTextureCache &cache, SceGxmTextureFormat format) {
+    if (cache.impl->placeholders[cache.impl->current]) return current_texture(cache);
     const auto &view = cache.impl->imported_views[cache.impl->current];
     const auto color = view.active ? std::nullopt : repacked_u2_color(format);
     return sampling_view(current_texture(cache), format, color ? &*color : nullptr,
@@ -3492,6 +3494,7 @@ void MetalTextureCache::select(size_t index, const SceGxmTexture &texture) {
 }
 void MetalTextureCache::configure_texture(const SceGxmTexture &) {
     impl->textures[impl->current] = nil;
+    impl->placeholders[impl->current] = false;
     impl->imported_views[impl->current] = {};
     impl->width = gxm::get_width(impl->source);
     impl->height = gxm::get_height(impl->source);
@@ -3534,9 +3537,42 @@ void MetalTextureCache::import_configure_impl(SceGxmTextureBaseFormat format, ui
     // independently of the guest descriptor's partial-channel gamma mode.
     impl->gamma = srgb ? (format == SCE_GXM_TEXTURE_BASE_FORMAT_U8U8 ? 3 : 1) : 0;
     impl->textures[impl->current] = nil;
+    impl->placeholders[impl->current] = false;
 }
 void MetalTextureCache::upload_texture_impl(SceGxmTextureBaseFormat format, uint32_t width, uint32_t height,
     uint32_t mip, const void *pixels, int face, uint32_t stride) {
+    const uint32_t slice = face > 0 ? face - 1 : 0;
+    if (!mip && !slice) impl->placeholders[impl->current] = false;
+    if (impl->placeholders[impl->current]) return;
+    const auto placeholder = [&](const char *reason) {
+        LOG_WARN_ONCE("Metal: substituting a 1x1 texture for invalid or unsupported image ({})", reason);
+        auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+            width:1 height:1 mipmapped:NO];
+        desc.textureType = impl->cube ? MTLTextureTypeCube : MTLTextureType2D;
+        desc.storageMode = MTLStorageModeShared;
+        desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+        id<MTLTexture> safe = [impl->state.impl->device->native_device() newTextureWithDescriptor:desc];
+        require(safe != nil, "Metal: cannot allocate 1x1 fallback texture");
+        const uint8_t magenta[4] = {255, 0, 255, 255};
+        for (uint32_t side = 0; side < (impl->cube ? 6u : 1u); ++side)
+            [safe replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:side
+                withBytes:magenta bytesPerRow:4 bytesPerImage:4];
+        impl->textures[impl->current] = safe;
+        impl->placeholders[impl->current] = true;
+    };
+    constexpr uint32_t max_dim = 16384;
+    const uint32_t allowed_mips = std::bit_width(std::max(impl->width, impl->height));
+    if (!impl->width || !impl->height || impl->width > max_dim || impl->height > max_dim
+        || (impl->cube && impl->width != impl->height)
+        || !impl->mips || impl->mips > allowed_mips) {
+        placeholder("dimensions or mip count");
+        return;
+    }
+    if (!width || !height || width > impl->width || height > impl->height
+        || mip >= impl->mips || slice >= (impl->cube ? 6u : 1u)) {
+        if (!mip && !slice) placeholder("upload extent or slice");
+        return;
+    }
     MTLPixelFormat native;
     uint32_t bytes;
     uint32_t block_bytes = 0;
@@ -3578,7 +3614,9 @@ void MetalTextureCache::upload_texture_impl(SceGxmTextureBaseFormat format, uint
         bytes = 2;
         break;
 #undef TEX
-    default: throw std::runtime_error("Metal: unsupported decoded texture format " + std::to_string(format));
+    default:
+        placeholder("decoded format");
+        return;
     }
     std::vector<uint8_t> decoded_astc;
     if (renderer::texture::is_astc_format(format) && !support_astc) {
@@ -3615,7 +3653,6 @@ void MetalTextureCache::upload_texture_impl(SceGxmTextureBaseFormat format, uint
         block_bytes=0;
         bytes=4;
     }
-    const uint32_t slice = face > 0 ? face - 1 : 0;
     if (!impl->dump_dir.empty() && !mip && format == SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8 && impl->dumped_textures.size() < impl->dump_limit) {
         auto name = fmt::format("{:08x}-{:08x}-{}x{}", impl->source.data_addr << 2, uint32_t(gxm::get_format(impl->source)), width, height);
         if (slice) name += fmt::format("-face{}",slice);
@@ -3719,6 +3756,10 @@ void MetalTextureCache::upload_texture_impl(SceGxmTextureBaseFormat format, uint
         desc.storageMode = MTLStorageModeShared;
         desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
         impl->textures[impl->current] = [impl->state.impl->device->native_device() newTextureWithDescriptor:desc];
+        if (!impl->textures[impl->current]) {
+            placeholder("native format or allocation");
+            return;
+        }
     }
     id<MTLTexture> texture = impl->textures[impl->current];
     require(texture != nil, "Metal: texture upload allocation failed");
