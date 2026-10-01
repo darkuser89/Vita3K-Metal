@@ -449,16 +449,19 @@ std::optional<SurfaceRect> surface_byte_subrectangle(const SceGxmColorSurface &s
     const uint32_t mode=(uint32_t(surface.colorFormat)&SCE_GXM_COLOR_SWIZZLE_MASK)>>20;
     const bool channels=source==SCE_GXM_COLOR_BASE_FORMAT_U8U8
         || source==SCE_GXM_COLOR_BASE_FORMAT_S8S8;
-    const bool packed_direct=(source==SCE_GXM_COLOR_BASE_FORMAT_U5U6U5 && mode==1)
-        || (source==SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4 && mode==2)
-        || (source==SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5 && (mode==1 || mode==2));
+    const bool packed=source==SCE_GXM_COLOR_BASE_FORMAT_U5U6U5
+        || source==SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4
+        || source==SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5;
     const bool word=source==SCE_GXM_COLOR_BASE_FORMAT_U16
         || source==SCE_GXM_COLOR_BASE_FORMAT_S16
-        || source==SCE_GXM_COLOR_BASE_FORMAT_F16 || packed_direct;
+        || source==SCE_GXM_COLOR_BASE_FORMAT_F16 || packed;
     if (!surface.data || !surface.width || !surface.height || surface.width>UINT32_MAX/2
         || surface.strideInPixels<surface.width || surface.surfaceType!=SCE_GXM_COLOR_SURFACE_LINEAR
         || (!channels && !word) || (channels && mode>=4)
-        || (word && !packed_direct && mode>=2)
+        || (word && !packed && mode>=2)
+        || (source==SCE_GXM_COLOR_BASE_FORMAT_U5U6U5 && mode>=2)
+        || (source==SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4 && mode>=4)
+        || (source==SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5 && mode>=4)
         || (target!=SCE_GXM_TEXTURE_BASE_FORMAT_U8 && target!=SCE_GXM_TEXTURE_BASE_FORMAT_S8)
         || (type!=SCE_GXM_TEXTURE_LINEAR && type!=SCE_GXM_TEXTURE_LINEAR_STRIDED)
         || (type!=SCE_GXM_TEXTURE_LINEAR_STRIDED && texture.true_mip_count()>1)) return std::nullopt;
@@ -547,15 +550,16 @@ std::optional<SurfaceRect> surface_32_small_subrectangle(const SceGxmColorSurfac
         || source==SCE_GXM_COLOR_BASE_FORMAT_S16S16
         || source==SCE_GXM_COLOR_BASE_FORMAT_F16F16;
     const bool r32=source==SCE_GXM_COLOR_BASE_FORMAT_F32;
-    const bool packed_direct=(source==SCE_GXM_COLOR_BASE_FORMAT_F11F11F10 && mode<2)
-        || (source==SCE_GXM_COLOR_BASE_FORMAT_U2U10U10U10 && mode==0);
+    const bool packed_source=(source==SCE_GXM_COLOR_BASE_FORMAT_F11F11F10 && mode<2)
+        || (source==SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9 && mode<2)
+        || (source==SCE_GXM_COLOR_BASE_FORMAT_U2U10U10U10 && mode<4);
     const auto components=texture_components(target);
     const uint32_t bytes=components.count*components.bytes;
     if (bytes!=1 && bytes!=2) return std::nullopt;
     const uint32_t ratio=4/bytes;
     if (!surface.data || !surface.width || !surface.height
         || surface.strideInPixels<surface.width || surface.surfaceType!=SCE_GXM_COLOR_SURFACE_LINEAR
-        || (!rg16 && !r32 && !packed_direct) || (rg16 && mode>=2) || (r32 && mode!=0)
+        || (!rg16 && !r32 && !packed_source) || (rg16 && mode>=2) || (r32 && mode!=0)
         || (bytes==2 && !surface_halfword_target_supported(target))
         || (bytes==1 && target!=SCE_GXM_TEXTURE_BASE_FORMAT_U8
             && target!=SCE_GXM_TEXTURE_BASE_FORMAT_S8)
@@ -1816,13 +1820,22 @@ kernel void unpack_byte_halfwords_buffer(texture2d<uint, access::read> input [[t
 }
 kernel void unpack_16bit_bytes(texture2d<uint, access::read> input [[texture(0)]],
     texture2d<uint, access::write> output [[texture(1)]],
-    constant uint2 &memory_channels [[buffer(0)]], constant uint &two_channels [[buffer(1)]],
+    constant uint4 &memory_channels [[buffer(0)]], constant uint &mode [[buffer(1)]],
     uint2 p [[thread_position_in_grid]]) {
     if (p.x>=output.get_width() || p.y>=output.get_height()) return;
     const uint2 source=min(uint2(p.x/2u,p.y),uint2(input.get_width()-1u,input.get_height()-1u));
     const uint4 bits=input.read(source);
-    const uint byte=two_channels ? bits[memory_channels[p.x&1u]]&255u
-        : (bits.x>>((p.x&1u)*8u))&255u;
+    uint word=bits.x&65535u;
+    if (mode==2u) word=(word&0x07e0u)|((word&0xf800u)>>11)|((word&0x001fu)<<11);
+    if (mode==3u) {
+        word=0u;
+        for (uint c=0u;c<4u;++c)
+            word|=((bits.x>>(12u-4u*memory_channels[c]))&15u)<<(12u-4u*c);
+    }
+    if (mode==4u) word=(word&0x83e0u)|((word&0x7c00u)>>10)|((word&0x001fu)<<10);
+    if (mode==5u) word=(word&0x07c1u)|((word&0xf800u)>>10)|((word&0x003eu)<<10);
+    const uint byte=mode==1u ? bits[memory_channels[p.x&1u]]&255u
+        : (word>>((p.x&1u)*8u))&255u;
     output.write(uint4(byte,0u,0u,0u),p);
 }
 kernel void unpack_rgba8_bytes(texture2d<uint, access::read> input [[texture(0)]],
@@ -1837,13 +1850,27 @@ uint wide_guest_byte(uint4 words, uint4 memory_channels, uint component_bytes, u
     return (words[memory_channels[offset/component_bytes]]
         >> ((offset%component_bytes)*8u))&255u;
 }
+uint guest_packed_32_word(uint word, uint mode) {
+    if (mode==1u) return (word&0xf803fe00u)|((word&0x000001ffu)<<18)
+        |((word&0x07fc0000u)>>18);
+    if (mode==2u) return (word&0xc00ffc00u)|((word&0x000003ffu)<<20)
+        |((word&0x3ff00000u)>>20);
+    if (mode==3u || mode==4u) {
+        const uint blue=word&0x3ffu,green=(word>>10)&0x3ffu,red=(word>>20)&0x3ffu;
+        return (word>>30)|((mode==3u ? blue : red)<<2)|(green<<12)
+            |((mode==3u ? red : blue)<<22);
+    }
+    return word;
+}
 kernel void unpack_wide_small(texture2d<uint, access::read> input [[texture(0)]],
     texture2d<uint, access::write> output [[texture(1)]],
     constant uint4 &memory_channels [[buffer(0)]], constant uint4 &config [[buffer(1)]],
+    constant uint &packed_mode [[buffer(2)]],
     uint2 p [[thread_position_in_grid]]) {
     if (p.x>=output.get_width() || p.y>=output.get_height()) return;
     const uint2 source=min(uint2(p.x/config.w,p.y),uint2(input.get_width()-1u,input.get_height()-1u));
-    const uint4 words=input.read(source);
+    uint4 words=input.read(source);
+    words.x=guest_packed_32_word(words.x,packed_mode);
     const uint offset=(p.x%config.w)*config.z;
     const uint lo=wide_guest_byte(words,memory_channels,config.x,offset);
     const uint hi=config.z==2u ? wide_guest_byte(words,memory_channels,config.x,offset+1u) : 0u;
@@ -1853,11 +1880,12 @@ kernel void unpack_wide_small(texture2d<uint, access::read> input [[texture(0)]]
 }
 kernel void unpack_wide_small_buffer(texture2d<uint, access::read> input [[texture(0)]],
     device ushort *output [[buffer(0)]], constant uint4 &memory_channels [[buffer(1)]],
-    constant uint2 &config [[buffer(2)]], constant uint3 &layout [[buffer(3)]],
+    constant uint3 &config [[buffer(2)]], constant uint3 &layout [[buffer(3)]],
     uint2 p [[thread_position_in_grid]]) {
     if (p.x>=layout.x || p.y>=layout.y) return;
     const uint2 source=min(uint2(p.x/config.y,p.y),uint2(input.get_width()-1u,input.get_height()-1u));
-    const uint4 words=input.read(source);
+    uint4 words=input.read(source);
+    words.x=guest_packed_32_word(words.x,config.z);
     const uint offset=(p.x%config.y)*2u;
     const uint lo=wide_guest_byte(words,memory_channels,config.x,offset);
     const uint hi=wide_guest_byte(words,memory_channels,config.x,offset+1u);
@@ -3096,38 +3124,46 @@ id<MTLTexture> SurfaceCaster::byte_texture_from_16bit_surface(id<MTLTexture> sou
     const uint32_t mode=(uint32_t(color)&SCE_GXM_COLOR_SWIZZLE_MASK)>>20;
     const bool channels=base==SCE_GXM_COLOR_BASE_FORMAT_U8U8
         || base==SCE_GXM_COLOR_BASE_FORMAT_S8S8;
-    const bool packed_direct=(base==SCE_GXM_COLOR_BASE_FORMAT_U5U6U5 && mode==1)
-        || (base==SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4 && mode==2)
-        || (base==SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5 && (mode==1 || mode==2));
+    const bool packed=base==SCE_GXM_COLOR_BASE_FORMAT_U5U6U5
+        || base==SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4
+        || base==SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5;
     const bool word=base==SCE_GXM_COLOR_BASE_FORMAT_U16
         || base==SCE_GXM_COLOR_BASE_FORMAT_S16
-        || base==SCE_GXM_COLOR_BASE_FORMAT_F16 || packed_direct;
+        || base==SCE_GXM_COLOR_BASE_FORMAT_F16 || packed;
     if (!source || !source.width || !source.height || (!channels && !word)
         || (channels && (mode>=4 || (source.pixelFormat!=MTLPixelFormatRG8Unorm
             && source.pixelFormat!=MTLPixelFormatRG8Snorm
             && source.pixelFormat!=MTLPixelFormatRG8Uint)))
-        || (word && !packed_direct && (mode>=2 || (source.pixelFormat!=MTLPixelFormatR16Unorm
+        || (word && !packed && (mode>=2 || (source.pixelFormat!=MTLPixelFormatR16Unorm
             && source.pixelFormat!=MTLPixelFormatR16Snorm
             && source.pixelFormat!=MTLPixelFormatR16Float
             && source.pixelFormat!=MTLPixelFormatR16Uint)))
-        || (packed_direct && !((base==SCE_GXM_COLOR_BASE_FORMAT_U5U6U5
-                && source.pixelFormat==MTLPixelFormatB5G6R5Unorm)
-            || (base==SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4
-                && source.pixelFormat==MTLPixelFormatABGR4Unorm)
-            || (base==SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5
-                && source.pixelFormat==(mode<2 ? MTLPixelFormatBGR5A1Unorm
-                    : MTLPixelFormatA1BGR5Unorm))))
+        || (base==SCE_GXM_COLOR_BASE_FORMAT_U5U6U5
+            && (mode>=2 || source.pixelFormat!=MTLPixelFormatB5G6R5Unorm))
+        || (base==SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4
+            && (mode>=4 || source.pixelFormat!=MTLPixelFormatABGR4Unorm))
+        || (base==SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5
+            && (mode>=4 || source.pixelFormat!=(mode<2 ? MTLPixelFormatBGR5A1Unorm
+                : MTLPixelFormatA1BGR5Unorm)))
         || (texture!=SCE_GXM_TEXTURE_BASE_FORMAT_U8
             && texture!=SCE_GXM_TEXTURE_BASE_FORMAT_S8)
         || (pending_commands && pending_commands.status!=MTLCommandBufferStatusNotEnqueued))
         throw std::runtime_error("Metal: invalid 16-bit surface byte cast");
-    uint32_t memory_channels[2]={0,1};
+    uint32_t memory_channels[4]={0,1,2,3};
     if (channels) {
         const auto mapping=surface_memory_mapping(color);
         for (uint32_t channel=0;channel<2;++channel) {
             const auto found=std::find(identity.begin(),identity.begin()+2,mapping[channel]);
             if (found==identity.begin()+2)
                 throw std::runtime_error("Metal: invalid two-channel guest byte mapping");
+            memory_channels[channel]=uint32_t(found-identity.begin());
+        }
+    }
+    if (base==SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4) {
+        const auto mapping=surface_memory_mapping(color);
+        for (uint32_t channel=0;channel<4;++channel) {
+            const auto found=std::find(identity.begin(),identity.end(),mapping[channel]);
+            if (found==identity.end()) throw std::runtime_error("Metal: invalid packed 4444 mapping");
             memory_channels[channel]=uint32_t(found-identity.begin());
         }
     }
@@ -3142,14 +3178,18 @@ id<MTLTexture> SurfaceCaster::byte_texture_from_16bit_surface(id<MTLTexture> sou
     if (!result) throw std::runtime_error("Metal: cannot allocate 16-bit surface byte alias");
     auto raw=[result newTextureViewWithPixelFormat:MTLPixelFormatR8Uint];
     if (!raw) throw std::runtime_error("Metal: cannot view byte alias destination bits");
-    const uint32_t two_channels=channels;
+    const uint32_t packed_mode=channels ? 1u
+        : base==SCE_GXM_COLOR_BASE_FORMAT_U5U6U5 && mode==0 ? 2u
+        : base==SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4 ? 3u
+        : base==SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5 && mode==0 ? 4u
+        : base==SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5 && mode==3 ? 5u : 0u;
     auto commands=pending_commands ? pending_commands : surface_command_buffer(device,@"Vita3K 16-bit surface byte cast");
     auto encoder=[commands computeCommandEncoder];
     [encoder setComputePipelineState:byte_unpack_pipeline];
     [encoder setTexture:bits atIndex:0];
     [encoder setTexture:raw atIndex:1];
     [encoder setBytes:memory_channels length:sizeof(memory_channels) atIndex:0];
-    [encoder setBytes:&two_channels length:sizeof(two_channels) atIndex:1];
+    [encoder setBytes:&packed_mode length:sizeof(packed_mode) atIndex:1];
     [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1)
         threadsPerThreadgroup:MTLSizeMake(8,8,1)];
     [encoder endEncoding];
@@ -3222,13 +3262,17 @@ id<MTLTexture> SurfaceCaster::small_texture_from_wide_surface(id<MTLTexture> sou
         || base==SCE_GXM_COLOR_BASE_FORMAT_F16F16;
     const bool r32=base==SCE_GXM_COLOR_BASE_FORMAT_F32;
     const uint32_t mode=(uint32_t(color)&SCE_GXM_COLOR_SWIZZLE_MASK)>>20;
-    const bool packed_direct=(base==SCE_GXM_COLOR_BASE_FORMAT_F11F11F10 && mode<2)
-        || (base==SCE_GXM_COLOR_BASE_FORMAT_U2U10U10U10 && mode==0);
+    const bool packed_source=(base==SCE_GXM_COLOR_BASE_FORMAT_F11F11F10 && mode<2)
+        || (base==SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9 && mode<2)
+        || (base==SCE_GXM_COLOR_BASE_FORMAT_U2U10U10U10 && mode<4);
+    const uint32_t packed_mode=base==SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9 && mode==1 ? 1u
+        : base==SCE_GXM_COLOR_BASE_FORMAT_U2U10U10U10 ? mode==1 ? 2u
+            : mode==2 ? 3u : mode==3 ? 4u : 0u : 0u;
     const bool packed=texture==SCE_GXM_TEXTURE_BASE_FORMAT_U5U6U5
         || texture==SCE_GXM_TEXTURE_BASE_FORMAT_U4U4U4U4
         || texture==SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5;
     if (!source || !source.width || !source.height
-        || (!f16x4 && !f32x2 && !rg16 && !r32 && !packed_direct)
+        || (!f16x4 && !f32x2 && !rg16 && !r32 && !packed_source)
         || (f16x4 && (mode>=std::size(four)
             || (source.pixelFormat!=MTLPixelFormatRGBA16Float
                 && source.pixelFormat!=MTLPixelFormatRGBA16Uint)))
@@ -3240,8 +3284,10 @@ id<MTLTexture> SurfaceCaster::small_texture_from_wide_surface(id<MTLTexture> sou
             && source.pixelFormat!=MTLPixelFormatRG16Uint)))
         || (r32 && (mode!=0 || (source.pixelFormat!=MTLPixelFormatR32Float
             && source.pixelFormat!=MTLPixelFormatR32Uint)))
-        || (packed_direct && !((base==SCE_GXM_COLOR_BASE_FORMAT_F11F11F10
+        || (packed_source && !((base==SCE_GXM_COLOR_BASE_FORMAT_F11F11F10
                 && source.pixelFormat==MTLPixelFormatRG11B10Float)
+            || (base==SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9
+                && source.pixelFormat==MTLPixelFormatRGB9E5Float)
             || (base==SCE_GXM_COLOR_BASE_FORMAT_U2U10U10U10
                 && source.pixelFormat==MTLPixelFormatBGR10A2Unorm)))
         || (bytes!=1 && bytes!=2)
@@ -3251,7 +3297,7 @@ id<MTLTexture> SurfaceCaster::small_texture_from_wide_surface(id<MTLTexture> sou
         || (texture==SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5 && texture_swizzle>=8)
         || (pending_commands && pending_commands.status!=MTLCommandBufferStatusNotEnqueued))
         throw std::runtime_error("Metal: invalid wide surface small cast");
-    const auto mapping=packed_direct ? identity : surface_memory_mapping(color);
+    const auto mapping=packed_source ? identity : surface_memory_mapping(color);
     const uint32_t source_components=f16x4 ? 4 : (f32x2 || rg16 ? 2 : 1);
     const uint32_t component_bytes=f16x4 || rg16 ? 2 : 4;
     const uint32_t source_bytes=source_components*component_bytes;
@@ -3282,7 +3328,7 @@ id<MTLTexture> SurfaceCaster::small_texture_from_wide_surface(id<MTLTexture> sou
         const NSUInteger total_bytes=row_bytes*result.height;
         auto buffer=[device.native_device() newBufferWithLength:total_bytes options:MTLResourceStorageModeShared];
         if (!buffer) throw std::runtime_error("Metal: cannot allocate packed wide small buffer");
-        const uint32_t config[]={component_bytes,ratio};
+        const uint32_t config[]={component_bytes,ratio,packed_mode};
         const uint32_t layout[]={uint32_t(result.width),uint32_t(result.height),uint32_t(row_bytes/2)};
         auto encoder=[commands computeCommandEncoder];
         [encoder setComputePipelineState:wide_small_buffer_pipeline];
@@ -3309,6 +3355,7 @@ id<MTLTexture> SurfaceCaster::small_texture_from_wide_surface(id<MTLTexture> sou
         [encoder setTexture:raw atIndex:1];
         [encoder setBytes:memory_channels length:sizeof(memory_channels) atIndex:0];
         [encoder setBytes:config length:sizeof(config) atIndex:1];
+        [encoder setBytes:&packed_mode length:sizeof(packed_mode) atIndex:2];
         [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1)
             threadsPerThreadgroup:MTLSizeMake(8,8,1)];
         [encoder endEncoding];

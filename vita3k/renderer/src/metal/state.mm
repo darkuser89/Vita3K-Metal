@@ -4482,6 +4482,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 --found;
                 if (surface_texture_layout_overlap(found->second.guest,texture))
                     return texture_surface_usable(found->second)
+                        && (gxm::get_base_format(found->second.guest.colorFormat)
+                                != SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9
+                            || found->second.color.pixelFormat==MTLPixelFormatRGB9E5Float)
                         && surface_32_small_subrectangle(found->second.guest,texture)
                         ? found : impl->surfaces.end();
             }
@@ -4791,7 +4794,10 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 const bool direct_byte_alias=surface_byte_subrectangle(source->second.guest,texture).has_value();
                 const bool direct_rgba8_byte_alias=surface_rgba8_byte_subrectangle(source->second.guest,texture).has_value();
                 const bool direct_wide_small_alias=surface_wide_small_subrectangle(source->second.guest,texture).has_value();
-                const bool direct_32_small_alias=surface_32_small_subrectangle(source->second.guest,texture).has_value();
+                const bool direct_32_small_alias=(gxm::get_base_format(source->second.guest.colorFormat)
+                        != SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9
+                    || source->second.color.pixelFormat==MTLPixelFormatRGB9E5Float)
+                    && surface_32_small_subrectangle(source->second.guest,texture).has_value();
                 // A native surface can only be sampled directly when both
                 // its byte layout and format match the guest texture view.
                 incompatible_alias=!direct_word_alias && !direct_halfword_alias
