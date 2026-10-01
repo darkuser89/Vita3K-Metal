@@ -140,9 +140,9 @@ class SurfaceCaster {
     id<MTLComputePipelineState> mask_store_pipeline, mask_store_ms_pipeline;
     id<MTLBuffer> depth_store_buffer, mask_store_buffer;
     id<MTLComputePipelineState> pipeline, halfword_unpack_pipeline, byte_halfword_pipeline,
-        byte_unpack_pipeline, rgba8_byte_unpack_pipeline;
+        byte_unpack_pipeline, rgba8_byte_unpack_pipeline, wide_small_unpack_pipeline;
     id<MTLComputePipelineState> word_buffer_pipeline, halfword_buffer_pipeline,
-        byte_halfword_buffer_pipeline;
+        byte_halfword_buffer_pipeline, wide_small_buffer_pipeline;
     id<MTLComputePipelineState> x8_word_decode_pipeline;
     id<MTLComputePipelineState> cube_pipeline, component_cast_pipeline;
     id<MTLComputePipelineState> depth_pipeline, stencil_pipeline, stencil_ms_pipeline, rg_gamma_pipeline;
@@ -198,6 +198,9 @@ public:
         SceGxmTextureBaseFormat texture, id<MTLCommandBuffer> pending_commands = nil);
     id<MTLTexture> byte_texture_from_rgba8(id<MTLTexture> source, SceGxmColorFormat color,
         SceGxmTextureBaseFormat texture, id<MTLCommandBuffer> pending_commands = nil);
+    id<MTLTexture> small_texture_from_64bit_surface(id<MTLTexture> source, SceGxmColorFormat color,
+        SceGxmTextureBaseFormat texture, uint32_t texture_swizzle,
+        id<MTLCommandBuffer> pending_commands = nil);
     bool load_depth_memory(id<MTLTexture>, const SceGxmDepthStencilSurface &, const DepthMemoryLayout &, float scale,
         std::span<const uint8_t> depth, std::span<const uint8_t> stencil,
         id<MTLCommandBuffer> commands = nil);
@@ -290,6 +293,8 @@ std::optional<SurfaceRect> surface_halfword_subrectangle(const SceGxmColorSurfac
 std::optional<SurfaceRect> surface_byte_subrectangle(const SceGxmColorSurface &,
     const SceGxmTexture &);
 std::optional<SurfaceRect> surface_rgba8_byte_subrectangle(const SceGxmColorSurface &,
+    const SceGxmTexture &);
+std::optional<SurfaceRect> surface_wide_small_subrectangle(const SceGxmColorSurface &,
     const SceGxmTexture &);
 bool surface_format_cast_enqueueable(SceGxmColorFormat, SceGxmTextureBaseFormat,
     uint32_t texture_swizzle = UINT32_MAX);
