@@ -1107,6 +1107,11 @@ struct SceGxmContext {
 
     // insert new memory range used by a command list
     void insert_new_memory_range() {
+        // An empty deferred list has not occupied guest VDM memory. In
+        // particular, do not attach a zero-length range after a failed refill.
+        if (renderer->metal_gxm.enabled && alloc_space.address() == alloc_space_start.address())
+            return;
+
         CommandListRange range = {
             alloc_space_start.address(),
             alloc_space.address(),
@@ -1138,6 +1143,10 @@ struct SceGxmContext {
         if (state.active && state.type == SCE_GXM_CONTEXT_TYPE_DEFERRED) {
             // update memory ranges
             insert_new_memory_range();
+            // A failed callback must not register the sealed span again when
+            // the command list is ended or another refill is attempted.
+            if (renderer->metal_gxm.enabled)
+                alloc_space_start = alloc_space;
         }
 
         std::uint32_t actual_size = 0;
