@@ -141,7 +141,8 @@ class SurfaceCaster {
     id<MTLBuffer> depth_store_buffer, mask_store_buffer;
     id<MTLComputePipelineState> pipeline, halfword_unpack_pipeline, byte_halfword_pipeline,
         byte_unpack_pipeline, rgba8_byte_unpack_pipeline;
-    id<MTLComputePipelineState> word_buffer_pipeline, halfword_buffer_pipeline;
+    id<MTLComputePipelineState> word_buffer_pipeline, halfword_buffer_pipeline,
+        byte_halfword_buffer_pipeline;
     id<MTLComputePipelineState> x8_word_decode_pipeline;
     id<MTLComputePipelineState> cube_pipeline, component_cast_pipeline;
     id<MTLComputePipelineState> depth_pipeline, stencil_pipeline, stencil_ms_pipeline, rg_gamma_pipeline;
@@ -191,7 +192,8 @@ public:
         uint32_t guest_height = 0, id<MTLCommandBuffer> pending_commands = nil,
         bool separate_word = false);
     id<MTLTexture> halfword_texture_from_rgba8(id<MTLTexture> source, SceGxmColorFormat color,
-        SceGxmTextureBaseFormat texture, id<MTLCommandBuffer> pending_commands = nil);
+        SceGxmTextureBaseFormat texture, uint32_t texture_swizzle,
+        id<MTLCommandBuffer> pending_commands = nil);
     id<MTLTexture> byte_texture_from_16bit_surface(id<MTLTexture> source, SceGxmColorFormat color,
         SceGxmTextureBaseFormat texture, id<MTLCommandBuffer> pending_commands = nil);
     id<MTLTexture> byte_texture_from_rgba8(id<MTLTexture> source, SceGxmColorFormat color,

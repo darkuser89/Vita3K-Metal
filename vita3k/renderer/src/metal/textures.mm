@@ -425,6 +425,7 @@ std::optional<SurfaceRect> surface_halfword_subrectangle(const SceGxmColorSurfac
         || (source!=SCE_GXM_COLOR_BASE_FORMAT_U8U8U8U8
             && source!=SCE_GXM_COLOR_BASE_FORMAT_S8S8S8S8)
         || color_mode>=std::size(four) || !surface_halfword_target_supported(target)
+        || (target==SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5 && texture.swizzle_format>=8)
         || (type!=SCE_GXM_TEXTURE_LINEAR && type!=SCE_GXM_TEXTURE_LINEAR_STRIDED)
         || (type!=SCE_GXM_TEXTURE_LINEAR_STRIDED && texture.true_mip_count()>1)) return std::nullopt;
     const uint64_t width=gxm::get_width(texture),height=gxm::get_height(texture);
@@ -1582,7 +1583,10 @@ bool surface_halfword_target_supported(SceGxmTextureBaseFormat texture) {
         || texture==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8
         || texture==SCE_GXM_TEXTURE_BASE_FORMAT_U16
         || texture==SCE_GXM_TEXTURE_BASE_FORMAT_S16
-        || texture==SCE_GXM_TEXTURE_BASE_FORMAT_F16;
+        || texture==SCE_GXM_TEXTURE_BASE_FORMAT_F16
+        || texture==SCE_GXM_TEXTURE_BASE_FORMAT_U5U6U5
+        || texture==SCE_GXM_TEXTURE_BASE_FORMAT_U4U4U4U4
+        || texture==SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5;
 }
 static bool packed_32_word_target(SceGxmTextureBaseFormat texture) {
     return texture==SCE_GXM_TEXTURE_BASE_FORMAT_F11F11F10
@@ -1720,6 +1724,17 @@ kernel void unpack_byte_halfwords(texture2d<uint, access::read> input [[texture(
     const uint hi=channels[memory_channels[first+1u]]&255u;
     output.write(component_bytes==2u ? uint4(lo|(hi<<8),0u,0u,0u)
         : uint4(lo,hi,0u,0u),p);
+}
+kernel void unpack_byte_halfwords_buffer(texture2d<uint, access::read> input [[texture(0)]],
+    device ushort *output [[buffer(0)]], constant uint4 &memory_channels [[buffer(1)]],
+    constant uint3 &layout [[buffer(2)]], uint2 p [[thread_position_in_grid]]) {
+    if (p.x>=layout.x || p.y>=layout.y) return;
+    const uint2 source=min(uint2(p.x/2u,p.y),uint2(input.get_width()-1u,input.get_height()-1u));
+    const uint4 channels=input.read(source);
+    const uint first=(p.x&1u)*2u;
+    const uint lo=channels[memory_channels[first]]&255u;
+    const uint hi=channels[memory_channels[first+1u]]&255u;
+    output[p.y*layout.z+p.x]=ushort(lo|(hi<<8));
 }
 kernel void unpack_16bit_bytes(texture2d<uint, access::read> input [[texture(0)]],
     texture2d<uint, access::write> output [[texture(1)]],
@@ -2213,6 +2228,7 @@ fragment uint4 publication_words(float4 position [[position]],
     if (!pipeline) throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal: surface cast pipeline failed");
     halfword_unpack_pipeline = cached_compute(device, library, @"unpack_halfwords");
     byte_halfword_pipeline = cached_compute(device, library, @"unpack_byte_halfwords");
+    byte_halfword_buffer_pipeline = cached_compute(device, library, @"unpack_byte_halfwords_buffer");
     byte_unpack_pipeline = cached_compute(device, library, @"unpack_16bit_bytes");
     rgba8_byte_unpack_pipeline = cached_compute(device, library, @"unpack_rgba8_bytes");
     word_buffer_pipeline = cached_compute(device, library, @"unpack_words_buffer");
@@ -2884,11 +2900,14 @@ id<MTLTexture> SurfaceCaster::word_texture_from_rgba16(id<MTLTexture> source, Sc
     return result;
 }
 id<MTLTexture> SurfaceCaster::halfword_texture_from_rgba8(id<MTLTexture> source,
-    SceGxmColorFormat color, SceGxmTextureBaseFormat texture,
+    SceGxmColorFormat color, SceGxmTextureBaseFormat texture, uint32_t texture_swizzle,
     id<MTLCommandBuffer> pending_commands) {
-    const auto target=texture_components(texture);
+    auto target=texture_components(texture);
     const auto base=gxm::get_base_format(color);
     const uint32_t mode=(uint32_t(color)&SCE_GXM_COLOR_SWIZZLE_MASK)>>20;
+    const bool packed=texture==SCE_GXM_TEXTURE_BASE_FORMAT_U5U6U5
+        || texture==SCE_GXM_TEXTURE_BASE_FORMAT_U4U4U4U4
+        || texture==SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5;
     if (!source || !source.width || !source.height
         || (source.pixelFormat!=MTLPixelFormatRGBA8Unorm
             && source.pixelFormat!=MTLPixelFormatRGBA8Unorm_sRGB
@@ -2897,6 +2916,7 @@ id<MTLTexture> SurfaceCaster::halfword_texture_from_rgba8(id<MTLTexture> source,
         || (base!=SCE_GXM_COLOR_BASE_FORMAT_U8U8U8U8
             && base!=SCE_GXM_COLOR_BASE_FORMAT_S8S8S8S8)
         || mode>=std::size(four) || !surface_halfword_target_supported(texture)
+        || (texture==SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5 && texture_swizzle>=8)
         || target.count*target.bytes!=2
         || (pending_commands && pending_commands.status!=MTLCommandBufferStatusNotEnqueued))
         throw std::runtime_error("Metal: invalid RGBA8 halfword cast");
@@ -2909,25 +2929,50 @@ id<MTLTexture> SurfaceCaster::halfword_texture_from_rgba8(id<MTLTexture> source,
     }
     auto bytes=[source newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Uint];
     if (!bytes) throw std::runtime_error("Metal: cannot view RGBA8 surface bytes");
+    if (texture==SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5 && (texture_swizzle&2u))
+        target.native=MTLPixelFormatA1BGR5Unorm;
     auto desc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:target.native
         width:source.width*2 height:source.height mipmapped:NO];
     desc.storageMode=MTLStorageModeShared;
-    desc.usage=MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite|MTLTextureUsagePixelFormatView;
+    desc.usage=MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView
+        | (packed ? 0 : MTLTextureUsageShaderWrite);
     auto result=[device.native_device() newTextureWithDescriptor:desc];
     if (!result) throw std::runtime_error("Metal: cannot allocate RGBA8 halfword alias");
-    auto raw=[result newTextureViewWithPixelFormat:sample_bits_format(target.native)];
-    if (!raw) throw std::runtime_error("Metal: cannot view RGBA8 halfword destination bits");
-    const uint32_t component_bytes=target.bytes;
     auto commands=pending_commands ? pending_commands : surface_command_buffer(device,@"Vita3K RGBA8 halfword cast");
-    auto encoder=[commands computeCommandEncoder];
-    [encoder setComputePipelineState:byte_halfword_pipeline];
-    [encoder setTexture:bytes atIndex:0];
-    [encoder setTexture:raw atIndex:1];
-    [encoder setBytes:memory_channels length:sizeof(memory_channels) atIndex:0];
-    [encoder setBytes:&component_bytes length:sizeof(component_bytes) atIndex:1];
-    [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1)
-        threadsPerThreadgroup:MTLSizeMake(8,8,1)];
-    [encoder endEncoding];
+    if (packed) {
+        const NSUInteger row_bytes=(result.width*2+255)&~NSUInteger(255);
+        const NSUInteger total_bytes=row_bytes*result.height;
+        auto buffer=[device.native_device() newBufferWithLength:total_bytes options:MTLResourceStorageModeShared];
+        if (!buffer) throw std::runtime_error("Metal: cannot allocate packed halfword buffer");
+        const uint32_t layout[]={uint32_t(result.width),uint32_t(result.height),uint32_t(row_bytes/2)};
+        auto encoder=[commands computeCommandEncoder];
+        [encoder setComputePipelineState:byte_halfword_buffer_pipeline];
+        [encoder setTexture:bytes atIndex:0];
+        [encoder setBuffer:buffer offset:0 atIndex:0];
+        [encoder setBytes:memory_channels length:sizeof(memory_channels) atIndex:1];
+        [encoder setBytes:layout length:sizeof(layout) atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1)
+            threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+        [encoder endEncoding];
+        auto blit=[commands blitCommandEncoder];
+        [blit copyFromBuffer:buffer sourceOffset:0 sourceBytesPerRow:row_bytes
+            sourceBytesPerImage:total_bytes sourceSize:MTLSizeMake(result.width,result.height,1)
+            toTexture:result destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+        [blit endEncoding];
+    } else {
+        auto raw=[result newTextureViewWithPixelFormat:sample_bits_format(target.native)];
+        if (!raw) throw std::runtime_error("Metal: cannot view RGBA8 halfword destination bits");
+        const uint32_t component_bytes=target.bytes;
+        auto encoder=[commands computeCommandEncoder];
+        [encoder setComputePipelineState:byte_halfword_pipeline];
+        [encoder setTexture:bytes atIndex:0];
+        [encoder setTexture:raw atIndex:1];
+        [encoder setBytes:memory_channels length:sizeof(memory_channels) atIndex:0];
+        [encoder setBytes:&component_bytes length:sizeof(component_bytes) atIndex:1];
+        [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1)
+            threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+        [encoder endEncoding];
+    }
     if (!pending_commands) {
         std::string error;
         if (!device.submit_and_wait(commands,error)) throw std::runtime_error(error);

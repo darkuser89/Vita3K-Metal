@@ -5262,7 +5262,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 prepare_inline_commands();
                 if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
                 auto full=impl->caster->halfword_texture_from_rgba8(source,entry.guest.colorFormat,
-                    base,ctx.impl->commands);
+                    base,texture.swizzle_format,ctx.impl->commands);
                 crop=impl->caster->enqueue_subrectangle(full,entry.guest.width*2,
                     entry.guest.height,rect,ctx.impl->commands);
             }
