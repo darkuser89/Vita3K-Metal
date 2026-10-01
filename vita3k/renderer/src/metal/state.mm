@@ -1242,10 +1242,10 @@ void MetalState::unmap_memory(MemState &, Ptr<void> address) {
     // or by a previously submitted internal batch. The guest can release its
     // storage as soon as sceGxmUnmapMemory returns, so retire those accesses
     // before removing the mapping, as Vulkan's device.waitIdle() does.
-    // Unmap is a guest-visible memory-lifetime boundary: even internal
-    // batches without a publication must finish before the guest can reuse
-    // their borrowed pages.
-    if (context) finish(*static_cast<MetalContext *>(context), false, true);
+    // Unmap is a guest-visible memory-lifetime boundary. Publishing the
+    // active surface also waits for every pending internal batch; suppressing
+    // that publication leaves completed color writes out of guest memory.
+    if (context) finish(*static_cast<MetalContext *>(context));
     impl->direct_guest_buffers.clear();
     impl->mapped_memory.unmap(address.address());
 }
