@@ -1633,13 +1633,13 @@ kernel void resolve_raw_f16_samples(texture2d_ms<uint,access::read> input [[text
     texture2d<uint,access::write> output [[texture(2)]], uint2 p [[thread_position_in_grid]]) {
     if (p.x>=output.get_width() || p.y>=output.get_height()) return;
     const uint4 first=input.read(p,0);
-    bool identical=true;
+    uint4 differences=uint4(0);
     for (uint sample=1;sample<input.get_num_samples();++sample)
-        identical=identical && all(input.read(p,sample)==first);
+        differences|=input.read(p,sample)^first;
     // Pixel-frequency GXM shading writes the same raw word to every covered
-    // sample. Preserve it without the float MSAA resolve canonicalizing NaNs.
-    // Mixed coverage keeps Metal's normal resolved color for that pixel.
-    output.write(identical ? first : resolved.read(p),p);
+    // sample. Preserve each channel independently so mixed coverage in another
+    // channel cannot canonicalize an unchanged F16 NaN payload.
+    output.write(select(resolved.read(p),first,differences==uint4(0)),p);
 }
 kernel void expand_depth(depth2d_ms<float,access::read> input [[texture(0)]],
     texture2d<float,access::write> output [[texture(1)]], constant uint2 &guest_size [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
