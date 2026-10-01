@@ -961,6 +961,7 @@ struct MetalState::Impl {
         id<MTLTexture> cube = nil;
     };
     std::map<uintptr_t, CubeAlias> cube_aliases;
+    id<MTLTexture> invalid_cube_fallback = nil;
     std::map<std::pair<Address, Address>, DepthSurface> depth_surfaces;
     std::map<std::string, std::unique_ptr<CompiledProgram>> shaders;
     std::set<std::pair<Sha256Hash, Sha256Hash>> known_shader_pairs;
@@ -4580,9 +4581,13 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 const Address address=texture.data_addr<<2;
                 const size_t bytes=texture_storage_size(texture);
                 const uint64_t end=uint64_t(address)+bytes;
-                require(address && end<=uint64_t(UINT32_MAX)-4095
-                    && is_valid_addr_range(mem,address,Address(end)),
-                    "Metal: cube fallback texture extends beyond mapped guest memory");
+                if (!address || end>uint64_t(UINT32_MAX)-4095
+                    || !is_valid_addr_range(mem,address,Address(end))) {
+                    if (!impl->invalid_cube_fallback)
+                        impl->invalid_cube_fallback=sampled_placeholder(*impl->device,true);
+                    prepared_images[index]=impl->invalid_cube_fallback;
+                    continue;
+                }
                 bool raw_cast_requested=false;
                 for (auto &[base,surface]:impl->surfaces) {
                     const size_t size=surface_memory_size(surface.guest);
@@ -4684,14 +4689,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             const uint64_t end=uint64_t(address)+storage;
             if (!address || end>uint64_t(UINT32_MAX)-4095
                 || !is_valid_addr_range(mem,address,Address(end))) {
-                if (source!=impl->surfaces.end()) {
-                    const auto &s=source->second.guest;
-                    LOG_ERROR("Metal invalid texture source: address={:#x}, size={}x{}, stride={}, format={:#x}, type={}",
-                        s.data.address(),s.width,s.height,s.strideInPixels,uint32_t(s.colorFormat),uint32_t(s.surfaceType));
-                }
-                throw std::runtime_error(fmt::format("Metal: texture subresources extend beyond mapped guest memory: address={:#x}, bytes={}, type={:#x}, format={:#x}, size={}x{}, mips={}, cube={}, stage={}, slot={}",
-                    address,storage,uint32_t(upload.texture_type()),uint32_t(gxm::get_format(upload)),
-                    gxm::get_width(upload),gxm::get_height(upload),uint32_t(upload.true_mip_count()),cube,vertex?"vertex":"fragment",slot));
+                texture_cache.cache_and_bind_image(upload,mem);
+                prepared_images[index]=current_texture_view(texture_cache,gxm::get_format(texture));
+                continue;
             }
             std::vector<Surface *> overlaps;
             for (auto &[base,surface]:impl->surfaces) {
@@ -6157,13 +6157,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     const bool cube = ((vertex ? vs.cube_texture_mask : fs.cube_texture_mask) & (1u<<slot)) != 0;
                     if (cube) {
                         upload = cube_texture_descriptor(texture);
-                        const size_t bytes = cube_texture_storage_size(upload);
-                        const uint64_t end = uint64_t(texture_address)+bytes;
-                        require(texture_address && end<=uint64_t(UINT32_MAX)-4095
-                            && is_valid_addr_range(mem,texture_address,Address(end)),"Metal: texture subresources extend beyond mapped guest memory");
                         if (upload.texture_type()!=texture.texture_type())
-                            LOG_INFO_ONCE("Metal: cube sampler resolves six swizzled faces at {:#x}, mip_count={}, storage_bytes={}",
-                                texture_address,uint32_t(texture.mip_count),bytes);
+                            LOG_INFO_ONCE("Metal: cube sampler resolves six swizzled faces at {:#x}, mip_count={}",
+                                texture_address,uint32_t(texture.mip_count));
                     }
                     texture_cache.cache_and_bind_image(upload, mem);
                     native = current_texture_view(texture_cache, gxm::get_format(texture));
