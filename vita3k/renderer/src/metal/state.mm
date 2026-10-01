@@ -414,10 +414,27 @@ static SurfacePublication read_surface_publication(const Surface &entry, const S
                 std::min<uint32_t>(area.y1 * entry.publication_samples_y, source.height)};
         }
         if (!caster) caster = std::make_unique<SurfaceCaster>(device);
+        std::optional<PublicationClip> publication_clip;
+        if (surface.clip_enabled && entry.publication_samples_x == 1 && entry.publication_samples_y == 1
+            && source.textureType == MTLTextureType2D && source.sampleCount == 1) {
+            const uint32_t x0 = std::min(uint32_t(surface.clip_x_min), surface.width);
+            const uint32_t y0 = std::min(uint32_t(surface.clip_y_min), surface.height);
+            const uint32_t x1 = std::min(uint32_t(surface.clip_x_max) + 1, surface.width);
+            const uint32_t y1 = std::min(uint32_t(surface.clip_y_max) + 1, surface.height);
+            const auto edge = [&](uint32_t coordinate, NSUInteger limit) {
+                return uint32_t(std::clamp(std::floor(double(coordinate) * entry.render_scale), 0.0, double(limit)));
+            };
+            const uint32_t sx0 = edge(x0, source.width), sy0 = edge(y0, source.height);
+            const uint32_t sx1 = edge(x1, source.width), sy1 = edge(y1, source.height);
+            if (x0 < x1 && y0 < y1 && sx0 < sx1 && sy0 < sy1)
+                publication_clip = {{x0, y0, x1 - x0, y1 - y0},
+                    {sx0, sy0, sx1 - sx0, sy1 - sy0}};
+        }
         source = caster->resample_publication(source, surface.width, surface.height,
             {input.x0,input.y0,input.x1-input.x0,input.y1-input.y0},
             {bounds.x0,bounds.y0,bounds.x1-bounds.x0,bounds.y1-bounds.y0},
-            raw || base == SCE_GXM_COLOR_BASE_FORMAT_F32 || base == SCE_GXM_COLOR_BASE_FORMAT_F32F32);
+            raw || base == SCE_GXM_COLOR_BASE_FORMAT_F32 || base == SCE_GXM_COLOR_BASE_FORMAT_F32F32,
+            nil, publication_clip ? &*publication_clip : nullptr);
     }
     if (bounds.x0 == 0 && bounds.y0 == 0 && bounds.x1 == surface.width && bounds.y1 == surface.height)
         return read_surface_memory(source, surface, output) ? SurfacePublication::Published : SurfacePublication::Unavailable;

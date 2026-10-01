@@ -53,6 +53,7 @@ struct CubeSurface {
     uint32_t face, mip;
 };
 struct SurfaceRect { uint32_t x, y, width, height; };
+struct PublicationClip { SurfaceRect guest, source; };
 struct SurfaceMemoryRange { size_t offset, size; };
 std::optional<SurfaceRect> surface_subrectangle(const SceGxmColorSurface &, const SceGxmTexture &);
 bool surface_texture_layout_overlap(const SceGxmColorSurface &, const SceGxmTexture &);
@@ -241,7 +242,8 @@ public:
     // Only destination_rect is initialized. With a command buffer, queue the
     // blit after its producers; otherwise submit and wait for guest publication.
     id<MTLTexture> resample_publication(id<MTLTexture> source, uint32_t width, uint32_t height,
-        SurfaceRect source_rect, SurfaceRect destination_rect, bool raw_words, id<MTLCommandBuffer> commands = nil);
+        SurfaceRect source_rect, SurfaceRect destination_rect, bool raw_words, id<MTLCommandBuffer> commands = nil,
+        const PublicationClip *clip = nullptr);
     id<MTLTexture> enqueue_subrectangle(id<MTLTexture> source, uint32_t width, uint32_t height,
         SurfaceRect, id<MTLCommandBuffer> commands);
     id<MTLTexture> color_subrectangle(id<MTLTexture> source, const SceGxmColorSurface &, SurfaceRect);

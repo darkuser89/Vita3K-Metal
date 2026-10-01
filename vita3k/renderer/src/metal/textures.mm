@@ -1907,6 +1907,21 @@ fragment float4 publication_linear(float4 position [[position]],
     const float2 size = float2(source.get_width(),source.get_height());
     return source.sample(linear_sampler,publication_coordinate(position.xy,region)/size,level(0));
 }
+fragment float4 publication_clipped(float4 position [[position]],
+    texture2d<float> source [[texture(0)]], constant PublicationBlit &region [[buffer(0)]],
+    constant float4 &guest_clip [[buffer(1)]], constant float4 &source_clip [[buffer(2)]]) {
+    constexpr sampler linear_sampler(coord::normalized, address::clamp_to_edge, filter::linear);
+    float2 coordinate = publication_coordinate(position.xy,region);
+    // The render target was restored outside the clip before this resample.
+    // Keep the bilinear footprint on the same side of each restored edge.
+    if (position.x < guest_clip.x) coordinate.x = min(coordinate.x,source_clip.x-0.5f);
+    else if (position.x >= guest_clip.z) coordinate.x = max(coordinate.x,source_clip.z+0.5f);
+    else coordinate.x = clamp(coordinate.x,source_clip.x+0.5f,source_clip.z-0.5f);
+    if (position.y < guest_clip.y) coordinate.y = min(coordinate.y,source_clip.y-0.5f);
+    else if (position.y >= guest_clip.w) coordinate.y = max(coordinate.y,source_clip.w+0.5f);
+    else coordinate.y = clamp(coordinate.y,source_clip.y+0.5f,source_clip.w-0.5f);
+    return source.sample(linear_sampler,coordinate/float2(source.get_width(),source.get_height()),level(0));
+}
 fragment uint4 publication_words(float4 position [[position]],
     texture2d<uint,access::read> source [[texture(0)]], constant PublicationBlit &region [[buffer(0)]]) {
     const uint2 maximum = uint2(source.get_width()-1,source.get_height()-1);
@@ -2283,7 +2298,8 @@ id<MTLTexture> SurfaceCaster::color_subrectangle(id<MTLTexture> source, const Sc
     return snapshot_subrectangle(source,surface.width,surface.height,rect);
 }
 id<MTLTexture> SurfaceCaster::resample_publication(id<MTLTexture> source, uint32_t width, uint32_t height,
-    SurfaceRect source_rect, SurfaceRect destination_rect, bool raw_words, id<MTLCommandBuffer> pending_commands) {
+    SurfaceRect source_rect, SurfaceRect destination_rect, bool raw_words, id<MTLCommandBuffer> pending_commands,
+    const PublicationClip *clip) {
     if (!source || source.textureType != MTLTextureType2D || source.sampleCount != 1
         || !source.width || !source.height || !width || !height
         || (pending_commands && pending_commands.status != MTLCommandBufferStatusNotEnqueued)
@@ -2308,12 +2324,14 @@ id<MTLTexture> SurfaceCaster::resample_publication(id<MTLTexture> source, uint32
         output = [result newTextureViewWithPixelFormat:bits];
         if (!source || !output) throw std::runtime_error("Metal: cannot view publication storage bits");
     }
-    auto &pipeline = publication_pipelines[uint32_t(output.pixelFormat)];
+    const bool clipped = clip && !raw_words;
+    auto &pipeline = publication_pipelines[uint32_t(output.pixelFormat)*2 + clipped];
     std::string error;
     if (!pipeline) {
         auto descriptor = [MTLRenderPipelineDescriptor new];
         descriptor.vertexFunction = [multisample_library newFunctionWithName:@"publication_vs"];
-        descriptor.fragmentFunction = [multisample_library newFunctionWithName:raw_words ? @"publication_words" : @"publication_linear"];
+        descriptor.fragmentFunction = [multisample_library newFunctionWithName:raw_words ? @"publication_words"
+            : clipped ? @"publication_clipped" : @"publication_linear"];
         descriptor.colorAttachments[0].pixelFormat = output.pixelFormat;
         pipeline = device.create_pipeline(descriptor,error);
         if (!pipeline) throw std::runtime_error(error);
@@ -2334,6 +2352,14 @@ id<MTLTexture> SurfaceCaster::resample_publication(id<MTLTexture> source, uint32
     [encoder setScissorRect:MTLScissorRect{destination_rect.x,destination_rect.y,destination_rect.width,destination_rect.height}];
     [encoder setFragmentTexture:source atIndex:0];
     [encoder setFragmentBytes:region length:sizeof(region) atIndex:0];
+    if (clipped) {
+        const float guest_clip[] = {float(clip->guest.x),float(clip->guest.y),
+            float(clip->guest.x+clip->guest.width),float(clip->guest.y+clip->guest.height)};
+        const float source_clip[] = {float(clip->source.x),float(clip->source.y),
+            float(clip->source.x+clip->source.width),float(clip->source.y+clip->source.height)};
+        [encoder setFragmentBytes:guest_clip length:sizeof(guest_clip) atIndex:1];
+        [encoder setFragmentBytes:source_clip length:sizeof(source_clip) atIndex:2];
+    }
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [encoder endEncoding];
     if (!pending_commands && !device.submit_and_wait(commands,error)) throw std::runtime_error(error);
