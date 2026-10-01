@@ -138,7 +138,7 @@ class SurfaceCaster {
     id<MTLComputePipelineState> packed_depth_store_pipeline, packed_depth_store_ms_pipeline;
     id<MTLComputePipelineState> mask_store_pipeline, mask_store_ms_pipeline;
     id<MTLBuffer> depth_store_buffer, mask_store_buffer;
-    id<MTLComputePipelineState> pipeline;
+    id<MTLComputePipelineState> pipeline, halfword_unpack_pipeline;
     id<MTLComputePipelineState> cube_pipeline, component_cast_pipeline;
     id<MTLComputePipelineState> depth_pipeline, stencil_pipeline, stencil_ms_pipeline, rg_gamma_pipeline;
     id<MTLComputePipelineState> scaled_snapshot_pipeline;
@@ -178,6 +178,10 @@ public:
         uint32_t word_offset = 0, bool signed_normalized = false,
         uint32_t guest_width = 0, uint32_t guest_height = 0,
         id<MTLCommandBuffer> pending_commands = nil, bool separate_word = false);
+    id<MTLTexture> rgba8_from_rgba16(id<MTLTexture> source, SceGxmColorFormat color,
+        uint32_t word_offset, bool signed_normalized, uint32_t guest_width = 0,
+        uint32_t guest_height = 0, id<MTLCommandBuffer> pending_commands = nil,
+        bool separate_word = false);
     bool load_depth_memory(id<MTLTexture>, const SceGxmDepthStencilSurface &, const DepthMemoryLayout &, float scale,
         std::span<const uint8_t> depth, std::span<const uint8_t> stencil,
         id<MTLCommandBuffer> commands = nil);

@@ -1537,6 +1537,26 @@ kernel void unpack_words(texture2d<uint, access::read> input [[texture(0)]],
     const uint word = y < input.get_height() ? input.read(uint2(x,y))[component] : 0;
     output.write(uint4(word&255, (word>>8)&255, (word>>16)&255, word>>24),p);
 }
+kernel void unpack_halfwords(texture2d<uint, access::read> input [[texture(0)]],
+    texture2d<uint, access::write> output [[texture(1)]], constant uint4 &config [[buffer(0)]],
+    constant uint4 &memory_channels [[buffer(1)]], uint2 p [[thread_position_in_grid]]) {
+    if (p.x >= output.get_width() || p.y >= output.get_height()) return;
+    const uint row_words = output.get_width();
+    const bool separate_word = config.y != 0;
+    const uint address = p.y*row_words + p.x + (separate_word ? 0u : config.z);
+    const uint guest_x = (address%row_words)/2;
+    const uint guest_y = address/row_words;
+    const uint x = config.x ? guest_x*input.get_width()/config.x : guest_x;
+    const uint y = config.w ? guest_y*input.get_height()/config.w : guest_y;
+    const uint half = (separate_word ? config.z : address%2)*2;
+    uint word = 0;
+    if (x < input.get_width() && y < input.get_height()) {
+        const uint4 channels = input.read(uint2(x,y));
+        word = (channels[memory_channels[half]] & 65535u)
+            | ((channels[memory_channels[half+1]] & 65535u) << 16);
+    }
+    output.write(uint4(word&255u, (word>>8)&255u, (word>>16)&255u, word>>24),p);
+}
 kernel void repack_components(texture2d<uint,access::read> input [[texture(0)]],
     texture2d<uint,access::write> output [[texture(1)]], constant uint4 &config [[buffer(0)]],
     constant uint4 &mapping [[buffer(1)]], uint2 p [[thread_position_in_grid]]) {
@@ -1950,6 +1970,7 @@ fragment uint4 publication_words(float4 position [[position]],
     if (!library) throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal: surface cast shader failed");
     pipeline = cached_compute(device, library, @"unpack_words");
     if (!pipeline) throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal: surface cast pipeline failed");
+    halfword_unpack_pipeline = cached_compute(device, library, @"unpack_halfwords");
     depth_pipeline = cached_compute(device, library, @"copy_depth");
     if (!depth_pipeline) throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal: depth copy pipeline failed");
     scaled_snapshot_pipeline = cached_compute(device, library, @"scale_snapshot_words");
@@ -2436,6 +2457,50 @@ id<MTLTexture> SurfaceCaster::rgba8_from_rg32(id<MTLTexture> source, bool swap_w
     [encoder setTexture:bytes atIndex:1];
     const uint32_t config[] = {guest_width, uint32_t(swap_words) | (separate_word ? 2u : 0u), word_offset, guest_height};
     [encoder setBytes:config length:sizeof(config) atIndex:0];
+    [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+    [encoder endEncoding];
+    if (!pending_commands) {
+        std::string error;
+        if (!device.submit_and_wait(commands,error)) throw std::runtime_error(error);
+    }
+    return result;
+}
+id<MTLTexture> SurfaceCaster::rgba8_from_rgba16(id<MTLTexture> source, SceGxmColorFormat color,
+    uint32_t word_offset, bool signed_normalized, uint32_t guest_width, uint32_t guest_height,
+    id<MTLCommandBuffer> pending_commands, bool separate_word) {
+    if (!source.width || !source.height || (source.pixelFormat != MTLPixelFormatRGBA16Float
+        && source.pixelFormat != MTLPixelFormatRGBA16Uint) || word_offset > 1
+        || gxm::get_base_format(color) != SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16
+        || bool(guest_width) != bool(guest_height)
+        || (pending_commands && pending_commands.status != MTLCommandBufferStatusNotEnqueued))
+        throw std::runtime_error("Metal: invalid RGBA16 surface word cast");
+    const auto mapping = surface_memory_mapping(color);
+    uint32_t memory_channels[4];
+    for (uint32_t channel = 0; channel < 4; ++channel) {
+        const auto found = std::find(identity.begin(), identity.end(), mapping[channel]);
+        if (found == identity.end()) throw std::runtime_error("Metal: invalid RGBA16 guest channel mapping");
+        memory_channels[channel] = uint32_t(found - identity.begin());
+    }
+    auto words = [source newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Uint];
+    if (!words) throw std::runtime_error("Metal: cannot view RGBA16 surface halfwords");
+    auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+        signed_normalized ? MTLPixelFormatRGBA8Snorm : MTLPixelFormatRGBA8Unorm
+        width:(guest_width ? guest_width : source.width)*2
+        height:guest_height ? guest_height : source.height mipmapped:NO];
+    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+    desc.storageMode = MTLStorageModeShared;
+    auto result = [device.native_device() newTextureWithDescriptor:desc];
+    if (!result) throw std::runtime_error("Metal: cannot allocate RGBA16 word alias");
+    auto bytes = [result newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Uint];
+    if (!bytes) throw std::runtime_error("Metal: cannot write RGBA16 word alias bytes");
+    auto commands = pending_commands ? pending_commands : surface_command_buffer(device, @"Vita3K surface RGBA16 word cast");
+    auto encoder = [commands computeCommandEncoder];
+    [encoder setComputePipelineState:halfword_unpack_pipeline];
+    [encoder setTexture:words atIndex:0];
+    [encoder setTexture:bytes atIndex:1];
+    const uint32_t config[] = {guest_width, uint32_t(separate_word), word_offset, guest_height};
+    [encoder setBytes:config length:sizeof(config) atIndex:0];
+    [encoder setBytes:memory_channels length:sizeof(memory_channels) atIndex:1];
     [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
     [encoder endEncoding];
     if (!pending_commands) {
