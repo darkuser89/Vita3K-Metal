@@ -2598,18 +2598,25 @@ bool MetalState::transfer_image(MemState &mem, const SceGxmTransferImage &source
     struct Update { Surface *surface; size_t bytes; };
     std::vector<Snapshot> snapshots;
     std::vector<Update> updates;
-    const auto conflicts_with_snapshot = [&](uint64_t address,
-                                             std::span<const SurfaceMemoryRange> claimed) {
-        for (const auto &range : claimed) {
-            const uint64_t first_address = address + range.offset;
+    const auto conflicts_with_snapshot = [&](const Snapshot &candidate) {
+        for (const auto &range : candidate.claimed) {
+            const uint64_t first_address = candidate.address + range.offset;
             const uint64_t last_address = first_address + range.size;
             for (const auto &other : snapshots) {
                 for (const auto &other_range : other.claimed) {
                     const uint64_t other_first = other.address + other_range.offset;
                     const uint64_t first = std::max(first_address, other_first);
                     const uint64_t last = std::min(last_address, other_first + other_range.size);
-                    if (first < last && !surface_intersections(first, last - first, reads).empty())
-                        return true;
+                    if (first >= last) continue;
+                    // Both views may be valid despite overlapping ownership.
+                    // Equal bytes are independent of which draw wrote last;
+                    // differing bytes still require write-order provenance.
+                    for (const auto &read : surface_intersections(first, last - first, reads)) {
+                        const uint64_t at = first + read.offset;
+                        if (std::memcmp(candidate.data.data() + at - candidate.address,
+                                other.data.data() + at - other.address, read.size) != 0)
+                            return true;
+                    }
                 }
             }
         }
@@ -2647,7 +2654,7 @@ bool MetalState::transfer_image(MemState &mem, const SceGxmTransferImage &source
             // only when their published bytes do not compete with that range.
             snapshot.claimed = publication == SurfacePublication::CpuNewer
                 ? surface_intersections(address,size,reads) : snapshot.published;
-            if (conflicts_with_snapshot(address,snapshot.claimed)) return false;
+            if (conflicts_with_snapshot(snapshot)) return false;
             snapshots.push_back(std::move(snapshot));
         }
     }
@@ -2655,9 +2662,10 @@ bool MetalState::transfer_image(MemState &mem, const SceGxmTransferImage &source
     if (!prepare_depth_transfers(*this,mem,reads,destinations,depth_transfers)) return false;
     const auto add_depth_snapshot=[&](uint64_t address,std::vector<uint8_t> &data) {
         const std::array published{SurfaceMemoryRange{0,data.size()}};
-        if (conflicts_with_snapshot(address,published)) return false;
-        snapshots.push_back({address,std::move(data),{published.begin(),published.end()},
-            {published.begin(),published.end()}});
+        Snapshot snapshot{address,std::move(data),{published.begin(),published.end()},
+            {published.begin(),published.end()}};
+        if (conflicts_with_snapshot(snapshot)) return false;
+        snapshots.push_back(std::move(snapshot));
         return true;
     };
     for (auto &transfer:depth_transfers) {
