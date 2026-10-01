@@ -1446,6 +1446,21 @@ bool surface_format_cast_supported(SceGxmColorFormat color, SceGxmTextureBaseFor
     } catch (const std::runtime_error &) { return false; }
     return true;
 }
+bool surface_word_target_supported(SceGxmTextureBaseFormat texture) {
+    switch (texture) {
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U16U16:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_S16S16:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_F16F16:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_U32:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_S32:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_F32:
+        return true;
+    default:
+        return false;
+    }
+}
 bool surface_format_cast_enqueueable(SceGxmColorFormat color, SceGxmTextureBaseFormat texture,
     uint32_t texture_swizzle) {
     return !packed_color_cast_source(gxm::get_base_format(color))
@@ -1492,7 +1507,7 @@ static MTLPixelFormat sample_bits_format(MTLPixelFormat format) {
     case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Snorm: case MTLPixelFormatR16Float: return MTLPixelFormatR16Uint;
     case MTLPixelFormatRG16Unorm: case MTLPixelFormatRG16Snorm: case MTLPixelFormatRG16Float: return MTLPixelFormatRG16Uint;
     case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Snorm: case MTLPixelFormatRGBA16Float: return MTLPixelFormatRGBA16Uint;
-    case MTLPixelFormatR32Float: return MTLPixelFormatR32Uint;
+    case MTLPixelFormatR32Float: case MTLPixelFormatR32Sint: case MTLPixelFormatR32Uint: return MTLPixelFormatR32Uint;
     case MTLPixelFormatRG32Float: case MTLPixelFormatRG32Uint: return MTLPixelFormatRG32Uint;
     case MTLPixelFormatRGBA32Float: return MTLPixelFormatRGBA32Uint;
     // Packed attachments must keep their storage words through MSAA seed,
@@ -1542,7 +1557,8 @@ kernel void unpack_halfwords(texture2d<uint, access::read> input [[texture(0)]],
     constant uint4 &memory_channels [[buffer(1)]], uint2 p [[thread_position_in_grid]]) {
     if (p.x >= output.get_width() || p.y >= output.get_height()) return;
     const uint row_words = output.get_width();
-    const bool separate_word = config.y != 0;
+    const bool separate_word = (config.y & 1u) != 0;
+    const uint component_bytes = config.y >> 1;
     const uint address = p.y*row_words + p.x + (separate_word ? 0u : config.z);
     const uint guest_x = (address%row_words)/2;
     const uint guest_y = address/row_words;
@@ -1555,7 +1571,10 @@ kernel void unpack_halfwords(texture2d<uint, access::read> input [[texture(0)]],
         word = (channels[memory_channels[half]] & 65535u)
             | ((channels[memory_channels[half+1]] & 65535u) << 16);
     }
-    output.write(uint4(word&255u, (word>>8)&255u, (word>>16)&255u, word>>24),p);
+    const uint4 components = component_bytes == 4 ? uint4(word,0u,0u,0u)
+        : component_bytes == 2 ? uint4(word&65535u,word>>16,0u,0u)
+        : uint4(word&255u,(word>>8)&255u,(word>>16)&255u,word>>24);
+    output.write(components,p);
 }
 kernel void repack_components(texture2d<uint,access::read> input [[texture(0)]],
     texture2d<uint,access::write> output [[texture(1)]], constant uint4 &config [[buffer(0)]],
@@ -2465,12 +2484,14 @@ id<MTLTexture> SurfaceCaster::rgba8_from_rg32(id<MTLTexture> source, bool swap_w
     }
     return result;
 }
-id<MTLTexture> SurfaceCaster::rgba8_from_rgba16(id<MTLTexture> source, SceGxmColorFormat color,
-    uint32_t word_offset, bool signed_normalized, uint32_t guest_width, uint32_t guest_height,
+id<MTLTexture> SurfaceCaster::word_texture_from_rgba16(id<MTLTexture> source, SceGxmColorFormat color,
+    SceGxmTextureBaseFormat texture, uint32_t word_offset, uint32_t guest_width, uint32_t guest_height,
     id<MTLCommandBuffer> pending_commands, bool separate_word) {
+    const auto target=texture_components(texture);
     if (!source.width || !source.height || (source.pixelFormat != MTLPixelFormatRGBA16Float
         && source.pixelFormat != MTLPixelFormatRGBA16Uint) || word_offset > 1
         || gxm::get_base_format(color) != SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16
+        || !surface_word_target_supported(texture) || target.count*target.bytes != 4
         || bool(guest_width) != bool(guest_height)
         || (pending_commands && pending_commands.status != MTLCommandBufferStatusNotEnqueued))
         throw std::runtime_error("Metal: invalid RGBA16 surface word cast");
@@ -2483,22 +2504,21 @@ id<MTLTexture> SurfaceCaster::rgba8_from_rgba16(id<MTLTexture> source, SceGxmCol
     }
     auto words = [source newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Uint];
     if (!words) throw std::runtime_error("Metal: cannot view RGBA16 surface halfwords");
-    auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
-        signed_normalized ? MTLPixelFormatRGBA8Snorm : MTLPixelFormatRGBA8Unorm
+    auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:target.native
         width:(guest_width ? guest_width : source.width)*2
         height:guest_height ? guest_height : source.height mipmapped:NO];
     desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
     desc.storageMode = MTLStorageModeShared;
     auto result = [device.native_device() newTextureWithDescriptor:desc];
     if (!result) throw std::runtime_error("Metal: cannot allocate RGBA16 word alias");
-    auto bytes = [result newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Uint];
+    auto bytes = [result newTextureViewWithPixelFormat:sample_bits_format(target.native)];
     if (!bytes) throw std::runtime_error("Metal: cannot write RGBA16 word alias bytes");
     auto commands = pending_commands ? pending_commands : surface_command_buffer(device, @"Vita3K surface RGBA16 word cast");
     auto encoder = [commands computeCommandEncoder];
     [encoder setComputePipelineState:halfword_unpack_pipeline];
     [encoder setTexture:words atIndex:0];
     [encoder setTexture:bytes atIndex:1];
-    const uint32_t config[] = {guest_width, uint32_t(separate_word), word_offset, guest_height};
+    const uint32_t config[] = {guest_width, uint32_t(separate_word) | (target.bytes << 1), word_offset, guest_height};
     [encoder setBytes:config length:sizeof(config) atIndex:0];
     [encoder setBytes:memory_channels length:sizeof(memory_channels) atIndex:1];
     [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];

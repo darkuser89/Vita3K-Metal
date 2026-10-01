@@ -291,6 +291,7 @@ struct Surface {
     bool multisample_dirty = true;
     float multisample_scale = 1;
     std::map<std::array<uint32_t, 3>, id<MTLTexture>> rgba8_casts;
+    std::map<std::array<uint32_t, 3>, id<MTLTexture>> word_casts;
     bool has_word_offset_view = false;
     std::map<std::array<uint32_t,4>,id<MTLTexture>> subrectangles;
     SceGxmColorSurface guest{};
@@ -2321,7 +2322,7 @@ bool MetalState::transfer_fill(MemState &mem, const SceGxmTransferImage &image, 
         update_cpu_snapshot(surface,
             {static_cast<const uint8_t *>(surface.guest.data.get(mem)),update.bytes},update.ranges);
         ++surface.revision;
-        surface.rgba8_casts.clear(); surface.subrectangles.clear();
+        surface.rgba8_casts.clear(); surface.word_casts.clear(); surface.subrectangles.clear();
         if (surface.multisample_color && !surface.multisample_dirty) {
             if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
             require(impl->caster->patch_multisample(surface.multisample_color,surface.guest,surface.multisample_scale,
@@ -2794,7 +2795,7 @@ bool MetalState::transfer_image(MemState &mem, const SceGxmTransferImage &source
         update_cpu_snapshot(surface,
             {static_cast<const uint8_t *>(surface.guest.data.get(mem)),update.bytes},ranges);
         ++surface.revision;
-        surface.rgba8_casts.clear(); surface.subrectangles.clear();
+        surface.rgba8_casts.clear(); surface.word_casts.clear(); surface.subrectangles.clear();
         if (surface.multisample_color && !surface.multisample_dirty) {
             if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
             require(impl->caster->patch_multisample(surface.multisample_color,surface.guest,surface.multisample_scale,
@@ -2892,7 +2893,7 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                 entry.rendered_width = entry.rendered_height = 0;
             }
             ++entry.revision;
-            entry.rgba8_casts.clear(); entry.subrectangles.clear();
+            entry.rgba8_casts.clear(); entry.word_casts.clear(); entry.subrectangles.clear();
             auto format = color_format(surface.colorFormat, impl->device->native_device());
             if (surface.gamma) {
                 // Vulkan uses an sRGB view only for RGBA8. For other render
@@ -4450,6 +4451,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 ? gxm::get_stride_in_bytes(texture)
                 : uint64_t(align(gxm::get_width(texture),8))*4;
             return guest.surfaceType==SCE_GXM_COLOR_SURFACE_LINEAR
+                && surface_word_target_supported(gxm::get_base_format(gxm::get_format(texture)))
                 && gxm::get_base_format(guest.colorFormat)==SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16
                 && surface.color.pixelFormat==MTLPixelFormatRGBA16Float
                 && (texture_address==guest.data.address()
@@ -4477,15 +4479,17 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     gxm::get_height(texture)) > 1) continue;
             const auto base = gxm::get_base_format(gxm::get_format(texture));
             const Address address = texture.data_addr << 2;
-            if (address < 4 || (base != SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
-                    && base != SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)) continue;
+            if (address < 4 || !surface_word_target_supported(base)) continue;
             const auto source = find_texture_surface(address - 4);
             if (source != impl->surfaces.end()
-                && (rg32_linear_alias(source->second, texture, address)
+                && (((base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
+                        || base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)
+                        && rg32_linear_alias(source->second, texture, address))
                     || rgba16_linear_alias(source->second, texture, address))
                 && !source->second.has_word_offset_view) {
                 source->second.has_word_offset_view = true;
                 source->second.rgba8_casts.clear();
+                source->second.word_casts.clear();
             }
         }
         // A mip chain or cube can span several independently rendered surfaces.
@@ -4680,21 +4684,22 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 if (surface_viewports[index]) continue;
             }
             if (source!=impl->surfaces.end() && surface_memory_size(source->second.guest)) {
-                const bool direct_rg32_alias=(texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
-                    || texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)
-                    && (rg32_linear_alias(source->second,texture,texture_address)
-                        || rgba16_linear_alias(source->second,texture,texture_address));
+                const bool direct_word_alias=rgba16_linear_alias(source->second,texture,texture_address)
+                    || ((texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
+                        || texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)
+                        && rg32_linear_alias(source->second,texture,texture_address));
                 // A native surface can only be sampled directly when both
                 // its byte layout and format match the guest texture view.
-                incompatible_alias=!direct_rg32_alias
+                incompatible_alias=!direct_word_alias
                     && !surface_subrectangle(source->second.guest,texture);
             }
-            if (texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
-                || texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8) {
+            if (surface_word_target_supported(texture_base)) {
                 if (source==impl->surfaces.end() && texture_address>=4)
                     source=find_texture_surface(texture_address-4);
                 incompatible_alias|=source!=impl->surfaces.end()
                     && ((source->second.color.pixelFormat==MTLPixelFormatRG32Float
+                            && (texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
+                                || texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)
                             && !rg32_linear_alias(source->second,texture,texture_address))
                         || (source->second.color.pixelFormat==MTLPixelFormatRGBA16Float
                             && gxm::get_base_format(source->second.guest.colorFormat)==SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16
@@ -5016,11 +5021,12 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 const auto &texture=ctx.textures[index];
                 const Address address=texture.data_addr<<2;
                 const auto base=gxm::get_base_format(gxm::get_format(texture));
-                const bool word_alias=(base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
-                        || base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)
-                    && uint64_t(address)==uint64_t(ctx.impl->guest_color.data.address())+4
-                    && (ctx.impl->color.pixelFormat==MTLPixelFormatRG32Float
+                const bool rgba8_alias=base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
+                    || base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8;
+                const bool word_alias=uint64_t(address)==uint64_t(ctx.impl->guest_color.data.address())+4
+                    && ((ctx.impl->color.pixelFormat==MTLPixelFormatRG32Float && rgba8_alias)
                         || (ctx.impl->color.pixelFormat==MTLPixelFormatRGBA16Float
+                            && surface_word_target_supported(base)
                             && gxm::get_base_format(ctx.impl->guest_color.colorFormat)==SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16));
                 if (address==ctx.impl->guest_color.data.address() || word_alias) {
                     needs_feedback=true;
@@ -6107,11 +6113,12 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             // Uncharted's signed normal/gloss alias starts at the second word
             // of its interleaved RG32 color/normal target.
             if (!prepared && surface == impl->surfaces.end() && texture_address >= 4
-                && (texture_base == SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
-                    || texture_base == SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)) {
+                && surface_word_target_supported(texture_base)) {
                 auto previous = find_texture_surface(texture_address - 4);
                 if (previous != impl->surfaces.end()
-                    && (previous->second.color.pixelFormat == MTLPixelFormatRG32Float
+                    && (((texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
+                            || texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)
+                            && previous->second.color.pixelFormat == MTLPixelFormatRG32Float)
                         || rgba16_linear_alias(previous->second,texture,texture_address)))
                     surface = previous;
             }
@@ -6273,21 +6280,18 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 rendered_format = nullptr; // The cast has reconstructed guest memory channel order.
             }
             if (surface != impl->surfaces.end()
-                && (texture_base == SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
-                    || texture_base == SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)
                 && rgba16_linear_alias(surface->second,texture,texture_address)) {
                 auto &entry=surface->second;
                 const uint32_t word_offset=(texture_address-surface->first)/4;
-                const bool signed_normalized=texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8;
                 const bool separate_word=res_multiplier!=1 && entry.has_word_offset_view;
                 const bool guest_grid=vertex && res_multiplier<1 && !separate_word;
-                auto &cast=entry.rgba8_casts[{word_offset,uint32_t(signed_normalized),uint32_t(guest_grid)}];
+                auto &cast=entry.word_casts[{word_offset,uint32_t(texture_base),uint32_t(guest_grid)}];
                 if (!cast) {
                     if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
                     if (native==entry.color) native=raw_surface_color(entry);
                     else if (native==color_feedback && raw_color_feedback) native=raw_color_feedback;
-                    cast=impl->caster->rgba8_from_rgba16(native,entry.guest.colorFormat,
-                        word_offset,signed_normalized,
+                    cast=impl->caster->word_texture_from_rgba16(native,entry.guest.colorFormat,
+                        texture_base,word_offset,
                         guest_grid ? entry.guest.width : 0,guest_grid ? entry.guest.height : 0,
                         nil,separate_word);
                 }
@@ -6302,7 +6306,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 if (vertex) vertex_info.set_viewport_offset(slot,offset);
                 else fragment_info.set_viewport_offset(slot,offset);
                 rendered_format=nullptr;
-                if (texture.gamma_mode) {
+                if (texture.gamma_mode && (texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
+                    || texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)) {
                     if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
                     native=impl->caster->rgba8_surface_sampling(native,
                         SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR,texture.gamma_mode);
@@ -7049,7 +7054,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         }
         if (!record.is_maskupdate && ctx.impl->guest_color.data) {
             auto surface=impl->surfaces.find(ctx.impl->guest_color.data.address());
-            if (surface!=impl->surfaces.end()) { ++surface->second.revision; surface->second.rgba8_casts.clear(); surface->second.subrectangles.clear(); }
+            if (surface!=impl->surfaces.end()) { ++surface->second.revision; surface->second.rgba8_casts.clear(); surface->second.word_casts.clear(); surface->second.subrectangles.clear(); }
         }
         // Keep small draws together to avoid a GPU completion wait every 64
         // draws; the upload-byte cap still bounds retained resources.

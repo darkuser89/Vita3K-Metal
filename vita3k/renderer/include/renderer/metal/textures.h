@@ -178,8 +178,8 @@ public:
         uint32_t word_offset = 0, bool signed_normalized = false,
         uint32_t guest_width = 0, uint32_t guest_height = 0,
         id<MTLCommandBuffer> pending_commands = nil, bool separate_word = false);
-    id<MTLTexture> rgba8_from_rgba16(id<MTLTexture> source, SceGxmColorFormat color,
-        uint32_t word_offset, bool signed_normalized, uint32_t guest_width = 0,
+    id<MTLTexture> word_texture_from_rgba16(id<MTLTexture> source, SceGxmColorFormat color,
+        SceGxmTextureBaseFormat texture, uint32_t word_offset, uint32_t guest_width = 0,
         uint32_t guest_height = 0, id<MTLCommandBuffer> pending_commands = nil,
         bool separate_word = false);
     bool load_depth_memory(id<MTLTexture>, const SceGxmDepthStencilSurface &, const DepthMemoryLayout &, float scale,
@@ -267,6 +267,7 @@ uint32_t effective_sampler_anisotropy(const SceGxmTexture &texture, uint32_t req
 id<MTLSamplerState> make_sampler(Device &device, const SceGxmTexture &texture, uint32_t anisotropy);
 bool surface_format_cast_supported(SceGxmColorFormat, SceGxmTextureBaseFormat,
     uint32_t texture_swizzle = UINT32_MAX);
+bool surface_word_target_supported(SceGxmTextureBaseFormat);
 bool surface_format_cast_enqueueable(SceGxmColorFormat, SceGxmTextureBaseFormat,
     uint32_t texture_swizzle = UINT32_MAX);
 // Plus carries 64-bit float surface aliases through four UNORM16 halves to
