@@ -1086,8 +1086,6 @@ spv::Id load(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunc
     spv::Id type_f32 = b.makeFloatType(32);
 
     if (params.native_metal && (op.is_global || op.bank == RegisterBank::GLOBAL)) {
-        if (shift_offset != 0)
-            throw std::runtime_error("Metal: unsupported global register context");
         const auto global = op.num;
         if (global == GLOBAL_REG_FRONT_FACING && params.native_effective_front_facing_id) {
             // Plus defines g16 as one on the front face. Construct the value
@@ -1109,7 +1107,7 @@ spv::Id load(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunc
                     std::vector<spv::Id>(components, value));
             return apply_modifiers(b, utils, op.flags, value);
         }
-        if ((global == 17 || global == 45) && params.thread_buffer) {
+        if (shift_offset == 0 && (global == 17 || global == 45) && params.thread_buffer) {
             // The USC spill prologue selects (4 * CORENUMBER + PIPENUMBER)
             // from shared hardware scratch storage. Our thread-buffer LDR/STR
             // path uses a private array per invocation and omits that base.
@@ -1118,16 +1116,21 @@ spv::Id load(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunc
             op.bank = RegisterBank::IMMEDIATE;
             op.is_global = false;
             op.num = 0;
-        } else {
-            if (!params.native_global_regs)
-                throw std::runtime_error("Metal: unsupported global register context");
+        } else if (shift_offset == 0 && params.native_global_regs
+                   && (global == 23 || global == 24 || global == 43)) {
             switch (global) {
             case 23: op.num = 0; break;
             case 24: op.num = 1; break;
             case 43: op.num = 2; break;
-            default: throw std::runtime_error("Metal: unsupported SGX global register " + std::to_string(global));
             }
             op.bank = RegisterBank::GLOBAL;
+        } else {
+            // Plus reads an unsupported global as zero. This keeps a rare
+            // hardware register from rejecting the entire Metal shader.
+            LOG_WARN_ONCE("Metal: unsupported SGX global register g{} read as zero", global);
+            op.bank = RegisterBank::IMMEDIATE;
+            op.is_global = false;
+            op.num = 0;
         }
     }
 
