@@ -5153,7 +5153,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             auto &crop=entry.word_rect_casts[{rect.x,rect.y,rect.width,rect.height,
                 uint32_t(base),uint32_t(texture.swizzle_format)}];
             if (!crop) {
-                const bool active=entry.color==ctx.impl->color;
+                const bool active=entry.color==ctx.impl->color && !record.is_maskupdate;
                 if (active) require(color_feedback!=nil,"Metal: missing cropped word feedback snapshot");
                 auto source=active ? (raw_color_feedback ? raw_color_feedback : color_feedback)
                     : raw_surface_color(entry);
