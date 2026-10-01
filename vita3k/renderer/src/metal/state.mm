@@ -16,6 +16,7 @@
 #include <shader/metal_texture.h>
 #include <shader/uniform_block.h>
 #include <gxm/functions.h>
+#include <mem/functions.h>
 #include <config/state.h>
 #include <display/state.h>
 #include <overlay/display_manager.h>
@@ -5654,12 +5655,38 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 require(binding.data && binding.size, "Metal: shader uses an unbound uniform buffer");
                 auto &range = uniform_ranges[stage][block];
                 range = {binding.data, binding.size, false};
+                bool mapped_uniform = false;
                 // GXP LDR/STR can address before or after its declared uniform
                 // registers. Retain the complete containing GXM mapping, while
                 // the shader's base still points at the bound guest address.
                 if (memory_backed_uniform_slot(gxps[stage]->buffer_flags, block)) {
                     const auto mapped = impl->mapped_memory.range(binding.address, binding.size);
                     range = {binding.data - (binding.address - mapped.address), mapped.size, mapped.mapped};
+                    mapped_uniform = mapped.mapped;
+                }
+                if (!mapped_uniform && (program.dynamic_uniform_buffers & (1u << block))) {
+                    // Plus copies at most 16 KiB beyond a dynamically indexed
+                    // uniform. Metal snapshots whole host pages; include only
+                    // guest pages that remain allocated and stop at the next
+                    // color surface, as Plus does for its DoubleBuffer path.
+                    constexpr uint64_t slack_window = 16 * 1024;
+                    uint64_t limit = std::min<uint64_t>(uint64_t(binding.address) + slack_window, UINT32_MAX);
+                    const auto next_surface = impl->surfaces.upper_bound(binding.address);
+                    if (next_surface != impl->surfaces.end())
+                        limit = std::min<uint64_t>(limit, next_surface->first);
+                    if (next_surface != impl->surfaces.begin()) {
+                        const auto previous = std::prev(next_surface);
+                        if (uint64_t(previous->first) + surface_memory_size(previous->second.guest) > binding.address)
+                            limit = binding.address;
+                    }
+                    uint64_t valid_end = uint64_t(binding.address) + binding.size;
+                    while (valid_end < limit) {
+                        const uint64_t candidate = std::min<uint64_t>(limit, ((valid_end / 4096) + 1) * 4096);
+                        if (!is_valid_addr_range(mem, binding.address, Address(candidate)))
+                            break;
+                        valid_end = candidate;
+                    }
+                    range.size = std::max(range.size, size_t(valid_end - binding.address));
                 }
                 // GXM-mapped memory is live GPU-visible memory, as in Vulkan.
                 // Snapshotting its full extent on every draw copies entire

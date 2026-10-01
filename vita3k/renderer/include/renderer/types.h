@@ -207,6 +207,7 @@ struct ShaderProgram {
     UniformBufferSizes uniform_buffer_data_offsets; // Offset of the buffer in 4-bytes unit
     size_t max_total_uniform_buffer_storage;
     uint16_t buffer_count; // max buffer index used by the shader + 1
+    uint32_t dynamic_uniform_buffers = 0; // Metal may need bytes past the declared register span
 
     uint16_t texture_count; // max texture index used by the shader + 1
     TextureInfo textures_used; // textures_used[i] is true if and only if the i-th texture is used by the shader
