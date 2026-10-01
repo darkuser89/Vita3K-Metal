@@ -609,6 +609,36 @@ static void unpack_packed_float(uint32_t word, uint32_t mode, uint16_t *channels
     channels[2] = blue_first ? first : third;
     channels[3] = alpha_half[low_alpha ? word & 3 : word >> 30];
 }
+static uint32_t pack_rgb9e5(const uint16_t *channels) {
+    float rgb[3];
+    for (uint32_t i=0;i<3;++i) {
+        __fp16 half;
+        std::memcpy(&half,channels+i,sizeof(half));
+        const float value=static_cast<float>(half);
+        rgb[i]=std::isnan(value) ? 0.0f : std::clamp(value,0.0f,65408.0f);
+    }
+    const float maximum=std::max({rgb[0],rgb[1],rgb[2]});
+    if (maximum==0.0f) return 0;
+    int exponent=std::max(-16,std::ilogb(maximum))+16;
+    float scale=std::ldexp(1.0f,exponent-24);
+    if (maximum/scale+0.5f>=512.0f && exponent<31) {
+        ++exponent;
+        scale*=2.0f;
+    }
+    const auto mantissa=[scale](float value) {
+        return std::min(511u,uint32_t(value/scale+0.5f));
+    };
+    return mantissa(rgb[0]) | (mantissa(rgb[1])<<9)
+        | (mantissa(rgb[2])<<18) | (uint32_t(exponent)<<27);
+}
+static void unpack_rgb9e5(uint32_t word, uint16_t *channels) {
+    const int exponent=int(word>>27)-24;
+    for (uint32_t i=0;i<3;++i) {
+        const __fp16 half=std::ldexp(float((word>>(i*9))&511),exponent);
+        std::memcpy(channels+i,&half,sizeof(half));
+    }
+    channels[3]=0x3c00; // The guest format has implicit alpha one.
+}
 static std::pair<size_t,size_t> write_native_interval(size_t guest, size_t guest_size,
     size_t native_size, size_t sample_extent) {
     const size_t groups=native_size/sample_extent;
@@ -896,6 +926,58 @@ static bool packed_float_surface_memory(id<MTLTexture> texture, const SceGxmColo
         mipmapLevel:0 withBytes:raw.data() bytesPerRow:stride];
     return true;
 }
+static bool rgb9e5_expanded_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surface,
+    std::span<const uint8_t> source, std::span<uint8_t> destination,
+    std::span<const SurfaceMemoryRange> ranges, bool upload, uint32_t samples_x=1, uint32_t samples_y=1) {
+    const size_t size=surface_memory_size(surface);
+    const uint32_t mode=(uint32_t(surface.colorFormat)&SCE_GXM_COLOR_SWIZZLE_MASK)>>20;
+    if (!size || (upload ? source.size() : destination.size())<size || !texture || mode>=2
+        || texture.pixelFormat!=MTLPixelFormatRGBA16Float
+        || texture.textureType!=MTLTextureType2D || texture.storageMode!=MTLStorageModeShared
+        || !texture.width || !texture.height || texture.width%samples_x || texture.height%samples_y) return false;
+    size_t previous_end=0;
+    for (const auto &range:ranges) {
+        if (!range.size || range.offset<previous_end || range.offset>size || range.size>size-range.offset)
+            return false;
+        previous_end=range.offset+range.size;
+    }
+    if (upload && ranges.empty()) return true;
+    const size_t stride=texture.width*8;
+    std::vector<uint8_t> raw(stride*texture.height);
+    [texture getBytes:raw.data() bytesPerRow:stride
+        fromRegion:MTLRegionMake2D(0,0,texture.width,texture.height) mipmapLevel:0];
+    bool changed=false;
+    for (uint32_t y=0;y<surface.height;++y) for (uint32_t x=0;x<surface.width;++x) {
+        const size_t offset=packed_float_guest_pixel(surface,x,y)*4;
+        if (upload) {
+            const auto range=std::lower_bound(ranges.begin(),ranges.end(),offset,
+                [](const auto &item,size_t byte) { return item.offset+item.size<=byte; });
+            if (range==ranges.end() || range->offset>=offset+4) continue;
+            uint32_t word;
+            std::memcpy(&word,source.data()+offset,4);
+            if (mode==1) word=swap_e5_red_blue(word);
+            uint16_t channels[4];
+            unpack_rgb9e5(word,channels);
+            const auto [top,bottom]=write_native_interval(y,surface.height,texture.height,samples_y);
+            const auto [left,right]=write_native_interval(x,surface.width,texture.width,samples_x);
+            for (size_t ny=top;ny<bottom;++ny)
+                for (size_t nx=left;nx<right;++nx)
+                    std::memcpy(raw.data()+ny*stride+nx*8,channels,8);
+            changed=true;
+        } else {
+            const size_t ny=size_t(y)*texture.height/surface.height;
+            const size_t nx=size_t(x)*texture.width/surface.width;
+            uint16_t channels[4];
+            std::memcpy(channels,raw.data()+ny*stride+nx*8,8);
+            uint32_t word=pack_rgb9e5(channels);
+            if (mode==1) word=swap_e5_red_blue(word);
+            std::memcpy(destination.data()+offset,&word,4);
+        }
+    }
+    if (changed) [texture replaceRegion:MTLRegionMake2D(0,0,texture.width,texture.height)
+        mipmapLevel:0 withBytes:raw.data() bytesPerRow:stride];
+    return true;
+}
 bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surface,
     std::span<uint8_t> destination) {
     if (gxm::get_base_format(surface.colorFormat)==SCE_GXM_COLOR_BASE_FORMAT_S5S5U6)
@@ -906,6 +988,9 @@ bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surfa
         return u8u3u3u2_surface_memory(texture, surface, {}, destination, {}, false);
     if (gxm::get_base_format(surface.colorFormat) == SCE_GXM_COLOR_BASE_FORMAT_U2F10F10F10)
         return packed_float_surface_memory(texture, surface, {}, destination, {}, false);
+    if (gxm::get_base_format(surface.colorFormat) == SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9
+        && texture && texture.pixelFormat == MTLPixelFormatRGBA16Float)
+        return rgb9e5_expanded_surface_memory(texture,surface,{},destination,{},false);
     const auto size = surface_memory_size(surface);
     const auto components = surface_components(surface.colorFormat);
     if (!size || size > destination.size() || !texture || !raw_storage_matches(texture.pixelFormat, components.native)
@@ -1027,6 +1112,9 @@ static bool write_surface_memory_mapped(id<MTLTexture> texture, const SceGxmColo
         return u8u3u3u2_surface_memory(texture, surface, source, {}, ranges, true, samples_x, samples_y);
     if (gxm::get_base_format(surface.colorFormat) == SCE_GXM_COLOR_BASE_FORMAT_U2F10F10F10)
         return packed_float_surface_memory(texture, surface, source, {}, ranges, true,samples_x,samples_y);
+    if (gxm::get_base_format(surface.colorFormat) == SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9
+        && texture && texture.pixelFormat == MTLPixelFormatRGBA16Float)
+        return rgb9e5_expanded_surface_memory(texture,surface,source,{},ranges,true,samples_x,samples_y);
     const size_t size = surface_memory_size(surface);
     const auto components = surface_components(surface.colorFormat);
     if (!size || size > source.size() || !texture || !raw_storage_matches(texture.pixelFormat, components.native)
@@ -1986,6 +2074,8 @@ bool SurfaceCaster::patch_multisample(id<MTLTexture> texture, const SceGxmColorS
     const size_t size=surface_memory_size(surface);
     const auto components=surface_components(surface.colorFormat);
     const auto native = gxm::get_base_format(surface.colorFormat) == SCE_GXM_COLOR_BASE_FORMAT_U2F10F10F10
+        || (gxm::get_base_format(surface.colorFormat) == SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9
+            && texture && texture.pixelFormat == MTLPixelFormatRGBA16Float)
         ? MTLPixelFormatRGBA16Float : components.native;
     if (!size || source.size()<size || !scale || !texture || texture.textureType!=MTLTextureType2DMultisample
         || (texture.sampleCount!=2 && texture.sampleCount!=4)
@@ -2288,7 +2378,9 @@ id<MTLTexture> SurfaceCaster::surface_format_cast(id<MTLTexture> source, SceGxmC
     auto output=texture_components(texture);
     if (!source || source.textureType!=MTLTextureType2D || source.sampleCount!=1
         || !surface_format_cast_supported(color,texture,texture_swizzle)
-        || !raw_storage_matches(source.pixelFormat,input.native)) return nil;
+        || !(raw_storage_matches(source.pixelFormat,input.native)
+            || (gxm::get_base_format(color)==SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9
+                && source.pixelFormat==MTLPixelFormatRGBA16Float))) return nil;
     if (raw_bits) {
         if (input.count*input.bytes!=8 || output.count*output.bytes!=8) return nil;
         // Keep guest memory order; these are word halves, not guest texture

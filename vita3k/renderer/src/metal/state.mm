@@ -88,7 +88,7 @@ shader::metal::Program depth_only_program(uint32_t samples) {
     program.source += ") < float4(0.5))) discard_fragment(); }\n";
     return program;
 }
-MTLPixelFormat color_format(SceGxmColorFormat format) {
+MTLPixelFormat color_format(SceGxmColorFormat format, id<MTLDevice> device) {
     switch (gxm::get_base_format(format)) {
     case SCE_GXM_COLOR_BASE_FORMAT_U8U8U8U8:
     case SCE_GXM_COLOR_BASE_FORMAT_U8U8U8: return MTLPixelFormatRGBA8Unorm;
@@ -125,7 +125,11 @@ MTLPixelFormat color_format(SceGxmColorFormat format) {
     case SCE_GXM_COLOR_BASE_FORMAT_F11F11F10: return MTLPixelFormatRG11B10Float;
     case SCE_GXM_COLOR_BASE_FORMAT_U5U6U5: return MTLPixelFormatB5G6R5Unorm;
     case SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4: return MTLPixelFormatABGR4Unorm;
-    case SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9: return MTLPixelFormatRGB9E5Float;
+    case SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9:
+        // RGB9E5 is filter-only on Mac-family GPUs. Apple-family GPUs can
+        // render to it; otherwise expand the attachment and pack on readback.
+        return [device supportsFamily:MTLGPUFamilyApple2]
+            ? MTLPixelFormatRGB9E5Float : MTLPixelFormatRGBA16Float;
     case SCE_GXM_COLOR_BASE_FORMAT_U2U10U10U10: return MTLPixelFormatBGR10A2Unorm;
     case SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5: {
         const uint32_t mode=(uint32_t(format)&SCE_GXM_COLOR_SWIZZLE_MASK)>>20;
@@ -352,11 +356,13 @@ static SurfacePublication read_surface_publication(const Surface &entry, const S
     };
     const auto base = gxm::get_base_format(surface.colorFormat);
     const bool raw = entry.raw_color && !entry.raw_color_invalidated;
-    // These two native attachments need the expanded-format conversion path
-    // which Plus excludes from its general ownership clamp. Native ABGR4 and
-    // RGB9E5 are already packed, unlike Plus' optional expanded fallbacks.
+    // Expanded attachments need conversion before publishing guest words.
+    // RGB9E5 joins this path on Mac-family GPUs without a renderable native
+    // RGB9E5 attachment; Apple-family GPUs keep the packed attachment.
     const bool repack = base == SCE_GXM_COLOR_BASE_FORMAT_U8U8U8
-        || base == SCE_GXM_COLOR_BASE_FORMAT_U2F10F10F10;
+        || base == SCE_GXM_COLOR_BASE_FORMAT_U2F10F10F10
+        || (base == SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9
+            && entry.color.pixelFormat == MTLPixelFormatRGBA16Float);
     bool macroblock_clamped = false, ownership_clamped = false;
     if (!raw && !repack) {
         if (!entry.scene_render_area.empty()) macroblock_clamped = intersect(entry.scene_macroblock_bounds);
@@ -2840,7 +2846,7 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
             }
             ++entry.revision;
             entry.rgba8_casts.clear(); entry.subrectangles.clear();
-            auto format = color_format(surface.colorFormat);
+            auto format = color_format(surface.colorFormat, impl->device->native_device());
             if (surface.gamma) {
                 // Vulkan uses an sRGB view only for RGBA8. For other render
                 // formats it keeps the linear attachment and shader hint.
