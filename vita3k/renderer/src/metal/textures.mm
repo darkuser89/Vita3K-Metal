@@ -1459,6 +1459,7 @@ bool surface_word_target_supported(SceGxmTextureBaseFormat texture) {
     case SCE_GXM_TEXTURE_BASE_FORMAT_F11F11F10:
     case SCE_GXM_TEXTURE_BASE_FORMAT_SE5M9M9M9:
     case SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8:
         return true;
     default:
         return false;
@@ -1632,6 +1633,19 @@ kernel void unpack_halfwords_buffer(texture2d<uint, access::read> input [[textur
             | ((channels[memory_channels[half+1u]]&65535u)<<16);
     }
     output[p.y*layout.z+p.x]=native_packed_word(word,layout.w);
+}
+kernel void decode_x8_word(texture2d<uint, access::read> input [[texture(0)]],
+    texture2d<half, access::write> output [[texture(1)]],
+    constant uint &mode [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
+    if (p.x>=output.get_width() || p.y>=output.get_height()) return;
+    const uint word=input.read(p).x;
+    const uint red=(word>>(mode==0u ? 0u : 16u))&255u;
+    const uint green_bits=(word>>8)&255u;
+    const uint blue_bits=(word>>(mode==0u ? 16u : 0u))&255u;
+    const int green=int(green_bits)-(green_bits>=128u ? 256 : 0);
+    const int blue=int(blue_bits)-(blue_bits>=128u ? 256 : 0);
+    output.write(half4(float(red)/255.f,float(max(green,-127))/127.f,
+        float(max(blue,-127))/127.f,1.f),p);
 }
 kernel void repack_components(texture2d<uint,access::read> input [[texture(0)]],
     texture2d<uint,access::write> output [[texture(1)]], constant uint4 &config [[buffer(0)]],
@@ -2049,6 +2063,7 @@ fragment uint4 publication_words(float4 position [[position]],
     halfword_unpack_pipeline = cached_compute(device, library, @"unpack_halfwords");
     word_buffer_pipeline = cached_compute(device, library, @"unpack_words_buffer");
     halfword_buffer_pipeline = cached_compute(device, library, @"unpack_halfwords_buffer");
+    x8_word_decode_pipeline = cached_compute(device, library, @"decode_x8_word");
     depth_pipeline = cached_compute(device, library, @"copy_depth");
     if (!depth_pipeline) throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal: depth copy pipeline failed");
     scaled_snapshot_pipeline = cached_compute(device, library, @"scale_snapshot_words");
@@ -2567,6 +2582,24 @@ static void encode_packed_word_texture(Device &device, id<MTLCommandBuffer> comm
         toTexture:result destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
     [blit endEncoding];
 }
+static id<MTLTexture> decode_x8_word_texture(Device &device, id<MTLCommandBuffer> commands,
+    id<MTLComputePipelineState> pipeline, id<MTLTexture> words, uint32_t swizzle) {
+    auto desc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+        width:words.width height:words.height mipmapped:NO];
+    desc.storageMode=MTLStorageModeShared;
+    desc.usage=MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+    auto result=[device.native_device() newTextureWithDescriptor:desc];
+    if (!result) throw std::runtime_error("Metal: cannot allocate decoded X8 word texture");
+    auto encoder=[commands computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setTexture:words atIndex:0];
+    [encoder setTexture:result atIndex:1];
+    [encoder setBytes:&swizzle length:sizeof(swizzle) atIndex:0];
+    [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1)
+        threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+    [encoder endEncoding];
+    return result;
+}
 id<MTLTexture> SurfaceCaster::word_texture_from_rg32(id<MTLTexture> source,
     SceGxmTextureBaseFormat texture, uint32_t texture_swizzle, bool swap_words, uint32_t word_offset,
     uint32_t guest_width, uint32_t guest_height, id<MTLCommandBuffer> pending_commands,
@@ -2575,9 +2608,21 @@ id<MTLTexture> SurfaceCaster::word_texture_from_rg32(id<MTLTexture> source,
     if (!source.width || !source.height || source.pixelFormat!=MTLPixelFormatRG32Float
         || !surface_word_target_supported(texture) || target.count*target.bytes!=4
         || (texture==SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10 && texture_swizzle>=8)
+        || (texture==SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8 && texture_swizzle>=2)
         || word_offset>1 || bool(guest_width)!=bool(guest_height)
         || (pending_commands && pending_commands.status!=MTLCommandBufferStatusNotEnqueued))
         throw std::runtime_error("Metal: invalid RG32 surface word cast");
+    if (texture==SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8) {
+        auto commands=pending_commands ? pending_commands : surface_command_buffer(device,@"Vita3K surface X8 word decode");
+        auto word_image=word_texture_from_rg32(source,SCE_GXM_TEXTURE_BASE_FORMAT_U32,
+            0,swap_words,word_offset,guest_width,guest_height,commands,separate_word);
+        auto decoded=decode_x8_word_texture(device,commands,x8_word_decode_pipeline,word_image,texture_swizzle);
+        if (!pending_commands) {
+            std::string error;
+            if (!device.submit_and_wait(commands,error)) throw std::runtime_error(error);
+        }
+        return decoded;
+    }
     auto words=[source newTextureViewWithPixelFormat:MTLPixelFormatRG32Uint];
     if (!words) throw std::runtime_error("Metal: cannot view RG32 surface words");
     auto desc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:target.native
@@ -2625,9 +2670,21 @@ id<MTLTexture> SurfaceCaster::word_texture_from_rgba16(id<MTLTexture> source, Sc
         || gxm::get_base_format(color) != SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16
         || !surface_word_target_supported(texture) || target.count*target.bytes != 4
         || (texture==SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10 && texture_swizzle>=8)
+        || (texture==SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8 && texture_swizzle>=2)
         || bool(guest_width) != bool(guest_height)
         || (pending_commands && pending_commands.status != MTLCommandBufferStatusNotEnqueued))
         throw std::runtime_error("Metal: invalid RGBA16 surface word cast");
+    if (texture==SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8) {
+        auto commands=pending_commands ? pending_commands : surface_command_buffer(device,@"Vita3K surface X8 halfword decode");
+        auto word_image=word_texture_from_rgba16(source,color,SCE_GXM_TEXTURE_BASE_FORMAT_U32,
+            0,word_offset,guest_width,guest_height,commands,separate_word);
+        auto decoded=decode_x8_word_texture(device,commands,x8_word_decode_pipeline,word_image,texture_swizzle);
+        if (!pending_commands) {
+            std::string error;
+            if (!device.submit_and_wait(commands,error)) throw std::runtime_error(error);
+        }
+        return decoded;
+    }
     const auto mapping = surface_memory_mapping(color);
     uint32_t memory_channels[4];
     for (uint32_t channel = 0; channel < 4; ++channel) {

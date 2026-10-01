@@ -140,6 +140,7 @@ class SurfaceCaster {
     id<MTLBuffer> depth_store_buffer, mask_store_buffer;
     id<MTLComputePipelineState> pipeline, halfword_unpack_pipeline;
     id<MTLComputePipelineState> word_buffer_pipeline, halfword_buffer_pipeline;
+    id<MTLComputePipelineState> x8_word_decode_pipeline;
     id<MTLComputePipelineState> cube_pipeline, component_cast_pipeline;
     id<MTLComputePipelineState> depth_pipeline, stencil_pipeline, stencil_ms_pipeline, rg_gamma_pipeline;
     id<MTLComputePipelineState> scaled_snapshot_pipeline;

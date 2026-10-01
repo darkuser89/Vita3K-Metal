@@ -4437,6 +4437,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 && surface_word_target_supported(gxm::get_base_format(gxm::get_format(texture)))
                 && (gxm::get_base_format(gxm::get_format(texture))!=SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10
                     || texture.swizzle_format<8)
+                && (gxm::get_base_format(gxm::get_format(texture))!=SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8
+                    || texture.swizzle_format<2)
                 && (texture_address==surface.guest.data.address()
                     || uint64_t(texture_address)==uint64_t(surface.guest.data.address())+4)
                 && guest.surfaceType==SCE_GXM_COLOR_SURFACE_LINEAR
@@ -4457,6 +4459,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 && surface_word_target_supported(gxm::get_base_format(gxm::get_format(texture)))
                 && (gxm::get_base_format(gxm::get_format(texture))!=SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10
                     || texture.swizzle_format<8)
+                && (gxm::get_base_format(gxm::get_format(texture))!=SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8
+                    || texture.swizzle_format<2)
                 && gxm::get_base_format(guest.colorFormat)==SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16
                 && surface.color.pixelFormat==MTLPixelFormatRGBA16Float
                 && (texture_address==guest.data.address()
