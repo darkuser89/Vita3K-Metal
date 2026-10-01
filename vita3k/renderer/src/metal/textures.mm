@@ -533,6 +533,43 @@ std::optional<SurfaceRect> surface_wide_small_subrectangle(const SceGxmColorSurf
     return SurfaceRect{uint32_t(x),uint32_t(y),uint32_t(width),uint32_t(height)};
 }
 
+std::optional<SurfaceRect> surface_32_small_subrectangle(const SceGxmColorSurface &surface,
+    const SceGxmTexture &texture) {
+    const auto source=gxm::get_base_format(surface.colorFormat);
+    const auto target=gxm::get_base_format(gxm::get_format(texture));
+    const auto type=texture.texture_type();
+    const uint32_t mode=(uint32_t(surface.colorFormat)&SCE_GXM_COLOR_SWIZZLE_MASK)>>20;
+    const bool rg16=source==SCE_GXM_COLOR_BASE_FORMAT_U16U16
+        || source==SCE_GXM_COLOR_BASE_FORMAT_S16S16
+        || source==SCE_GXM_COLOR_BASE_FORMAT_F16F16;
+    const bool r32=source==SCE_GXM_COLOR_BASE_FORMAT_F32;
+    const auto components=texture_components(target);
+    const uint32_t bytes=components.count*components.bytes;
+    if (bytes!=1 && bytes!=2) return std::nullopt;
+    const uint32_t ratio=4/bytes;
+    if (!surface.data || !surface.width || !surface.height
+        || surface.strideInPixels<surface.width || surface.surfaceType!=SCE_GXM_COLOR_SURFACE_LINEAR
+        || (!rg16 && !r32) || (rg16 && mode>=2) || (r32 && mode!=0)
+        || (bytes==2 && !surface_halfword_target_supported(target))
+        || (bytes==1 && target!=SCE_GXM_TEXTURE_BASE_FORMAT_U8
+            && target!=SCE_GXM_TEXTURE_BASE_FORMAT_S8)
+        || (target==SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5 && texture.swizzle_format>=8)
+        || surface.width>UINT32_MAX/ratio
+        || (type!=SCE_GXM_TEXTURE_LINEAR && type!=SCE_GXM_TEXTURE_LINEAR_STRIDED)
+        || (type!=SCE_GXM_TEXTURE_LINEAR_STRIDED && texture.true_mip_count()>1)) return std::nullopt;
+    const uint64_t width=gxm::get_width(texture),height=gxm::get_height(texture);
+    const uint64_t pitch=uint64_t(surface.strideInPixels)*4;
+    const uint64_t texture_pitch=type==SCE_GXM_TEXTURE_LINEAR_STRIDED
+        ? gxm::get_stride_in_bytes(texture) : ((width+7)&~uint64_t(7))*bytes;
+    const uint64_t address=uint64_t(texture.data_addr)<<2;
+    if (!width || !height || texture_pitch!=pitch || address<surface.data.address()) return std::nullopt;
+    const uint64_t offset=address-surface.data.address();
+    if (offset%bytes || offset>=pitch*surface.height) return std::nullopt;
+    const uint64_t x=(offset%pitch)/bytes,y=offset/pitch;
+    if (x+width>uint64_t(surface.width)*ratio || y+height>surface.height) return std::nullopt;
+    return SurfaceRect{uint32_t(x),uint32_t(y),uint32_t(width),uint32_t(height)};
+}
+
 std::optional<SurfaceRect> surface_subrectangle(const SceGxmColorSurface &surface, const SceGxmTexture &texture) {
     const auto type=texture.texture_type();
     if (!surface.data || !surface.width || !surface.height || surface.strideInPixels<surface.width
@@ -3156,59 +3193,74 @@ id<MTLTexture> SurfaceCaster::byte_texture_from_rgba8(id<MTLTexture> source,
     }
     return result;
 }
-id<MTLTexture> SurfaceCaster::small_texture_from_64bit_surface(id<MTLTexture> source,
+id<MTLTexture> SurfaceCaster::small_texture_from_wide_surface(id<MTLTexture> source,
     SceGxmColorFormat color, SceGxmTextureBaseFormat texture, uint32_t texture_swizzle,
     id<MTLCommandBuffer> pending_commands) {
     auto target=texture_components(texture);
     const uint32_t bytes=target.count*target.bytes;
     const auto base=gxm::get_base_format(color);
-    const bool f16=base==SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16;
-    const bool f32=base==SCE_GXM_COLOR_BASE_FORMAT_F32F32;
+    const bool f16x4=base==SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16;
+    const bool f32x2=base==SCE_GXM_COLOR_BASE_FORMAT_F32F32;
+    const bool rg16=base==SCE_GXM_COLOR_BASE_FORMAT_U16U16
+        || base==SCE_GXM_COLOR_BASE_FORMAT_S16S16
+        || base==SCE_GXM_COLOR_BASE_FORMAT_F16F16;
+    const bool r32=base==SCE_GXM_COLOR_BASE_FORMAT_F32;
     const uint32_t mode=(uint32_t(color)&SCE_GXM_COLOR_SWIZZLE_MASK)>>20;
     const bool packed=texture==SCE_GXM_TEXTURE_BASE_FORMAT_U5U6U5
         || texture==SCE_GXM_TEXTURE_BASE_FORMAT_U4U4U4U4
         || texture==SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5;
     if (!source || !source.width || !source.height
-        || (!f16 && !f32) || (f16 && (mode>=std::size(four)
+        || (!f16x4 && !f32x2 && !rg16 && !r32)
+        || (f16x4 && (mode>=std::size(four)
             || (source.pixelFormat!=MTLPixelFormatRGBA16Float
                 && source.pixelFormat!=MTLPixelFormatRGBA16Uint)))
-        || (f32 && (mode>=2 || (source.pixelFormat!=MTLPixelFormatRG32Float
+        || (f32x2 && (mode>=2 || (source.pixelFormat!=MTLPixelFormatRG32Float
             && source.pixelFormat!=MTLPixelFormatRG32Uint)))
+        || (rg16 && (mode>=2 || (source.pixelFormat!=MTLPixelFormatRG16Unorm
+            && source.pixelFormat!=MTLPixelFormatRG16Snorm
+            && source.pixelFormat!=MTLPixelFormatRG16Float
+            && source.pixelFormat!=MTLPixelFormatRG16Uint)))
+        || (r32 && (mode!=0 || (source.pixelFormat!=MTLPixelFormatR32Float
+            && source.pixelFormat!=MTLPixelFormatR32Uint)))
         || (bytes!=1 && bytes!=2)
         || (bytes==1 && texture!=SCE_GXM_TEXTURE_BASE_FORMAT_U8
             && texture!=SCE_GXM_TEXTURE_BASE_FORMAT_S8)
         || (bytes==2 && !surface_halfword_target_supported(texture))
         || (texture==SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5 && texture_swizzle>=8)
         || (pending_commands && pending_commands.status!=MTLCommandBufferStatusNotEnqueued))
-        throw std::runtime_error("Metal: invalid 64-bit surface small cast");
+        throw std::runtime_error("Metal: invalid wide surface small cast");
     const auto mapping=surface_memory_mapping(color);
-    const uint32_t source_components=f16 ? 4 : 2;
+    const uint32_t source_components=f16x4 ? 4 : (f32x2 || rg16 ? 2 : 1);
+    const uint32_t component_bytes=f16x4 || rg16 ? 2 : 4;
+    const uint32_t source_bytes=source_components*component_bytes;
     uint32_t memory_channels[4]={0,0,0,0};
     for (uint32_t channel=0;channel<source_components;++channel) {
         const auto found=std::find(identity.begin(),identity.begin()+source_components,mapping[channel]);
         if (found==identity.begin()+source_components)
-            throw std::runtime_error("Metal: invalid 64-bit guest channel mapping");
+            throw std::runtime_error("Metal: invalid wide guest channel mapping");
         memory_channels[channel]=uint32_t(found-identity.begin());
     }
-    auto words=[source newTextureViewWithPixelFormat:f16 ? MTLPixelFormatRGBA16Uint : MTLPixelFormatRG32Uint];
-    if (!words) throw std::runtime_error("Metal: cannot view 64-bit surface storage bits");
+    const MTLPixelFormat bits_format=f16x4 ? MTLPixelFormatRGBA16Uint
+        : f32x2 ? MTLPixelFormatRG32Uint : rg16 ? MTLPixelFormatRG16Uint : MTLPixelFormatR32Uint;
+    auto words=[source newTextureViewWithPixelFormat:bits_format];
+    if (!words) throw std::runtime_error("Metal: cannot view wide surface storage bits");
     if (texture==SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5 && (texture_swizzle&2u))
         target.native=MTLPixelFormatA1BGR5Unorm;
-    const uint32_t ratio=8/bytes;
+    const uint32_t ratio=source_bytes/bytes;
     auto desc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:target.native
         width:source.width*ratio height:source.height mipmapped:NO];
     desc.storageMode=MTLStorageModeShared;
     desc.usage=MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView
         | (packed ? 0 : MTLTextureUsageShaderWrite);
     auto result=[device.native_device() newTextureWithDescriptor:desc];
-    if (!result) throw std::runtime_error("Metal: cannot allocate 64-bit small alias");
-    auto commands=pending_commands ? pending_commands : surface_command_buffer(device,@"Vita3K 64-bit small cast");
+    if (!result) throw std::runtime_error("Metal: cannot allocate wide small alias");
+    auto commands=pending_commands ? pending_commands : surface_command_buffer(device,@"Vita3K wide small cast");
     if (packed) {
         const NSUInteger row_bytes=(result.width*2+255)&~NSUInteger(255);
         const NSUInteger total_bytes=row_bytes*result.height;
         auto buffer=[device.native_device() newBufferWithLength:total_bytes options:MTLResourceStorageModeShared];
-        if (!buffer) throw std::runtime_error("Metal: cannot allocate packed 64-bit small buffer");
-        const uint32_t config[]={f16 ? 2u : 4u,ratio};
+        if (!buffer) throw std::runtime_error("Metal: cannot allocate packed wide small buffer");
+        const uint32_t config[]={component_bytes,ratio};
         const uint32_t layout[]={uint32_t(result.width),uint32_t(result.height),uint32_t(row_bytes/2)};
         auto encoder=[commands computeCommandEncoder];
         [encoder setComputePipelineState:wide_small_buffer_pipeline];
@@ -3227,8 +3279,8 @@ id<MTLTexture> SurfaceCaster::small_texture_from_64bit_surface(id<MTLTexture> so
         [blit endEncoding];
     } else {
         auto raw=[result newTextureViewWithPixelFormat:sample_bits_format(target.native)];
-        if (!raw) throw std::runtime_error("Metal: cannot view 64-bit small destination bits");
-        const uint32_t config[]={f16 ? 2u : 4u,target.bytes,bytes,ratio};
+        if (!raw) throw std::runtime_error("Metal: cannot view wide small destination bits");
+        const uint32_t config[]={component_bytes,target.bytes,bytes,ratio};
         auto encoder=[commands computeCommandEncoder];
         [encoder setComputePipelineState:wide_small_unpack_pipeline];
         [encoder setTexture:words atIndex:0];

@@ -198,7 +198,7 @@ public:
         SceGxmTextureBaseFormat texture, id<MTLCommandBuffer> pending_commands = nil);
     id<MTLTexture> byte_texture_from_rgba8(id<MTLTexture> source, SceGxmColorFormat color,
         SceGxmTextureBaseFormat texture, id<MTLCommandBuffer> pending_commands = nil);
-    id<MTLTexture> small_texture_from_64bit_surface(id<MTLTexture> source, SceGxmColorFormat color,
+    id<MTLTexture> small_texture_from_wide_surface(id<MTLTexture> source, SceGxmColorFormat color,
         SceGxmTextureBaseFormat texture, uint32_t texture_swizzle,
         id<MTLCommandBuffer> pending_commands = nil);
     bool load_depth_memory(id<MTLTexture>, const SceGxmDepthStencilSurface &, const DepthMemoryLayout &, float scale,
@@ -295,6 +295,8 @@ std::optional<SurfaceRect> surface_byte_subrectangle(const SceGxmColorSurface &,
 std::optional<SurfaceRect> surface_rgba8_byte_subrectangle(const SceGxmColorSurface &,
     const SceGxmTexture &);
 std::optional<SurfaceRect> surface_wide_small_subrectangle(const SceGxmColorSurface &,
+    const SceGxmTexture &);
+std::optional<SurfaceRect> surface_32_small_subrectangle(const SceGxmColorSurface &,
     const SceGxmTexture &);
 bool surface_format_cast_enqueueable(SceGxmColorFormat, SceGxmTextureBaseFormat,
     uint32_t texture_swizzle = UINT32_MAX);
