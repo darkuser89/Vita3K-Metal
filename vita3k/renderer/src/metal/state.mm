@@ -2578,10 +2578,32 @@ bool MetalState::transfer_image(MemState &mem, const SceGxmTransferImage &source
     if (!downscale && (bits==8 || bits==16 || bits==32) && mode==SCE_GXM_TRANSFER_COLORKEY_NONE
         && try_transfer_depth_gpu(mem,source,destination,source_type,destination_type,reads,destinations))
         return true;
-    struct Snapshot { uint64_t address; std::vector<uint8_t> data; };
+    struct Snapshot {
+        uint64_t address;
+        std::vector<uint8_t> data;
+        std::vector<SurfaceMemoryRange> published;
+        std::vector<SurfaceMemoryRange> claimed;
+    };
     struct Update { Surface *surface; size_t bytes; };
     std::vector<Snapshot> snapshots;
     std::vector<Update> updates;
+    const auto conflicts_with_snapshot = [&](uint64_t address,
+                                             std::span<const SurfaceMemoryRange> claimed) {
+        for (const auto &range : claimed) {
+            const uint64_t first_address = address + range.offset;
+            const uint64_t last_address = first_address + range.size;
+            for (const auto &other : snapshots) {
+                for (const auto &other_range : other.claimed) {
+                    const uint64_t other_first = other.address + other_range.offset;
+                    const uint64_t first = std::max(first_address, other_first);
+                    const uint64_t last = std::min(last_address, other_first + other_range.size);
+                    if (first < last && !surface_intersections(first, last - first, reads).empty())
+                        return true;
+                }
+            }
+        }
+        return false;
+    };
     // Preflight every overlapping cached representation before modifying RAM.
     for (auto &[address,surface] : impl->surfaces) {
         const size_t extent=cached_surface_extent(surface);
@@ -2601,32 +2623,30 @@ bool MetalState::transfer_image(MemState &mem, const SceGxmTransferImage &source
             updates.push_back({&surface,size});
         }
         if (read) {
-            // Competing cache aliases need render-order tracking. Reject such
-            // ambiguity instead of selecting a source by map iteration order.
-            for (const auto &other : snapshots) {
-                const auto first=std::max<uint64_t>(address,other.address), last=std::min(end,other.address+other.data.size());
-                if (first<last && !surface_intersections(first,last-first,reads).empty()) return false;
-            }
-            Snapshot snapshot{address,std::vector<uint8_t>(guest,guest+size)};
+            Snapshot snapshot{address,std::vector<uint8_t>(guest,guest+size),{}, {}};
             // Plus transfers read through perform_surface_sync, including its
             // write-ownership bounds and scaled blit. Preserve guest bytes
             // outside those bounds in this private source snapshot as well.
             // This is not a guest publication: leave the CPU baseline intact.
-            std::vector<SurfaceMemoryRange> readback_ranges;
-            if (read_surface_publication(surface,surface.guest,snapshot.data,readback_ranges,
-                    *impl->device,impl->caster) == SurfacePublication::Unavailable) return false;
+            const auto publication = read_surface_publication(surface,surface.guest,snapshot.data,
+                snapshot.published,*impl->device,impl->caster);
+            if (publication == SurfacePublication::Unavailable) return false;
+            // A CPU-newer cached alias claims its entire source range until
+            // the exact changed bytes are known. Other aliases may contribute
+            // only when their published bytes do not compete with that range.
+            snapshot.claimed = publication == SurfacePublication::CpuNewer
+                ? surface_intersections(address,size,reads) : snapshot.published;
+            if (conflicts_with_snapshot(address,snapshot.claimed)) return false;
             snapshots.push_back(std::move(snapshot));
         }
     }
     std::vector<DepthTransfer> depth_transfers;
     if (!prepare_depth_transfers(*this,mem,reads,destinations,depth_transfers)) return false;
     const auto add_depth_snapshot=[&](uint64_t address,std::vector<uint8_t> &data) {
-        const uint64_t end=address+data.size();
-        for (const auto &other:snapshots) {
-            const auto first=std::max(address,other.address),last=std::min(end,other.address+other.data.size());
-            if (first<last && !surface_intersections(first,last-first,reads).empty()) return false;
-        }
-        snapshots.push_back({address,std::move(data)});
+        const std::array published{SurfaceMemoryRange{0,data.size()}};
+        if (conflicts_with_snapshot(address,published)) return false;
+        snapshots.push_back({address,std::move(data),{published.begin(),published.end()},
+            {published.begin(),published.end()}});
         return true;
     };
     for (auto &transfer:depth_transfers) {
@@ -2643,17 +2663,19 @@ bool MetalState::transfer_image(MemState &mem, const SceGxmTransferImage &source
             const uint64_t address=uint64_t(src.address(0,y));
             const size_t row_bytes=size_t(source.width)*bytes;
             std::memcpy(row,Ptr<uint8_t>(Address(address)).get(mem),row_bytes);
-            for (const auto &snapshot : snapshots) {
-                const auto first=std::max(address,snapshot.address);
-                const auto last=std::min(address+row_bytes,snapshot.address+snapshot.data.size());
+            for (const auto &snapshot : snapshots) for (const auto &range : snapshot.published) {
+                const uint64_t begin=snapshot.address+range.offset;
+                const uint64_t first=std::max(address,begin);
+                const uint64_t last=std::min(address+row_bytes,begin+range.size);
                 if (first<last) std::memcpy(row+first-address,snapshot.data.data()+first-snapshot.address,last-first);
             }
         } else for (uint32_t x=0;x<source.width;++x) {
             const uint64_t address=uint64_t(src.address(x,y));
             auto *pixel=row+size_t(x)*bytes;
             std::memcpy(pixel,Ptr<uint8_t>(Address(address)).get(mem),bytes);
-            for (const auto &snapshot : snapshots) {
-                const auto first=std::max(address,snapshot.address), last=std::min(address+bytes,snapshot.address+snapshot.data.size());
+            for (const auto &snapshot : snapshots) for (const auto &range : snapshot.published) {
+                const uint64_t begin=snapshot.address+range.offset;
+                const uint64_t first=std::max(address,begin), last=std::min(address+bytes,begin+range.size);
                 if (first<last) std::memcpy(pixel+first-address,snapshot.data.data()+first-snapshot.address,last-first);
             }
         }
