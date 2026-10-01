@@ -4453,6 +4453,17 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             }
             return impl->surfaces.end();
         };
+        const auto find_rgba8_byte_subrectangle = [&](const SceGxmTexture &texture) {
+            auto found=impl->surfaces.upper_bound(texture.data_addr<<2);
+            while (found!=impl->surfaces.begin()) {
+                --found;
+                if (surface_texture_layout_overlap(found->second.guest,texture))
+                    return texture_surface_usable(found->second)
+                        && surface_rgba8_byte_subrectangle(found->second.guest,texture)
+                        ? found : impl->surfaces.end();
+            }
+            return impl->surfaces.end();
+        };
         const auto find_direct_surface = [&](const SceGxmTexture &texture) {
             const auto found = find_texture_surface(texture.data_addr << 2);
             if (found == impl->surfaces.end()) return found;
@@ -4736,6 +4747,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             if (halfword_owner!=impl->surfaces.end()) source=halfword_owner;
             const auto byte_owner=find_byte_subrectangle(texture);
             if (byte_owner!=impl->surfaces.end()) source=byte_owner;
+            const auto rgba8_byte_owner=find_rgba8_byte_subrectangle(texture);
+            if (rgba8_byte_owner!=impl->surfaces.end()) source=rgba8_byte_owner;
             // Persona 4 describes a 1024x1024 texture over a 960x544 target.
             // Sample its rendered prefix directly, preserving guest texel
             // coordinates without reading the unallocated trailing rows.
@@ -4749,9 +4762,11 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     || surface_word_subrectangle(source->second.guest,texture).has_value();
                 const bool direct_halfword_alias=surface_halfword_subrectangle(source->second.guest,texture).has_value();
                 const bool direct_byte_alias=surface_byte_subrectangle(source->second.guest,texture).has_value();
+                const bool direct_rgba8_byte_alias=surface_rgba8_byte_subrectangle(source->second.guest,texture).has_value();
                 // A native surface can only be sampled directly when both
                 // its byte layout and format match the guest texture view.
-                incompatible_alias=!direct_word_alias && !direct_halfword_alias && !direct_byte_alias
+                incompatible_alias=!direct_word_alias && !direct_halfword_alias
+                    && !direct_byte_alias && !direct_rgba8_byte_alias
                     && !surface_subrectangle(source->second.guest,texture);
             }
             if (surface_word_target_supported(texture_base)) {
@@ -4783,6 +4798,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 direct_precise_surface |= word_owner!=impl->surfaces.end();
                 direct_precise_surface |= halfword_owner!=impl->surfaces.end();
                 direct_precise_surface |= byte_owner!=impl->surfaces.end();
+                direct_precise_surface |= rgba8_byte_owner!=impl->surfaces.end();
             }
             if (!cube && single_mip
                 && ((!incompatible_alias && features.use_texture_viewport) || direct_precise_surface)) continue;
@@ -5100,8 +5116,11 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 const auto byte_region=find_byte_subrectangle(texture);
                 const bool byte_alias=byte_region!=impl->surfaces.end()
                     && byte_region->first==ctx.impl->guest_color.data.address();
+                const auto rgba8_byte_region=find_rgba8_byte_subrectangle(texture);
+                const bool rgba8_byte_alias=rgba8_byte_region!=impl->surfaces.end()
+                    && rgba8_byte_region->first==ctx.impl->guest_color.data.address();
                 if (address==ctx.impl->guest_color.data.address() || word_alias || region_alias
-                    || halfword_alias || byte_alias) {
+                    || halfword_alias || byte_alias || rgba8_byte_alias) {
                     needs_feedback=true;
                     const auto active=impl->surfaces.find(ctx.impl->guest_color.data.address());
                     const bool packed_rg32=ctx.impl->color.pixelFormat==MTLPixelFormatRG32Float
@@ -5275,6 +5294,36 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 auto full=impl->caster->byte_texture_from_16bit_surface(source,entry.guest.colorFormat,
                     base,ctx.impl->commands);
                 crop=impl->caster->enqueue_subrectangle(full,entry.guest.width*2,
+                    entry.guest.height,rect,ctx.impl->commands);
+            }
+            prepared_images[index]=sampling_view(crop,gxm::get_format(texture),nullptr);
+        }
+        // A four-byte RGBA8 color texel may also be addressed as four
+        // individual guest bytes, including a rectangle within the surface.
+        for (uint32_t index=0;index<SCE_GXM_MAX_TEXTURE_UNITS*2;++index) {
+            const bool vertex=index>=SCE_GXM_MAX_TEXTURE_UNITS;
+            if ((!vertex && !fragment_resources) || prepared_images[index]) continue;
+            const auto &program=vertex?static_cast<const ShaderProgram &>(*vp->vertex_program)
+                : static_cast<const ShaderProgram &>(*fp->fragment_program);
+            if (!program.textures_used[index%SCE_GXM_MAX_TEXTURE_UNITS]) continue;
+            const auto &texture=ctx.textures[index];
+            auto found=find_rgba8_byte_subrectangle(texture);
+            if (found==impl->surfaces.end()) continue;
+            auto &entry=found->second;
+            const auto rect=*surface_rgba8_byte_subrectangle(entry.guest,texture);
+            const auto base=gxm::get_base_format(gxm::get_format(texture));
+            auto &crop=entry.byte_rect_casts[{rect.x,rect.y,rect.width,rect.height,
+                uint32_t(base),uint32_t(texture.swizzle_format)}];
+            if (!crop) {
+                const bool active=entry.color==ctx.impl->color && !record.is_maskupdate;
+                if (active) require(color_feedback!=nil,"Metal: missing RGBA8 byte feedback snapshot");
+                auto source=active ? (raw_color_feedback ? raw_color_feedback : color_feedback)
+                    : raw_surface_color(entry);
+                prepare_inline_commands();
+                if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+                auto full=impl->caster->byte_texture_from_rgba8(source,entry.guest.colorFormat,
+                    base,ctx.impl->commands);
+                crop=impl->caster->enqueue_subrectangle(full,entry.guest.width*4,
                     entry.guest.height,rect,ctx.impl->commands);
             }
             prepared_images[index]=sampling_view(crop,gxm::get_format(texture),nullptr);

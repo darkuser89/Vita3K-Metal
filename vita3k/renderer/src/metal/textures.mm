@@ -470,6 +470,33 @@ std::optional<SurfaceRect> surface_byte_subrectangle(const SceGxmColorSurface &s
     return SurfaceRect{uint32_t(x),uint32_t(y),uint32_t(width),uint32_t(height)};
 }
 
+std::optional<SurfaceRect> surface_rgba8_byte_subrectangle(const SceGxmColorSurface &surface,
+    const SceGxmTexture &texture) {
+    const auto source=gxm::get_base_format(surface.colorFormat);
+    const auto target=gxm::get_base_format(gxm::get_format(texture));
+    const auto type=texture.texture_type();
+    const uint32_t mode=(uint32_t(surface.colorFormat)&SCE_GXM_COLOR_SWIZZLE_MASK)>>20;
+    if (!surface.data || !surface.width || !surface.height || surface.width>UINT32_MAX/4
+        || surface.strideInPixels<surface.width || surface.surfaceType!=SCE_GXM_COLOR_SURFACE_LINEAR
+        || (source!=SCE_GXM_COLOR_BASE_FORMAT_U8U8U8U8
+            && source!=SCE_GXM_COLOR_BASE_FORMAT_S8S8S8S8)
+        || mode>=std::size(four)
+        || (target!=SCE_GXM_TEXTURE_BASE_FORMAT_U8 && target!=SCE_GXM_TEXTURE_BASE_FORMAT_S8)
+        || (type!=SCE_GXM_TEXTURE_LINEAR && type!=SCE_GXM_TEXTURE_LINEAR_STRIDED)
+        || (type!=SCE_GXM_TEXTURE_LINEAR_STRIDED && texture.true_mip_count()>1)) return std::nullopt;
+    const uint64_t width=gxm::get_width(texture),height=gxm::get_height(texture);
+    const uint64_t pitch=uint64_t(surface.strideInPixels)*4;
+    const uint64_t texture_pitch=type==SCE_GXM_TEXTURE_LINEAR_STRIDED
+        ? gxm::get_stride_in_bytes(texture) : ((width+7)&~uint64_t(7));
+    const uint64_t address=uint64_t(texture.data_addr)<<2;
+    if (!width || !height || texture_pitch!=pitch || address<surface.data.address()) return std::nullopt;
+    const uint64_t offset=address-surface.data.address();
+    if (offset>=pitch*surface.height) return std::nullopt;
+    const uint64_t x=offset%pitch,y=offset/pitch;
+    if (x+width>uint64_t(surface.width)*4 || y+height>surface.height) return std::nullopt;
+    return SurfaceRect{uint32_t(x),uint32_t(y),uint32_t(width),uint32_t(height)};
+}
+
 std::optional<SurfaceRect> surface_subrectangle(const SceGxmColorSurface &surface, const SceGxmTexture &texture) {
     const auto type=texture.texture_type();
     if (!surface.data || !surface.width || !surface.height || surface.strideInPixels<surface.width
@@ -1705,6 +1732,14 @@ kernel void unpack_16bit_bytes(texture2d<uint, access::read> input [[texture(0)]
         : (bits.x>>((p.x&1u)*8u))&255u;
     output.write(uint4(byte,0u,0u,0u),p);
 }
+kernel void unpack_rgba8_bytes(texture2d<uint, access::read> input [[texture(0)]],
+    texture2d<uint, access::write> output [[texture(1)]],
+    constant uint4 &memory_channels [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
+    if (p.x>=output.get_width() || p.y>=output.get_height()) return;
+    const uint2 source=min(uint2(p.x/4u,p.y),uint2(input.get_width()-1u,input.get_height()-1u));
+    const uint4 bits=input.read(source);
+    output.write(uint4(bits[memory_channels[p.x&3u]]&255u,0u,0u,0u),p);
+}
 uint native_packed_word(uint word, uint mode) {
     if (mode >= 4u || mode == 0u) return word;
     if (mode == 1u) return (word & 0xc00ffc00u)
@@ -2179,6 +2214,7 @@ fragment uint4 publication_words(float4 position [[position]],
     halfword_unpack_pipeline = cached_compute(device, library, @"unpack_halfwords");
     byte_halfword_pipeline = cached_compute(device, library, @"unpack_byte_halfwords");
     byte_unpack_pipeline = cached_compute(device, library, @"unpack_16bit_bytes");
+    rgba8_byte_unpack_pipeline = cached_compute(device, library, @"unpack_rgba8_bytes");
     word_buffer_pipeline = cached_compute(device, library, @"unpack_words_buffer");
     halfword_buffer_pipeline = cached_compute(device, library, @"unpack_halfwords_buffer");
     x8_word_decode_pipeline = cached_compute(device, library, @"decode_x8_word");
@@ -2949,6 +2985,56 @@ id<MTLTexture> SurfaceCaster::byte_texture_from_16bit_surface(id<MTLTexture> sou
     [encoder setTexture:raw atIndex:1];
     [encoder setBytes:memory_channels length:sizeof(memory_channels) atIndex:0];
     [encoder setBytes:&two_channels length:sizeof(two_channels) atIndex:1];
+    [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1)
+        threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+    [encoder endEncoding];
+    if (!pending_commands) {
+        std::string error;
+        if (!device.submit_and_wait(commands,error)) throw std::runtime_error(error);
+    }
+    return result;
+}
+id<MTLTexture> SurfaceCaster::byte_texture_from_rgba8(id<MTLTexture> source,
+    SceGxmColorFormat color, SceGxmTextureBaseFormat texture,
+    id<MTLCommandBuffer> pending_commands) {
+    const auto base=gxm::get_base_format(color);
+    const uint32_t mode=(uint32_t(color)&SCE_GXM_COLOR_SWIZZLE_MASK)>>20;
+    if (!source || !source.width || !source.height
+        || (source.pixelFormat!=MTLPixelFormatRGBA8Unorm
+            && source.pixelFormat!=MTLPixelFormatRGBA8Unorm_sRGB
+            && source.pixelFormat!=MTLPixelFormatRGBA8Snorm
+            && source.pixelFormat!=MTLPixelFormatRGBA8Uint)
+        || (base!=SCE_GXM_COLOR_BASE_FORMAT_U8U8U8U8
+            && base!=SCE_GXM_COLOR_BASE_FORMAT_S8S8S8S8)
+        || mode>=std::size(four)
+        || (texture!=SCE_GXM_TEXTURE_BASE_FORMAT_U8
+            && texture!=SCE_GXM_TEXTURE_BASE_FORMAT_S8)
+        || (pending_commands && pending_commands.status!=MTLCommandBufferStatusNotEnqueued))
+        throw std::runtime_error("Metal: invalid RGBA8 byte cast");
+    const auto mapping=surface_memory_mapping(color);
+    uint32_t memory_channels[4];
+    for (uint32_t channel=0;channel<4;++channel) {
+        const auto found=std::find(identity.begin(),identity.end(),mapping[channel]);
+        if (found==identity.end()) throw std::runtime_error("Metal: invalid RGBA8 guest byte mapping");
+        memory_channels[channel]=uint32_t(found-identity.begin());
+    }
+    auto bytes=[source newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Uint];
+    if (!bytes) throw std::runtime_error("Metal: cannot view RGBA8 surface bytes");
+    auto desc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+        texture==SCE_GXM_TEXTURE_BASE_FORMAT_U8 ? MTLPixelFormatR8Unorm : MTLPixelFormatR8Snorm
+        width:source.width*4 height:source.height mipmapped:NO];
+    desc.storageMode=MTLStorageModeShared;
+    desc.usage=MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite|MTLTextureUsagePixelFormatView;
+    auto result=[device.native_device() newTextureWithDescriptor:desc];
+    if (!result) throw std::runtime_error("Metal: cannot allocate RGBA8 byte alias");
+    auto raw=[result newTextureViewWithPixelFormat:MTLPixelFormatR8Uint];
+    if (!raw) throw std::runtime_error("Metal: cannot view RGBA8 byte destination bits");
+    auto commands=pending_commands ? pending_commands : surface_command_buffer(device,@"Vita3K RGBA8 byte cast");
+    auto encoder=[commands computeCommandEncoder];
+    [encoder setComputePipelineState:rgba8_byte_unpack_pipeline];
+    [encoder setTexture:bytes atIndex:0];
+    [encoder setTexture:raw atIndex:1];
+    [encoder setBytes:memory_channels length:sizeof(memory_channels) atIndex:0];
     [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1)
         threadsPerThreadgroup:MTLSizeMake(8,8,1)];
     [encoder endEncoding];
