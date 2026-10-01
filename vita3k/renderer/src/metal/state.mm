@@ -4414,6 +4414,15 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         const auto find_subrectangle = [&](const SceGxmTexture &texture) {
             return find_color_subrectangle(impl->surfaces, texture, texture_surface_usable);
         };
+        const auto find_direct_surface = [&](const SceGxmTexture &texture) {
+            const auto found = find_texture_surface(texture.data_addr << 2);
+            if (found == impl->surfaces.end()) return found;
+            // An equal base address alone does not establish ownership of a
+            // texture view. Plus checks the row pitch and tiling first.
+            return surface_texture_layout_overlap(found->second.guest, texture)
+                || surface_subrectangle(found->second.guest, texture)
+                ? found : impl->surfaces.end();
+        };
         const auto rg32_linear_alias = [&](const Surface &surface, const SceGxmTexture &texture,
             Address texture_address) {
             const auto type=texture.texture_type();
@@ -5184,7 +5193,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     && base!=SCE_GXM_TEXTURE_BASE_FORMAT_X8U24 && base!=SCE_GXM_TEXTURE_BASE_FORMAT_F32
                     && base!=SCE_GXM_TEXTURE_BASE_FORMAT_F32M && base!=SCE_GXM_TEXTURE_BASE_FORMAT_U16
                     && base!=SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8) continue;
-                if (find_texture_surface(texture.data_addr<<2)!=impl->surfaces.end()
+                if (find_direct_surface(texture)!=impl->surfaces.end()
                     || find_subrectangle(texture)!=impl->surfaces.end()) continue;
                 for (auto &[key,entry]:impl->depth_surfaces) {
                     // Color textures frequently reuse old depth allocations.
@@ -6064,7 +6073,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             const Address texture_address = texture.data_addr << 2;
             const auto texture_base = gxm::get_base_format(gxm::get_format(texture));
             const bool prepared = prepared_images[index] != nil;
-            auto surface = prepared ? impl->surfaces.end() : find_texture_surface(texture_address);
+            auto surface = prepared ? impl->surfaces.end() : find_direct_surface(texture);
             const auto subrectangle_surface=prepared ? impl->surfaces.end() : find_subrectangle(texture);
             if (subrectangle_surface!=impl->surfaces.end()) surface=subrectangle_surface;
             // Uncharted's signed normal/gloss alias starts at the second word
