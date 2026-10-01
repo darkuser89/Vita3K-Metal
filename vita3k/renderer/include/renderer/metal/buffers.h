@@ -18,6 +18,11 @@ struct GuestBufferRange {
     size_t size = 0;
     bool direct = false;
 };
+struct MappedGuestRange {
+    uint32_t address;
+    size_t size;
+    bool mapped = false;
+};
 // Preserve GXM map extents for shaders that use memory-backed uniform slots.
 // An overlapping later map must not hide a larger earlier region.
 class MappedGuestRegions {
@@ -25,6 +30,7 @@ class MappedGuestRegions {
 public:
     void map(uint32_t address, uint32_t size);
     void unmap(uint32_t address);
+    MappedGuestRange range(uint32_t address, size_t bound_size) const;
     size_t extent(uint32_t address, size_t bound_size) const;
 };
 struct UploadBufferSlice {

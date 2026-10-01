@@ -206,7 +206,7 @@ inline static bool is_sub_opcode(Opcode test_op) {
     return (test_op == Opcode::VSUB) || (test_op == Opcode::VF16SUB) || (test_op == Opcode::ISUB8) || (test_op == Opcode::ISUB16) || (test_op == Opcode::ISUB32) || (test_op == Opcode::ISUBU8) || (test_op == Opcode::ISUBU16) || (test_op == Opcode::ISUBU32) || (test_op == Opcode::FPSUB8);
 }
 
-spv::Id USSETranslatorVisitor::vtst_impl(Instruction inst, ExtPredicate pred, int zero_test, int sign_test, Imm4 load_mask, bool mask) {
+spv::Id USSETranslatorVisitor::vtst_impl(Instruction inst, ExtPredicate pred, int zero_test, int sign_test, Imm4 load_mask, bool mask, spv::Id *alu_result) {
     // Usually we would expect this to have a compare behavior
     // Comparison is done by subtracting the first src by the second src, and compare the result value.
     // We currently optimize for that case first
@@ -260,7 +260,9 @@ spv::Id USSETranslatorVisitor::vtst_impl(Instruction inst, ExtPredicate pred, in
     if (is_signed_integer_data_type(load_data_type)) {
         index_tb_comp = 1;
     } else if (is_unsigned_integer_data_type(load_data_type)) {
-        index_tb_comp = 2;
+        // A 32-bit ALU result uses its high bit for the sign test. Direct
+        // unsigned subtraction comparisons still compare the two operands.
+        index_tb_comp = m_spirv_params.native_metal && load_data_type == DataType::UINT32 && !is_sub_opcode(inst.opcode) ? 1 : 2;
     }
 
     const spv::Op used_comp_op = tb_comp_ops[index_tb_comp][compare_include_equal][sign_test];
@@ -321,6 +323,12 @@ spv::Id USSETranslatorVisitor::vtst_impl(Instruction inst, ExtPredicate pred, in
         return spv::NoResult;
     }
 
+    if (alu_result) {
+        // The comparison may bypass subtraction, but writeback cannot.
+        *alu_result = is_sub_opcode(inst.opcode)
+            ? m_b.createBinOp(is_float_data_type(load_data_type) ? spv::OpFSub : spv::OpISub, m_b.getTypeId(lhs), lhs, rhs)
+            : lhs;
+    }
     return m_b.createOp(used_comp_op, pred_type, { lhs, rhs });
 }
 
@@ -400,7 +408,16 @@ bool USSETranslatorVisitor::vtst(
     pred_op.num = pdst_n;
     inst.opr.dest = pred_op;
 
-    const spv::Id pred_result = vtst_impl(inst, pred, zero_test, sign_test, load_mask, false);
+    spv::Id alu_result = spv::NoResult;
+    const spv::Id pred_result = vtst_impl(inst, pred, zero_test, sign_test, load_mask, false,
+        m_spirv_params.native_metal && test_wben ? &alu_result : nullptr);
+    if (alu_result != spv::NoResult) {
+        Operand dest{};
+        dest = decode_dest(dest, dest_n, dest_bank, dest_ext, use_double_reg, bits_max, m_second_program);
+        dest.type = load_data_type;
+        dest.swizzle = SWIZZLE_CHANNEL_4_DEFAULT;
+        store(dest, alu_result, load_mask);
+    }
 
     store(inst.opr.dest, pred_result);
     return true;
@@ -481,9 +498,21 @@ bool USSETranslatorVisitor::vtstmsk(
     spv::Id output_type;
     spv::Id zeros;
     spv::Id ones;
+    bool f32_mask_bits = false;
     switch (load_data_type) {
     case DataType::F16:
     case DataType::F32:
+        if (m_spirv_params.native_metal && tst_mask_type == 0) {
+            const bool half = load_data_type == DataType::F16;
+            output_type = m_b.makeUintType(32);
+            zeros = m_b.makeUintConstant(0);
+            ones = m_b.makeUintConstant(half ? 0xFFFFu : 0xFFFFFFFFu);
+            if (half)
+                inst.opr.dest.type = DataType::UINT16;
+            else
+                f32_mask_bits = true;
+            break;
+        }
         output_type = type_f32;
         if (output_4)
             output_type = m_b.makeVectorType(output_type, 4);
@@ -527,6 +556,9 @@ bool USSETranslatorVisitor::vtstmsk(
     }
 
     pred_result = m_b.createOp(spv::OpSelect, output_type, { pred_result, ones, zeros });
+    // Preserve all mask bits in the float register instead of storing 1.0.
+    if (f32_mask_bits)
+        pred_result = m_b.createUnaryOp(spv::OpBitcast, type_f32, pred_result);
 
     store(inst.opr.dest, pred_result);
 

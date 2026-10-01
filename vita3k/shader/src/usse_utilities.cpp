@@ -736,8 +736,28 @@ void buffer_address_access(spv::Builder &b, const SpirvShaderParameters &params,
     const spv::Id i32 = b.makeIntType(32);
     const spv::Id zero = b.makeIntConstant(0);
 
+    if (params.native_metal && !params.buffer_count)
+        throw std::runtime_error("Metal: memory access without a uniform address table");
+
     spv::Id buffer_idx_val;
-    if (buffer_idx == -1) {
+    if (buffer_idx == -1 && params.native_metal) {
+        // Plus encodes the slot around a signed 28-bit offset. Rounding to
+        // the nearest slot keeps an address just below its base in that slot.
+        const auto biased = b.createBinOp(spv::OpIAdd, i32, addr, b.makeIntConstant(1 << 27));
+        buffer_idx_val = b.createBinOp(spv::OpShiftRightLogical, i32, biased, b.makeIntConstant(28));
+        const auto last = b.makeIntConstant(params.buffer_count - 1);
+        const auto too_big = b.createBinOp(spv::OpSGreaterThan, b.makeBoolType(), buffer_idx_val, last);
+        buffer_idx_val = b.createTriOp(spv::OpSelect, i32, too_big, last, buffer_idx_val);
+        const auto slot_base = b.createBinOp(spv::OpShiftLeftLogical, i32, buffer_idx_val, b.makeIntConstant(28));
+        addr = b.createBinOp(spv::OpISub, i32, addr, slot_base);
+        // Preserve Plus's malformed-address fallback. This is not a substitute
+        // for the guest mapping's actual bounds; valid offsets still need it.
+        constexpr int max_offset = 0x1000000;
+        const auto above = b.createBinOp(spv::OpSGreaterThan, b.makeBoolType(), addr, b.makeIntConstant(max_offset));
+        const auto below = b.createBinOp(spv::OpSLessThan, b.makeBoolType(), addr, b.makeIntConstant(-max_offset));
+        const auto invalid = b.createBinOp(spv::OpLogicalOr, b.makeBoolType(), above, below);
+        addr = b.createTriOp(spv::OpSelect, i32, invalid, zero, addr);
+    } else if (buffer_idx == -1) {
         // buffer index is in the upper 4 bits of addr
         buffer_idx_val = b.createBinOp(spv::OpShiftRightLogical, i32, addr, b.makeIntConstant(28));
         // remove the buffer index bits from the address
@@ -749,7 +769,15 @@ void buffer_address_access(spv::Builder &b, const SpirvShaderParameters &params,
     spv::Id buffer_address = utils::create_access_chain(b, spv::StorageClassUniform, params.render_info_id, { b.makeIntConstant(params.buffer_addresses_id), buffer_idx_val });
     buffer_address = b.createLoad(buffer_address, spv::NoPrecision);
     // add the offset from the base address
-    buffer_address = add_uvec2_uint(b, buffer_address, addr);
+    buffer_address = params.native_metal ? add_uvec2_int(b, buffer_address, addr)
+                                         : add_uvec2_uint(b, buffer_address, addr);
+
+    if (params.native_metal && component_size == sizeof(uint32_t)) {
+        const auto u32 = b.makeUintType(32);
+        auto low = b.createCompositeExtract(buffer_address, u32, 0);
+        low = b.createBinOp(spv::OpBitwiseAnd, u32, low, b.makeUintConstant(~3u));
+        buffer_address = b.createCompositeInsert(low, buffer_address, b.getTypeId(buffer_address), 0);
+    }
 
     if (params.native_metal && is_buffer_store && component_size == sizeof(uint32_t)) {
         // A scalar array with a 16-byte stride becomes float4 storage in MSL;
@@ -1412,7 +1440,20 @@ spv::Id load(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunc
         idx_in_arr_1 = b.makeIntConstant((op.num + shift_offset) >> 2);
     }
 
-    if (idx_in_arr_2 == spv::NoResult) {
+    if (params.native_metal) {
+        // Only fetch the last word selected by the swizzle. An unused +3
+        // lookahead can cross the end of a register bank, especially for F16.
+        const int last_word_offset = size_comp == 4 ? highest_dest_write_offset : highest_dest_write_offset / num_comp_in_single_float;
+        if (b.isConstant(finalize_offset)) {
+            idx_in_arr_2 = b.makeIntConstant((op.num + shift_offset + last_word_offset) >> 2);
+        } else if (last_word_offset == 0) {
+            idx_in_arr_2 = idx_in_arr_1;
+        } else {
+            const spv::Id type_i32 = b.makeIntType(32);
+            const spv::Id last_word = b.createBinOp(spv::OpIAdd, type_i32, finalize_offset, b.makeIntConstant(last_word_offset));
+            idx_in_arr_2 = b.createBinOp(spv::OpSDiv, type_i32, last_word, b.makeIntConstant(4));
+        }
+    } else if (idx_in_arr_2 == spv::NoResult) {
         idx_in_arr_2 = b.makeIntConstant((op.num + shift_offset + 3) >> 2);
     }
 
@@ -1487,13 +1528,17 @@ spv::Id unpack(spv::Builder &b, SpirvUtilFunctions &utils, const FeatureState &f
 }
 
 void store(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunctions &utils, const FeatureState &features, Operand dest,
-    spv::Id source, std::uint8_t dest_mask, int off) {
+    spv::Id source, std::uint8_t dest_mask, int off, bool raw_move, bool raw_move_keeps_declared) {
     if (params.native_metal && (dest.is_global || dest.bank == RegisterBank::GLOBAL))
         throw std::runtime_error("Metal: writing SGX global registers is unsupported");
     if (source == spv::NoResult) {
         LOG_WARN("Source invalid");
         return;
     }
+
+    if (params.frag_output_holds_declared_type && dest.bank == RegisterBank::OUTPUT && (dest_mask & 0xF))
+        b.createStore(b.makeBoolConstant(raw_move ? raw_move_keeps_declared : is_float_data_type(dest.type)),
+            params.frag_output_holds_declared_type);
 
     // Check for INDEX bank. INDEX bank are optimized to store an integer
     if (dest.bank == RegisterBank::INDEX || dest.bank == RegisterBank::PREDICATE) {
@@ -1598,9 +1643,17 @@ void store(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFuncti
         std::vector<spv::Id> composites;
         spv::Id vec_comp_type = utils::unwrap_type(b, b.getTypeId(source));
         int source_value_taken_count = 0;
+        const bool preserve_half_bits = params.native_metal && dest.type == DataType::F16;
+        int last_swizz_on = 4;
+        if (preserve_half_bits) {
+            if (!dest_mask)
+                return;
+            while (!(dest_mask & (1 << (last_swizz_on - 1))))
+                --last_swizz_on;
+        }
 
         // We need to pack source
-        for (auto i = 0; i < 4 - nearest_swizz_on; i += num_comp_in_float) {
+        for (auto i = 0; i < last_swizz_on - nearest_swizz_on; i += num_comp_in_float) {
             // Shuffle to get the type out
             std::vector<spv::Id> ops;
             for (auto j = 0; j < num_comp_in_float; j++) {
@@ -1610,6 +1663,9 @@ void store(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFuncti
                     } else {
                         ops.push_back(b.createOp(spv::OpVectorExtractDynamic, vec_comp_type, { source, b.makeIntConstant(std::min(source_value_taken_count++, (int)total_comp_source - 1)) }));
                     }
+                } else if (preserve_half_bits) {
+                    // Merge the original bits after packing the written lanes.
+                    ops.push_back(b.makeFloatConstant(0.0f));
                 } else {
                     if (elem == spv::NoResult) {
                         // Replace it
@@ -1628,6 +1684,22 @@ void store(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFuncti
             spv::Id result_type = utils::make_vector_or_scalar_type(b, vec_comp_type, (int)ops.size());
             spv::Id result = ops.size() == 1 ? ops[0] : b.createCompositeConstruct(result_type, ops);
             result = pack_one(b, utils, features, result, dest.type);
+
+            if (preserve_half_bits) {
+                const uint32_t lanes = (dest_mask >> (nearest_swizz_on + i)) & 3;
+                if (lanes != 3) {
+                    // Unwritten halves can contain integer bits or NaN payloads;
+                    // unpacking and repacking them would not preserve those bits.
+                    const uint32_t mask = lanes == 1 ? 0xFFFFu : 0xFFFF0000u;
+                    const int offset = insert_offset + (nearest_swizz_on + i) / 2;
+                    const spv::Id pointer = b.createOp(spv::OpAccessChain, comp_type, { bank_base, b.makeIntConstant(offset >> 2) });
+                    const spv::Id old = b.createCompositeExtract(b.createLoad(pointer, spv::NoPrecision), type_f32, offset % 4);
+                    const spv::Id u32 = b.makeUintType(32);
+                    const spv::Id kept = b.createBinOp(spv::OpBitwiseAnd, u32, b.createUnaryOp(spv::OpBitcast, u32, old), b.makeUintConstant(~mask));
+                    const spv::Id written = b.createBinOp(spv::OpBitwiseAnd, u32, b.createUnaryOp(spv::OpBitcast, u32, result), b.makeUintConstant(mask));
+                    result = b.createUnaryOp(spv::OpBitcast, type_f32, b.createBinOp(spv::OpBitwiseOr, u32, kept, written));
+                }
+            }
 
             composites.push_back(result);
 
@@ -1788,7 +1860,7 @@ spv::Id convert_to_float(spv::Builder &b, const SpirvUtilFunctions &utils, spv::
     return opr;
 }
 
-spv::Id convert_to_int(spv::Builder &b, const SpirvUtilFunctions &utils, spv::Id opr, DataType type, bool normal) {
+spv::Id convert_to_int(spv::Builder &b, const SpirvUtilFunctions &utils, spv::Id opr, DataType type, bool normal, bool native_metal) {
     const auto opr_type = b.getTypeId(opr);
     assert(b.isFloatType(unwrap_type(b, b.getTypeId(opr))));
 
@@ -1796,6 +1868,7 @@ spv::Id convert_to_int(spv::Builder &b, const SpirvUtilFunctions &utils, spv::Id
     const auto is_uint = is_unsigned_integer_data_type(type);
     const auto target_comp_type = is_uint ? b.makeUintType(32) : b.makeIntType(32);
     const auto target_type = b.isVector(opr) ? b.makeVectorType(target_comp_type, comp_count) : target_comp_type;
+    spv::Id saturate_high = spv::NoResult;
 
     if (normal) {
         const float constant_range = get_int_normalize_range_constants(type);
@@ -1809,12 +1882,44 @@ spv::Id convert_to_int(spv::Builder &b, const SpirvUtilFunctions &utils, spv::Id
         opr = b.createBuiltinCall(opr_type, utils.std_builtins, GLSLstd450FClamp, { opr, range_begin_vec, range_end_vec });
         opr = b.createBinOp(spv::OpFMul, opr_type, opr, normalizer_vec);
         opr = b.createBuiltinCall(opr_type, utils.std_builtins, GLSLstd450Round, { opr });
+    } else if (native_metal) {
+        float lo = 0.0f, hi = 0.0f;
+        switch (type) {
+        case DataType::UINT8: hi = 255.0f; break;
+        case DataType::INT8: lo = -128.0f; hi = 127.0f; break;
+        case DataType::UINT16: hi = 65535.0f; break;
+        case DataType::INT16: lo = -32768.0f; hi = 32767.0f; break;
+        // Use the largest representable float below the overflow boundary.
+        // The actual integer maximum is selected after conversion below.
+        case DataType::UINT32: hi = 4294967040.0f; break;
+        case DataType::INT32: lo = -2147483648.0f; hi = 2147483520.0f; break;
+        default: break;
+        }
+        if (lo != hi) {
+            const auto constant = [&](float value) {
+                return create_constant_vector_or_scalar(b, b.makeFloatConstant(value), comp_count);
+            };
+            const auto bool_type = make_vector_or_scalar_type(b, b.makeBoolType(), comp_count);
+            const auto is_nan = b.createUnaryOp(spv::OpIsNan, bool_type, opr);
+            opr = b.createTriOp(spv::OpSelect, opr_type, is_nan, constant(0.0f), opr);
+            if (type == DataType::UINT32 || type == DataType::INT32) {
+                const float overflow = is_uint ? 4294967296.0f : 2147483648.0f;
+                saturate_high = b.createBinOp(spv::OpFOrdGreaterThanEqual, bool_type, opr, constant(overflow));
+            }
+            opr = b.createBuiltinCall(opr_type, utils.std_builtins, GLSLstd450FClamp, { opr, constant(lo), constant(hi) });
+        }
     }
 
     if (!is_uint) {
         opr = b.createUnaryOp(spv::OpConvertFToS, target_type, opr);
     } else {
         opr = b.createUnaryOp(spv::OpConvertFToU, target_type, opr);
+    }
+
+    if (saturate_high != spv::NoResult) {
+        const auto maximum = is_uint ? b.makeUintConstant(0xFFFFFFFFu) : b.makeIntConstant(0x7FFFFFFF);
+        opr = b.createTriOp(spv::OpSelect, target_type, saturate_high,
+            create_constant_vector_or_scalar(b, maximum, comp_count), opr);
     }
 
     return opr;
@@ -1844,6 +1949,20 @@ spv::Id add_uvec2_uint(spv::Builder &b, spv::Id vec, spv::Id to_add) {
     upper = b.createBinOp(spv::OpIAdd, u32, upper, carry);
     lower = b.createCompositeExtract(lower_add, u32, 0);
     return b.createCompositeConstruct(uvec2, { lower, upper });
+}
+
+spv::Id add_uvec2_int(spv::Builder &b, spv::Id vec, spv::Id to_add) {
+    const auto i32 = b.makeIntType(32);
+    const auto u32 = b.makeUintType(32);
+    if (b.isUintType(b.getTypeId(to_add)))
+        to_add = b.createUnaryOp(spv::OpBitcast, i32, to_add);
+    // The unsigned helper supplies the low-word carry. Adding the sign to the
+    // high word then turns e.g. 0xfffffffc into -4, including a low-word borrow.
+    auto result = add_uvec2_uint(b, vec, to_add);
+    auto sign = b.createBinOp(spv::OpShiftRightArithmetic, i32, to_add, b.makeIntConstant(31));
+    sign = b.createUnaryOp(spv::OpBitcast, u32, sign);
+    const auto high = b.createBinOp(spv::OpIAdd, u32, b.createCompositeExtract(result, u32, 1), sign);
+    return b.createCompositeInsert(high, result, b.getTypeId(result), 1);
 }
 
 } // namespace shader::usse::utils

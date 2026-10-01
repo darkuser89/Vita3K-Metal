@@ -17,6 +17,7 @@
 
 #include <gxm/functions.h>
 #include <gxm/types.h>
+#include <display/state.h>
 #include <renderer/commands.h>
 #include <renderer/driver_functions.h>
 #include <renderer/state.h>
@@ -42,7 +43,86 @@
 #endif
 
 namespace renderer {
+void mark_metal_command_payload(Command &cmd) {
+    switch (cmd.opcode) {
+    case CommandOpcode::SetContext:
+    case CommandOpcode::TransferCopy:
+    case CommandOpcode::TransferDownscale:
+    case CommandOpcode::TransferFill:
+    case CommandOpcode::SetScreenFilter:
+    case CommandOpcode::NewFrame:
+        cmd.flags |= Command::FLAG_METAL_RAW_PAYLOAD;
+        break;
+    default:
+        break;
+    }
+}
+
+void mark_metal_command_payload(const State &state, Command &cmd) {
+    if (state.current_backend == Backend::Metal)
+        mark_metal_command_payload(cmd);
+}
+
+void destroy_metal_command_payload(Command &cmd) {
+#ifdef __APPLE__
+    if (cmd.flags & Command::FLAG_METAL_PROGRAM_BINDING) {
+        CommandHelper helper(&cmd);
+        helper.pop<GXMState>();
+        helper.pop<Ptr<const void>>();
+        helper.pop<bool>();
+        delete helper.pop<std::shared_ptr<const metal::ProgramBinding> *>();
+        cmd.flags &= ~Command::FLAG_METAL_PROGRAM_BINDING;
+    }
+#endif
+    if (!(cmd.flags & Command::FLAG_METAL_RAW_PAYLOAD))
+        return;
+    cmd.flags &= ~Command::FLAG_METAL_RAW_PAYLOAD;
+    CommandHelper helper(&cmd);
+    switch (cmd.opcode) {
+    case CommandOpcode::SetContext: {
+        helper.pop<RenderTarget *>();
+        const auto surfaces_at = helper.point;
+        delete helper.pop<SceGxmColorSurface *>();
+        delete helper.pop<SceGxmDepthStencilSurface *>();
+        // Legacy cleanup also recognizes SetContext by opcode. Leave nulls
+        // so repeated cleanup cannot delete already-consumed descriptors.
+        helper.point = surfaces_at;
+        SceGxmColorSurface *color = nullptr;
+        SceGxmDepthStencilSurface *depth = nullptr;
+        helper.push(color);
+        helper.push(depth);
+        break;
+    }
+    case CommandOpcode::TransferCopy:
+        helper.pop<uint32_t>();
+        helper.pop<uint32_t>();
+        helper.pop<SceGxmTransferColorKeyMode>();
+        delete[] helper.pop<const SceGxmTransferImage *>();
+        break;
+    case CommandOpcode::TransferDownscale:
+        delete helper.pop<SceGxmTransferImage *>();
+        delete helper.pop<SceGxmTransferImage *>();
+        break;
+    case CommandOpcode::TransferFill:
+        helper.pop<uint32_t>();
+        delete helper.pop<const SceGxmTransferImage *>();
+        break;
+    case CommandOpcode::SetScreenFilter:
+        delete helper.pop<std::string *>();
+        break;
+    case CommandOpcode::NewFrame:
+        delete helper.pop<DisplayFrameInfo *>();
+        break;
+    default:
+        break;
+    }
+}
+
 void destroy_command_payload(Command &cmd) {
+    if (cmd.flags & (Command::FLAG_METAL_PROGRAM_BINDING | Command::FLAG_METAL_RAW_PAYLOAD)) {
+        destroy_metal_command_payload(cmd);
+        return;
+    }
     switch (cmd.opcode) {
     case CommandOpcode::SetContext: {
         auto *color_surface = reinterpret_cast<SceGxmColorSurface **>(&cmd.data[sizeof(RenderTarget *)]);

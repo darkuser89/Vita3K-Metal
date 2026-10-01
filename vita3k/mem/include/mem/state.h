@@ -41,12 +41,14 @@ typedef std::map<int, std::string> PageNameMap;
 struct ProtectBlockInfo {
     uint32_t size = 0;
     ProtectCallback callback;
+    bool retain_on_read = false;
 };
 
 struct ProtectSegmentInfo {
     std::multimap<Address, ProtectBlockInfo> blocks;
     uint32_t size = 0;
     MemPerm perm = MemPerm::None;
+    bool write_watch_ranges_only = false;
 
     explicit ProtectSegmentInfo() = default;
     explicit ProtectSegmentInfo(uint32_t size, MemPerm perm)

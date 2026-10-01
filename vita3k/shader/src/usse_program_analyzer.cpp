@@ -66,20 +66,21 @@ bool does_write_to_predicate(const std::uint64_t inst, std::uint8_t &pred) {
     return false;
 }
 
-std::uint8_t get_predicate(const std::uint64_t inst) {
+std::uint8_t get_predicate(const std::uint64_t inst, bool native_metal) {
     switch (inst >> 59) {
-    // VMAD2
-    case 0b00000:
-        return ((inst >> 32) & ~0xFCFFFFFF) >> 24;
-
     // V32NMAD, V16NMAD, VMAD
     case 0b00001:
     case 0b00010:
     case 0b00011: {
         uint8_t predicate = ((inst >> 32) & ~0xF8FFFFFFU) >> 24;
-        return static_cast<uint8_t>(ext_vec_predicate_to_ext(static_cast<ExtVecPredicate>(predicate)));
+        return static_cast<uint8_t>(ext_vec_predicate_to_ext(static_cast<ExtVecPredicate>(predicate), native_metal));
     }
 
+    // Plus decodes VMAD2's two bits as NONE/P0/!P0/PN, not P0/P1/P2.
+    case 0b00000:
+        if (!native_metal)
+            return ((inst >> 32) & ~0xFCFFFFFF) >> 24;
+        [[fallthrough]];
     // VMAD normal version, predicates only occupied two bits
     case 0b00100:
     case 0b00101: {
@@ -309,7 +310,7 @@ void USSELoopNode::set_content_block(USSEBaseNodeInstance &node) {
     children[0] = std::move(node);
 }
 
-void analyze(USSEBlockNode &root, USSEOffset end_offset, const AnalyzeReadFunction &read_func) {
+void analyze(USSEBlockNode &root, USSEOffset end_offset, const AnalyzeReadFunction &read_func, bool native_metal) {
     struct BlockInvestigateRequest {
         USSEOffset begin_offset;
         USSEOffset end_offset;
@@ -393,7 +394,7 @@ void analyze(USSEBlockNode &root, USSEOffset end_offset, const AnalyzeReadFuncti
                 break;
             }
 
-            std::uint8_t pred = get_predicate(inst);
+            std::uint8_t pred = get_predicate(inst, native_metal);
 
             if (baddr == current_code->offset) {
                 current_code->condition = pred;
@@ -450,12 +451,24 @@ void analyze(USSEBlockNode &root, USSEOffset end_offset, const AnalyzeReadFuncti
                         current_code->size = baddr - current_code->offset;
                         request.block_node->add_children(current_code_inst);
 
-                        baddr = branch_from_result->second.dest - 1;
-
-                        std::unique_ptr<USSEBaseNode> current_code_inst = std::make_unique<USSECodeNode>(request.block_node);
-                        USSECodeNode *current_code = reinterpret_cast<USSECodeNode *>(current_code_inst.get());
-
-                        current_code->offset = baddr;
+                        if (native_metal) {
+                            const uint32_t follow_dest = branch_from_result->second.dest;
+                            if (follow_dest > request.end_offset) {
+                                current_code_inst = nullptr;
+                                break;
+                            }
+                            baddr = follow_dest - 1;
+                            // Replace the moved block owner instead of shadowing
+                            // it with a temporary destroyed at the end of this arm.
+                            current_code_inst = std::make_unique<USSECodeNode>(request.block_node);
+                            current_code = reinterpret_cast<USSECodeNode *>(current_code_inst.get());
+                            current_code->offset = follow_dest;
+                        } else {
+                            baddr = branch_from_result->second.dest - 1;
+                            std::unique_ptr<USSEBaseNode> current_code_inst = std::make_unique<USSECodeNode>(request.block_node);
+                            USSECodeNode *current_code = reinterpret_cast<USSECodeNode *>(current_code_inst.get());
+                            current_code->offset = baddr;
+                        }
                     } else {
                         bool else_exist = false;
                         auto branch_from_else_result = branches_from.find(branch_from_result->second.dest - 1);
@@ -563,7 +576,14 @@ void analyze(USSEBlockNode &root, USSEOffset end_offset, const AnalyzeReadFuncti
 
                 std::uint8_t predicate_writed_to = 0;
                 if (does_write_to_predicate(inst, predicate_writed_to)) {
-                    is_predicate_invalidated = ((predicate_writed_to + 1) == current_code->condition) || ((predicate_writed_to + 5) == current_code->condition);
+                    if (native_metal) {
+                        // NEGP2 is appended after PN, outside the legacy +5 encoding.
+                        static constexpr ExtPredicate negated[] = {ExtPredicate::NEGP0, ExtPredicate::NEGP1, ExtPredicate::NEGP2, ExtPredicate::PN};
+                        is_predicate_invalidated = ((predicate_writed_to + 1) == current_code->condition)
+                            || (predicate_writed_to < 4 && static_cast<uint8_t>(negated[predicate_writed_to]) == current_code->condition);
+                    } else {
+                        is_predicate_invalidated = ((predicate_writed_to + 1) == current_code->condition) || ((predicate_writed_to + 5) == current_code->condition);
+                    }
                 }
 
                 std::uint32_t offset_end = 0;

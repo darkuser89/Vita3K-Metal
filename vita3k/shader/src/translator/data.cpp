@@ -205,7 +205,11 @@ bool USSETranslatorVisitor::vmov(
         const auto words = load(source, 0b0011, src1_repeat_offset);
         if (words == spv::NoResult)
             return false;
+        // The bit-preserving path moves two whole words; retain their source
+        // types just like the ordinary VMOV path below.
+        track_raw_move(inst, 0b0011, 4, src1_repeat_offset, src2_repeat_offset, dest_repeat_offset, false);
         store(destination, words, 0b0011, dest_repeat_offset);
+        m_store_is_raw_move = false;
         continue;
     }
 
@@ -224,7 +228,8 @@ bool USSETranslatorVisitor::vmov(
         source_2 = load(inst.opr.src2, dest_mask, src2_repeat_offset);
         spv::Id result_type = m_b.getTypeId(source_2);
         spv::Id v0_comp_type = is_test_unsigned ? m_b.makeUintType(32) : (is_test_signed ? m_b.makeIntType(32) : m_b.makeFloatType(32));
-        spv::Id v0_type = utils::make_vector_or_scalar_type(m_b, v0_comp_type, m_b.getNumComponents(source_2));
+        spv::Id v0_type = utils::make_vector_or_scalar_type(m_b, v0_comp_type,
+            m_b.getNumComponents(m_spirv_params.native_metal ? source_to_compare_with_0 : source_2));
         spv::Id v0 = utils::make_uniform_vector_from_type(m_b, v0_type, 0);
 
         bool source_2_first = false;
@@ -234,6 +239,13 @@ bool USSETranslatorVisitor::vmov(
             // First compare source0 with vector 0
             spv::Id cond_result = m_b.createOp(compare_op, utils::make_vector_or_scalar_type(m_b, m_b.makeBoolType(), m_b.getNumComponents(source_to_compare_with_0)),
                 { source_to_compare_with_0, v0 });
+            // Match Plus's scalar-condition broadcast for pre-1.4 SPIR-V.
+            if (m_spirv_params.native_metal && m_b.getNumComponents(cond_result) == 1
+                && m_b.getNumComponents(source_2) > 1) {
+                const int count = m_b.getNumComponents(source_2);
+                cond_result = m_b.createCompositeConstruct(m_b.makeVectorType(m_b.makeBoolType(), count),
+                    std::vector<spv::Id>(count, cond_result));
+            }
 
             // For each component, if the compare result is true, move the equivalent component from source1 to dest,
             // else the same thing with source2
@@ -290,7 +302,10 @@ bool USSETranslatorVisitor::vmov(
         result = source_1;
     }
 
+    track_raw_move(inst, dest_mask, get_data_type_size(move_data_type),
+        src1_repeat_offset, src2_repeat_offset, dest_repeat_offset, is_conditional);
     store(inst.opr.dest, result, dest_mask, dest_repeat_offset);
+    m_store_is_raw_move = false;
 
     END_REPEAT()
 
@@ -538,23 +553,63 @@ bool USSETranslatorVisitor::vpck(
 
     // source is float destination is int
     if (!is_float_data_type(inst.opr.dest.type) && is_float_data_type(inst.opr.src1.type)) {
-        // Metal packs the converted value into an 8-bit field. Clamp the
-        // unscaled float first so values above 255 do not wrap to zero when
-        // the field is inserted into the destination register.
-        if (m_spirv_params.native_metal && inst.opr.dest.type == DataType::UINT8 && !scale) {
-            const unsigned count = m_b.isVector(source) ? m_b.getNumComponents(source) : 1;
-            const auto bound = [this, count](float value) {
-                const spv::Id scalar = m_b.makeFloatConstant(value);
-                return count == 1 ? scalar : m_b.makeCompositeConstant(
-                    m_b.makeVectorType(m_b.makeFloatType(32), count), std::vector<spv::Id>(count, scalar));
-            };
-            source = m_b.createBuiltinCall(m_b.getTypeId(source), m_util_funcs.std_builtins,
-                GLSLstd450FClamp, { source, bound(0.f), bound(255.f) });
-        }
-        source = utils::convert_to_int(m_b, m_util_funcs, source, inst.opr.dest.type, scale);
+        source = utils::convert_to_int(m_b, m_util_funcs, source, inst.opr.dest.type, scale, m_spirv_params.native_metal);
     }
 
-    store(inst.opr.dest, source, dest_mask, dest_repeat_offset);
+    Imm4 store_mask = dest_mask;
+    if (m_spirv_params.native_metal) {
+        const int size = get_data_type_size(inst.opr.dest.type);
+        const uint32_t base = (inst.opr.dest.num + dest_repeat_offset) & 0xFFFFFF;
+        const auto key = [&](uint32_t word) {
+            return (uint32_t(inst.opr.dest.bank) << 24) | (word & 0xFFFFFF);
+        };
+        if (is_integer_data_type(inst.opr.dest.type) && size < 4
+            && inst.opr.dest.bank != RegisterBank::FPINTERNAL) {
+            // Plus clears unwritten lanes only within words touched by this
+            // pack, unless an earlier pack, integer store or sample owns them.
+            // FPINTERNAL has unpacked 32-bit lanes, not packed word siblings.
+            const int per_word = 4 / size;
+            Imm4 expanded = 0;
+            for (int lane = 0; lane < 4; lane += per_word) {
+                const Imm4 word_mask = ((1 << per_word) - 1) << lane;
+                if (dest_mask & word_mask) expanded |= word_mask;
+            }
+            Imm4 zero_lanes = 0;
+            for (int lane = 0; lane < 4; ++lane) {
+                if (!(expanded & (1 << lane)) || (dest_mask & (1 << lane))) continue;
+                const uint32_t byte = lane * size;
+                const uint8_t bytes = ((1u << size) - 1) << (byte % 4);
+                const auto found = m_vpck_written_bytes.find(key(base + byte / 4));
+                if (found == m_vpck_written_bytes.end() || !(found->second & bytes))
+                    zero_lanes |= 1 << lane;
+            }
+            if (zero_lanes) {
+                store_mask |= zero_lanes;
+                const auto component = utils::unwrap_type(m_b, m_b.getTypeId(source));
+                const auto zero = m_b.isUintType(component) ? m_b.makeUintConstant(0) : m_b.makeIntConstant(0);
+                std::vector<spv::Id> values;
+                int source_index = 0;
+                for (int lane = 0; lane < 4; ++lane) {
+                    if (!(store_mask & (1 << lane))) continue;
+                    if (dest_mask & (1 << lane)) {
+                        values.push_back(m_b.isScalar(source) ? source
+                            : m_b.createCompositeExtract(source, component, source_index));
+                        ++source_index;
+                    } else values.push_back(zero);
+                }
+                source = values.size() == 1 ? values.front()
+                    : m_b.createCompositeConstruct(utils::make_vector_or_scalar_type(m_b, component, int(values.size())), values);
+            }
+        }
+        for (int lane = 0; lane < 4; ++lane) {
+            if (!(store_mask & (1 << lane))) continue;
+            const uint32_t byte = lane * size;
+            m_vpck_written_bytes[key(base + byte / 4)] |= uint8_t((size >= 4 ? 0xFu : (1u << size) - 1) << (byte % 4));
+        }
+        m_store_from_vpck = true;
+    }
+    store(inst.opr.dest, source, store_mask, dest_repeat_offset);
+    m_store_from_vpck = false;
     END_REPEAT()
 
     reset_repeat_multiplier();
@@ -713,8 +768,21 @@ bool USSETranslatorVisitor::vldst(
         if (offset % 4 != 0)
             continue;
 
+        int texture_unit = offset / 4;
+        if (m_spirv_params.native_metal) {
+            // The compiler's buffer slot may differ from the texture unit.
+            // SMP's dynamic switch is keyed by unit, just like direct SA samplers.
+            const auto *layout = m_program.texture_buffer_dependent_sampler();
+            for (uint32_t i = 0; i < m_program.texture_buffer_dependent_sampler_count; ++i) {
+                if (layout[i].resource_index_layout_offset % 4 == 0
+                    && layout[i].sa_offset / 4 == offset / 4) {
+                    texture_unit = layout[i].resource_index_layout_offset / 4;
+                    break;
+                }
+            }
+        }
         to_store.type = DataType::INT32;
-        store(to_store, m_b.makeIntConstant(offset / 4), 0b1);
+        store(to_store, m_b.makeIntConstant(texture_unit), 0b1);
         continue;
     } else if (inst.opr.src0.bank == RegisterBank::SECATTR && inst.opr.src0.num == m_spirv_params.literal_buffer_sa_offset) {
         // We are reading the literal buffer
@@ -735,6 +803,14 @@ bool USSETranslatorVisitor::vldst(
 
     // are we using the sa register containing the thread buffer address ?
     const bool is_thread_buffer_access = inst.opr.src0.bank == RegisterBank::SECATTR && inst.opr.src0.num == m_spirv_params.thread_buffer_sa_offset;
+    const auto bounded_thread_index = [&](spv::Id index) {
+        if (!m_spirv_params.native_metal || !m_spirv_params.thread_buffer_f32_count)
+            return index;
+        const auto last = m_b.makeIntConstant(m_spirv_params.thread_buffer_f32_count - 1);
+        const auto inside = m_b.createBinOp(spv::OpULessThanEqual, m_b.makeBoolType(), index, last);
+        // Match Plus: out-of-range (including negative) indices select the last word.
+        return m_b.createTriOp(spv::OpSelect, m_b.getTypeId(index), inside, index, last);
+    };
 
     if (m_spirv_params.native_metal && is_thread_buffer_access && addr_mode == 1) {
         // SGX LOCAL register offsets encode stride in bits 31:16 and a byte
@@ -763,7 +839,7 @@ bool USSETranslatorVisitor::vldst(
                 ? (inst.opr.src1.bank == RegisterBank::IMMEDIATE ? current_repeat : 0) : component;
             const auto index = element
                 ? m_b.createBinOp(spv::OpIAdd, i32, base_index, m_b.makeIntConstant(element)) : base_index;
-            const auto ptr = utils::create_access_chain(m_b, spv::StorageClassPrivate, m_spirv_params.thread_buffer, { index });
+            const auto ptr = utils::create_access_chain(m_b, spv::StorageClassPrivate, m_spirv_params.thread_buffer, { bounded_thread_index(index) });
             if (is_store) {
                 m_b.createStore(load(to_store, 0b1, to_store_offset), ptr);
             } else {
@@ -785,7 +861,10 @@ bool USSETranslatorVisitor::vldst(
     spv::Id i32_type = m_b.makeIntType(32);
 
     if (inst.opr.src1.bank != shader::usse::RegisterBank::IMMEDIATE) {
-        source_1 = m_b.createBinOp(spv::OpISub, m_b.getTypeId(source_1), source_1, reg_index_base_cst);
+        if (m_spirv_params.native_metal && is_thread_buffer_access)
+            source_1 = m_b.createBinOp(spv::OpBitwiseAnd, m_b.getTypeId(source_1), source_1, m_b.makeIntConstant(0xFFFF));
+        else
+            source_1 = m_b.createBinOp(spv::OpISub, m_b.getTypeId(source_1), source_1, reg_index_base_cst);
     }
 
     if (!moe_expand) {
@@ -811,11 +890,12 @@ bool USSETranslatorVisitor::vldst(
         }
 
         if (m_spirv_params.thread_buffer_base != 0)
-            source_1 = m_b.createBinOp(spv::OpIAdd, i32_type, source_1, m_spirv_params.thread_buffer_base);
+            source_1 = m_b.createBinOp(spv::OpIAdd, i32_type, source_1, m_spirv_params.native_metal
+                ? m_b.makeIntConstant(m_spirv_params.thread_buffer_base) : m_spirv_params.thread_buffer_base);
 
         // get the index in the float array
         spv::Id index = m_b.createBinOp(spv::OpShiftRightLogical, i32_type, source_1, m_b.makeUintConstant(2));
-        spv::Id float_ptr = utils::create_access_chain(m_b, spv::StorageClassPrivate, m_spirv_params.thread_buffer, { index });
+        spv::Id float_ptr = utils::create_access_chain(m_b, spv::StorageClassPrivate, m_spirv_params.thread_buffer, { bounded_thread_index(index) });
         if (is_store) {
             spv::Id value = load(to_store, 0b1);
             m_b.createStore(value, float_ptr);

@@ -107,7 +107,7 @@ bool USSETranslatorVisitor::vmad(
     Imm1 src1_swiz_ext,
     Imm4 src1_swiz,
     Imm6 src1_n) {
-    std::string disasm_str = fmt::format("{:016x}: {}{}", m_instr, disasm::e_predicate_str(ext_vec_predicate_to_ext(pred)), "VMAD");
+    std::string disasm_str = fmt::format("{:016x}: {}{}", m_instr, disasm::e_predicate_str(ext_vec_predicate_to_ext(pred, m_spirv_params.native_metal)), "VMAD");
 
     Instruction inst;
 
@@ -403,7 +403,7 @@ bool USSETranslatorVisitor::vdp(
     BEGIN_REPEAT(repeat_count)
     GET_REPEAT(inst, repeat_mode)
 
-    LOG_DISASM("{:016x}: {}VDP {} {} {}", m_instr, disasm::e_predicate_str(ext_vec_predicate_to_ext(pred)), disasm::operand_to_str(inst.opr.dest, write_mask, 0),
+    LOG_DISASM("{:016x}: {}VDP {} {} {}", m_instr, disasm::e_predicate_str(ext_vec_predicate_to_ext(pred, m_spirv_params.native_metal)), disasm::operand_to_str(inst.opr.dest, write_mask, 0),
         disasm::operand_to_str(inst.opr.src1, src_mask, src1_repeat_offset), disasm::operand_to_str(inst.opr.src2, src_mask, src2_repeat_offset));
 
     spv::Id lhs = load(inst.opr.src1, type == 1 ? 0b0111 : 0b1111, src1_repeat_offset);
@@ -425,9 +425,10 @@ bool USSETranslatorVisitor::vdp(
     return true;
 }
 
-spv::Id USSETranslatorVisitor::do_alu_op(Instruction &inst, const Imm4 source_mask, const Imm4 possible_dest_mask) {
-    spv::Id vsrc1 = load(inst.opr.src1, source_mask, 0);
-    spv::Id vsrc2 = load(inst.opr.src2, source_mask, 0);
+spv::Id USSETranslatorVisitor::do_alu_op(Instruction &inst, const Imm4 source_mask, const Imm4 possible_dest_mask,
+    int src1_repeat_offset, int src2_repeat_offset) {
+    spv::Id vsrc1 = load(inst.opr.src1, source_mask, src1_repeat_offset);
+    spv::Id vsrc2 = load(inst.opr.src2, source_mask, src2_repeat_offset);
     std::vector<spv::Id> ids;
     ids.push_back(vsrc1);
 
@@ -498,13 +499,13 @@ spv::Id USSETranslatorVisitor::do_alu_op(Instruction &inst, const Imm4 source_ma
 
     case Opcode::VMIN:
     case Opcode::VF16MIN: {
-        result = m_b.createBuiltinCall(source_type, std_builtins, GLSLstd450FMin, { vsrc1, vsrc2 });
+        result = m_b.createBuiltinCall(source_type, std_builtins, m_spirv_params.native_metal ? GLSLstd450NMin : GLSLstd450FMin, { vsrc1, vsrc2 });
         break;
     }
 
     case Opcode::VMAX:
     case Opcode::VF16MAX: {
-        result = m_b.createBuiltinCall(source_type, std_builtins, GLSLstd450FMax, { vsrc1, vsrc2 });
+        result = m_b.createBuiltinCall(source_type, std_builtins, m_spirv_params.native_metal ? GLSLstd450NMax : GLSLstd450FMax, { vsrc1, vsrc2 });
         break;
     }
 
@@ -513,7 +514,8 @@ spv::Id USSETranslatorVisitor::do_alu_op(Instruction &inst, const Imm4 source_ma
         // Dest = Source1 - Floor(Source2)
         // If two source are identical, let's use the fractional function
         if (inst.opr.src1.is_same(inst.opr.src2, source_mask)
-            && (!m_spirv_params.native_metal || inst.opr.src1.is_global == inst.opr.src2.is_global)) {
+            && (!m_spirv_params.native_metal || (inst.opr.src1.is_global == inst.opr.src2.is_global
+                && src1_repeat_offset == src2_repeat_offset))) {
             result = m_b.createBuiltinCall(source_type, std_builtins, GLSLstd450Fract, { vsrc1 });
         } else {
             // We need to floor source 2
@@ -639,18 +641,29 @@ bool USSETranslatorVisitor::v32nmad(
         }
     }
 
-    ExtPredicate pred_translated = ext_vec_predicate_to_ext(pred);
+    ExtPredicate pred_translated = ext_vec_predicate_to_ext(pred, m_spirv_params.native_metal);
 
-    LOG_DISASM("{:016x}: {}{} {} {} {}", m_instr, disasm::e_predicate_str(pred_translated), disasm::opcode_str(opcode), disasm::operand_to_str(inst.opr.dest, dest_mask),
-        disasm::operand_to_str(inst.opr.src1, source_mask), disasm::operand_to_str(inst.opr.src2, source_mask));
+    // VNMAD has no repeat count, but slot zero can still carry SMLSI offsets.
+    int src1_repeat_offset = 0, src2_repeat_offset = 0, dest_repeat_offset = 0;
+    if (m_spirv_params.native_metal) {
+        set_repeat_multiplier(2, 2, 2, 2);
+        src1_repeat_offset = get_repeat_offset(inst.opr.src1, 0, RepeatMode::SLMSI, inst.opr.src1.bank);
+        src2_repeat_offset = get_repeat_offset(inst.opr.src2, 0, RepeatMode::SLMSI, inst.opr.src2.bank);
+        dest_repeat_offset = get_repeat_offset(inst.opr.dest, 0, RepeatMode::SLMSI, inst.opr.dest.bank);
+    }
+    LOG_DISASM("{:016x}: {}{} {} {} {}", m_instr, disasm::e_predicate_str(pred_translated), disasm::opcode_str(opcode), disasm::operand_to_str(inst.opr.dest, dest_mask, dest_repeat_offset),
+        disasm::operand_to_str(inst.opr.src1, source_mask, src1_repeat_offset), disasm::operand_to_str(inst.opr.src2, source_mask, src2_repeat_offset));
 
     // Recompile
     m_b.setDebugSourceLocation(m_recompiler.cur_pc, nullptr);
-    spv::Id result = do_alu_op(inst, source_mask, dest_mask);
+    spv::Id result = do_alu_op(inst, source_mask, dest_mask, src1_repeat_offset, src2_repeat_offset);
 
     if (result != spv::NoResult) {
-        store(inst.opr.dest, result, dest_mask, 0);
+        store(inst.opr.dest, result, dest_mask, dest_repeat_offset);
     }
+
+    if (m_spirv_params.native_metal)
+        reset_repeat_multiplier();
 
     return true;
 }
@@ -797,16 +810,16 @@ bool USSETranslatorVisitor::vcomp(
     }
 
     case Opcode::VLOG: {
-        // src0 = e^y => return y
-        result = m_b.createBuiltinCall(m_b.getTypeId(result), std_builtins, GLSLstd450Log, { result });
+        // The native guest complex unit computes log2; retain the other backends' translation.
+        result = m_b.createBuiltinCall(m_b.getTypeId(result), std_builtins, m_spirv_params.native_metal ? GLSLstd450Log2 : GLSLstd450Log, { result });
         break;
     }
 
     case Opcode::VEXP: {
-        // y = e^src0 => return y
+        // The native guest complex unit computes exp2.
         // hack (kind of) :
         // define exp(Nan) as 1.0, this is needed for Freedom Wars to render properly
-        const spv::Id exp_val = m_b.createBuiltinCall(m_b.getTypeId(result), std_builtins, GLSLstd450Exp, { result });
+        const spv::Id exp_val = m_b.createBuiltinCall(m_b.getTypeId(result), std_builtins, m_spirv_params.native_metal ? GLSLstd450Exp2 : GLSLstd450Exp, { result });
         const spv::Id ones = utils::make_uniform_vector_from_type(m_b, m_b.getTypeId(result), 1.0f);
         const spv::Id is_nan = m_b.createUnaryOp(spv::OpIsNan, m_b.makeBoolType(), result);
         result = m_b.createTriOp(spv::OpSelect, m_b.getTypeId(result), is_nan, ones, exp_val);
@@ -993,12 +1006,12 @@ bool USSETranslatorVisitor::sop2(
 
         case Opcode::FMIN:
         case Opcode::VMIN: {
-            return m_b.createBuiltinCall(type, std_builtins, GLSLstd450FMin, { lhs, rhs });
+            return m_b.createBuiltinCall(type, std_builtins, m_spirv_params.native_metal ? GLSLstd450NMin : GLSLstd450FMin, { lhs, rhs });
         }
 
         case Opcode::FMAX:
         case Opcode::VMAX: {
-            return m_b.createBuiltinCall(type, std_builtins, GLSLstd450FMax, { lhs, rhs });
+            return m_b.createBuiltinCall(type, std_builtins, m_spirv_params.native_metal ? GLSLstd450NMax : GLSLstd450FMax, { lhs, rhs });
         }
 
         default: {
@@ -1198,12 +1211,12 @@ bool shader::usse::USSETranslatorVisitor::sop2m(Imm2 pred,
 
         case Opcode::FMIN:
         case Opcode::VMIN: {
-            return m_b.createBuiltinCall(type, std_builtins, GLSLstd450FMin, { lhs, rhs });
+            return m_b.createBuiltinCall(type, std_builtins, m_spirv_params.native_metal ? GLSLstd450NMin : GLSLstd450FMin, { lhs, rhs });
         }
 
         case Opcode::FMAX:
         case Opcode::VMAX: {
-            return m_b.createBuiltinCall(type, std_builtins, GLSLstd450FMax, { lhs, rhs });
+            return m_b.createBuiltinCall(type, std_builtins, m_spirv_params.native_metal ? GLSLstd450NMax : GLSLstd450FMax, { lhs, rhs });
         }
 
         default: {
@@ -1262,6 +1275,11 @@ bool shader::usse::USSETranslatorVisitor::sop2m(Imm2 pred,
     }
 
     result = utils::convert_to_int(m_b, m_util_funcs, result, DataType::UINT8, true);
+
+    // store() consumes compact source lanes. Select the written components
+    // first when SOP2M's mask does not start with contiguous lanes at x.
+    if (m_spirv_params.native_metal && (wmask & (wmask + 1)) != 0)
+        result = utils::finalize(m_b, result, result, SWIZZLE_CHANNEL_4_DEFAULT, m_b.makeIntConstant(0), wmask);
 
     // Final result. Do binary operation and then store
     store(inst.opr.dest, result, wmask, 0);
@@ -1904,7 +1922,7 @@ bool USSETranslatorVisitor::vdual(
         case Opcode::FEXP: {
             // hack: set exp(nan) = 1.0 (see VEXP)
             const spv::Id source = load(ops[0], write_mask_source);
-            result = m_b.createBuiltinCall(m_b.getTypeId(source), std_builtins, GLSLstd450Exp, { source });
+            result = m_b.createBuiltinCall(m_b.getTypeId(source), std_builtins, m_spirv_params.native_metal ? GLSLstd450Exp2 : GLSLstd450Exp, { source });
             const int num_comp = m_b.getNumComponents(source);
             const spv::Id ones = utils::make_uniform_vector_from_type(m_b, m_b.getTypeId(result), 1.0f);
             const spv::Id is_nan = m_b.createUnaryOp(spv::OpIsNan, utils::make_vector_or_scalar_type(m_b, m_b.makeBoolType(), num_comp), result);
@@ -1913,7 +1931,7 @@ bool USSETranslatorVisitor::vdual(
         }
         case Opcode::FLOG: {
             const spv::Id source = load(ops[0], write_mask_source);
-            result = m_b.createBuiltinCall(m_b.getTypeId(source), std_builtins, GLSLstd450Log, { source });
+            result = m_b.createBuiltinCall(m_b.getTypeId(source), std_builtins, m_spirv_params.native_metal ? GLSLstd450Log2 : GLSLstd450Log, { source });
             break;
         }
         case Opcode::VSSQ: {
@@ -1953,6 +1971,11 @@ bool USSETranslatorVisitor::vdual(
             LOG_ERROR("Missing implementation for DUAL {}.", disasm::opcode_str(code));
             return spv::NoResult;
         }
+
+        // A scalar DUAL result is replicated into every selected destination
+        // component, including noncontiguous masks and dot-product results.
+        if (m_spirv_params.native_metal && result != spv::NoResult && m_b.getNumComponents(result) == 1)
+            result = postprocess_dot_result_for_store(m_b, result, write_mask_dest);
 
         disasm_str += fmt::format("{} {}", disasm::opcode_str(code), disasm::operand_to_str(dest, write_mask_dest));
 

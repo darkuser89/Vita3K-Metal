@@ -77,18 +77,43 @@ public:
         return std::make_unique<T>(item);
     }
 
-    void push(const T &item) {
+    // Transfer an available item without allocating a result after removing
+    // it from the queue. A failed/aborted transfer leaves ownership here.
+    bool try_pop(T &item) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (aborted || queue_.empty())
+                return false;
+            item = queue_.front();
+            queue_.pop();
+        }
+        cond_.notify_all();
+        return true;
+    }
+
+    bool push(const T &item) {
         {
             std::unique_lock<std::mutex> mlock(mutex_);
             while (!aborted && queue_.size() == maxPendingCount_) {
                 cond_.wait(mlock);
             }
             if (aborted) {
-                return;
+                return false;
             }
             queue_.push(item);
         }
         condempty_.notify_one();
+        return true;
+    }
+
+    // Take ownership of pending items after the consumer has stopped. Keep
+    // the abort state until the caller has disposed of their payloads.
+    std::queue<T> take_pending() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::queue<T> pending;
+        queue_.swap(pending);
+        cond_.notify_all();
+        return pending;
     }
 
     size_t size() {
@@ -103,6 +128,11 @@ public:
         aborted = true;
         condempty_.notify_all();
         cond_.notify_all();
+    }
+
+    void abort_synchronized() {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        abort();
     }
 
     bool is_aborted() const {

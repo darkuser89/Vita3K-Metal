@@ -21,15 +21,27 @@ void MappedGuestRegions::map(uint32_t address, uint32_t size) {
 void MappedGuestRegions::unmap(uint32_t address) {
     regions.erase(address);
 }
-size_t MappedGuestRegions::extent(uint32_t address, size_t bound_size) const {
+MappedGuestRange MappedGuestRegions::range(uint32_t address, size_t bound_size) const {
     const uint64_t bound_end = uint64_t(address) + bound_size;
-    size_t result = bound_size;
+    uint32_t begin = address;
+    uint64_t end = bound_end;
+    bool mapped = false;
     for (auto region = regions.upper_bound(address); region != regions.begin();) {
         --region;
-        const uint64_t end = uint64_t(region->first) + region->second;
-        if (bound_end <= end) result = std::max(result, size_t(end - address));
+        const uint64_t region_end = uint64_t(region->first) + region->second;
+        if (bound_end <= region_end) {
+            // Every included range contains the binding, so their union has
+            // no gaps. Keep the prefix too: GXP offsets can be negative.
+            begin = std::min(begin, region->first);
+            end = std::max(end, region_end);
+            mapped = true;
+        }
     }
-    return result;
+    return {begin, size_t(end - begin), mapped};
+}
+size_t MappedGuestRegions::extent(uint32_t address, size_t bound_size) const {
+    const auto mapped = range(address, bound_size);
+    return mapped.size - (address - mapped.address);
 }
 void configure_vertex_stream(MTLVertexBufferLayoutDescriptor *binding, size_t stride, size_t extent, bool per_instance) {
     binding.stride = ((stride ? stride : extent) + 3) & ~size_t(3);

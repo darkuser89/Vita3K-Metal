@@ -8,7 +8,8 @@
 
 namespace gui {
 inline QStringList metal_screen_filters() {
-    QStringList filters{QStringLiteral("Nearest"), QStringLiteral("Bilinear")};
+    QStringList filters{QStringLiteral("Nearest"), QStringLiteral("Bilinear"),
+        QStringLiteral("Bicubic"), QStringLiteral("FXAA"), QStringLiteral("FSR")};
     if (renderer::metal::supports_metalfx_spatial())
         filters.append(QStringLiteral("MetalFX Spatial"));
     return filters;

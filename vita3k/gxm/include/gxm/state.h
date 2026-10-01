@@ -30,6 +30,7 @@
 struct EmuEnvState;
 struct SceGxmContext;
 struct SceGxmRenderTarget;
+namespace renderer { struct CommandList; }
 
 struct SceGxmInitializeParams {
     uint32_t flags = 0;
@@ -52,6 +53,11 @@ struct MemoryMapInfo {
     Address offset;
     std::uint32_t size;
     std::uint32_t perm;
+};
+
+enum class MetalGxmProgramKind {
+    Vertex,
+    Fragment,
 };
 
 struct GxmState {
@@ -78,6 +84,20 @@ struct GxmState {
     std::unordered_map<SceGxmContext *, Address> deferred_contexts;
     std::unordered_map<SceGxmRenderTarget *, Address> render_targets;
 
+    // Host bookkeeping only: opaque guest program handles keep their ABI.
+    std::mutex metal_programs_mutex;
+    std::unordered_map<Address, MetalGxmProgramKind> metal_live_programs;
+    uint64_t metal_stale_program_warnings = 0;
+
+    std::mutex metal_command_lists_mutex;
+    std::unordered_set<const renderer::CommandList *> metal_command_lists;
+
+    void clear_metal_programs() {
+        const std::lock_guard<std::mutex> lock(metal_programs_mutex);
+        metal_live_programs.clear();
+        metal_stale_program_warnings = 0;
+    }
+
     void deinit() {
         if (display_host_thread.joinable())
             display_host_thread.join();
@@ -98,5 +118,10 @@ struct GxmState {
         last_immediate_context = 0;
         deferred_contexts.clear();
         render_targets.clear();
+        clear_metal_programs();
+        {
+            const std::lock_guard<std::mutex> lock(metal_command_lists_mutex);
+            metal_command_lists.clear();
+        }
     }
 };

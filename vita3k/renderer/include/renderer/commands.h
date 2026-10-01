@@ -20,6 +20,7 @@
 #include <cassert>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <vector>
 
 namespace renderer {
@@ -84,14 +85,16 @@ enum class CommandOpcode : std::uint8_t {
     NewFrame,
 
     DestroyRenderTarget,
-    DestroyContext
+    DestroyContext,
+    SyncGuestRange
 };
 
 enum CommandErrorCode {
     CommandErrorCodeNone = 0,
     CommandErrorCodePending = -1,
     CommandErrorArgumentsTooLarge = -2,
-    CommandErrorMemoryMapFailed = -3
+    CommandErrorMemoryMapFailed = -3,
+    CommandErrorSurfaceSyncFailed = -4
 };
 
 constexpr std::size_t MAX_COMMAND_DATA_SIZE = 0x20;
@@ -99,7 +102,10 @@ constexpr std::size_t MAX_COMMAND_DATA_SIZE = 0x20;
 struct Command {
     enum {
         FLAG_FROM_HOST = 1 << 0,
-        FLAG_NO_FREE = 1 << 1
+        FLAG_NO_FREE = 1 << 1,
+        FLAG_METAL_PROGRAM_BINDING = 1 << 2,
+        FLAG_METAL_STATUS_OWNER = 1 << 3,
+        FLAG_METAL_RAW_PAYLOAD = 1 << 4
     };
 
     CommandOpcode opcode;
@@ -110,6 +116,23 @@ struct Command {
 
     Command *next = nullptr;
 };
+
+// Metal waits may return on shutdown before the command is consumed. Keep
+// their status alive independently of the waiter, without enlarging Command
+// or adding a nontrivial destructor to guest command-ring storage.
+struct MetalCommandStatusDeleter {
+    // The detached command owner retires the operation after its allocator
+    // callback returns. The waiting caller only releases its reference.
+    bool retire = false;
+    void operator()(int *status) const;
+};
+using MetalCommandStatusOwner = std::unique_ptr<int, MetalCommandStatusDeleter>;
+MetalCommandStatusOwner make_metal_command_status(State &state, bool wait);
+void retain_metal_command_status(Command &cmd);
+MetalCommandStatusOwner detach_metal_command_status(Command &cmd);
+void release_metal_command_status(Command &cmd);
+bool begin_metal_command(State &state, Command &cmd);
+int wait_for_metal_command(State &state, int *status);
 
 using CommandPool = std::vector<Command>;
 
@@ -173,9 +196,13 @@ bool do_command_push_data(CommandHelper &helper, Head arg1, Args... args2) {
     return true;
 }
 
-template <typename... Args>
+template <bool CheckAllocation = false, typename... Args>
 Command *make_command(CommandAllocFunc alloc_func, CommandFreeFunc free_func, const CommandOpcode opcode, int *status, Args... arguments) {
     Command *new_command = alloc_func();
+    if constexpr (CheckAllocation) {
+        if (!new_command)
+            return nullptr;
+    }
 
     new_command->opcode = opcode;
     new_command->status = status;

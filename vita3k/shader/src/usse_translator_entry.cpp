@@ -875,6 +875,7 @@ USSERecompiler::USSERecompiler(spv::Builder &b, const SceGxmProgram &program, co
     : inst(nullptr)
     , count(0)
     , b(b)
+    , native_metal(parameters.native_metal)
     , visitor(b, *this, program, features, utils, cur_instr, parameters, queries, true)
     , end_hook_func(end_hook_func)
     , tree_block_node(nullptr, 0) {
@@ -886,7 +887,7 @@ void USSERecompiler::reset(const std::uint64_t *_inst, const std::size_t _count)
     visitor.reset_for_new_session();
 
     usse::analyze(tree_block_node, static_cast<shader::usse::USSEOffset>(_count - 1),
-        [&](usse::USSEOffset off) -> std::uint64_t { return inst[off]; });
+        [&](usse::USSEOffset off) -> std::uint64_t { return inst[off]; }, native_metal);
 }
 
 spv::Id USSERecompiler::get_condition_value(const std::uint8_t pred, const bool neg) {
@@ -901,6 +902,9 @@ spv::Id USSERecompiler::get_condition_value(const std::uint8_t pred, const bool 
         pred_opr.num = static_cast<int>(predicator) - static_cast<int>(ExtPredicate::P0);
     } else if (predicator >= ExtPredicate::NEGP0 && predicator <= ExtPredicate::NEGP1) {
         pred_opr.num = static_cast<int>(predicator) - static_cast<int>(ExtPredicate::NEGP0);
+        do_neg = !do_neg;
+    } else if (native_metal && predicator == ExtPredicate::NEGP2) {
+        pred_opr.num = 2;
         do_neg = !do_neg;
     }
 

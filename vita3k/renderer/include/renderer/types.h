@@ -27,16 +27,19 @@
 #include <array>
 #include <bitset>
 #include <map>
+#include <memory>
 #include <vector>
 
 static constexpr auto DEFAULT_RES_WIDTH = 960;
 static constexpr auto DEFAULT_RES_HEIGHT = 544;
 
 struct SceGxmProgram;
+struct GxmState;
 
 using UniformBufferSizes = std::array<std::uint32_t, 15>;
 
 namespace renderer {
+namespace metal { struct ProgramBinding; }
 
 // State types
 typedef std::map<Sha256Hash, const SceGxmProgram *> GXPPtrMap;
@@ -179,12 +182,26 @@ struct Context {
 
     shader::Hints shader_hints;
 
+    // Guest-thread bookkeeping for Metal's deferred GXM callbacks. Keep it
+    // here so the guest-allocated SceGxmContext retains its size and layout.
+    struct {
+        bool enabled = false;
+        bool recording_failed = false;
+        // Non-owning: GXM destroys its contexts before its host state.
+        GxmState *owner = nullptr;
+        size_t vertex_reserved_bytes = 0;
+        size_t fragment_reserved_bytes = 0;
+    } metal_gxm;
+
     virtual ~Context() = default;
 };
 
 typedef std::bitset<SCE_GXM_MAX_TEXTURE_UNITS> TextureInfo;
 
 struct ShaderProgram {
+    // Populated only by Metal. The queued binding owns independent metadata
+    // and GXP bytes, so guest program destruction cannot invalidate a draw.
+    std::shared_ptr<const metal::ProgramBinding> metal_binding;
     Sha256Hash hash;
     UniformBufferSizes uniform_buffer_sizes; // Size of the buffer in 4-bytes unit
     UniformBufferSizes uniform_buffer_data_offsets; // Offset of the buffer in 4-bytes unit

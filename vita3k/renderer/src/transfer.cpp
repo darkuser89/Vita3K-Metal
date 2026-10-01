@@ -148,6 +148,7 @@ COMMAND(handle_transfer_copy) {
 #ifdef __APPLE__
     if (renderer.current_backend == Backend::Metal) {
         const std::unique_ptr<const SceGxmTransferImage[]> owned(images);
+        helper.cmd->flags &= ~Command::FLAG_METAL_RAW_PAYLOAD;
         if (!dynamic_cast<metal::MetalState &>(renderer).transfer_copy(mem, images[0], images[1],
                 src_type, dst_type, colorKeyMode, colorKeyValue, colorKeyMask))
             LOG_ERROR_ONCE("Metal: unsupported or invalid transfer copy");
@@ -214,6 +215,7 @@ COMMAND(handle_transfer_downscale) {
 #ifdef __APPLE__
     if (renderer.current_backend == Backend::Metal) {
         const std::unique_ptr<SceGxmTransferImage> owned_src(src), owned_dst(dst);
+        helper.cmd->flags &= ~Command::FLAG_METAL_RAW_PAYLOAD;
         if (!src || !dst || !static_cast<metal::MetalState &>(renderer).transfer_downscale(mem,*src,*dst))
             LOG_ERROR_ONCE("Metal: unsupported or invalid transfer downscale");
         return;
@@ -315,6 +317,7 @@ COMMAND(handle_transfer_fill) {
 #ifdef __APPLE__
     if (renderer.current_backend == Backend::Metal) {
         const std::unique_ptr<const SceGxmTransferImage> owned(dest);
+        helper.cmd->flags &= ~Command::FLAG_METAL_RAW_PAYLOAD;
         if (!dest || !static_cast<metal::MetalState &>(renderer).transfer_fill(mem,*dest,fill_color))
             LOG_ERROR_ONCE("Metal: unsupported or invalid transfer fill destination");
         return;
@@ -340,6 +343,18 @@ COMMAND(handle_transfer_fill) {
     // TODO: handle case where dest is a cached surface
 
     delete dest;
+}
+
+COMMAND(handle_sync_guest_range) {
+    TRACY_FUNC_COMMANDS(handle_sync_guest_range);
+    const auto address = helper.pop<Address>();
+    const auto size = helper.pop<uint32_t>();
+    int synced = 0;
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        synced = static_cast<metal::MetalState &>(renderer).sync_surfaces_for_cpu_read(mem, address, size);
+#endif
+    complete_command(renderer, helper, synced);
 }
 
 } // namespace renderer

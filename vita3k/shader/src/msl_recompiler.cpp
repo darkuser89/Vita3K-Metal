@@ -195,6 +195,9 @@ Program convert_spirv(const std::vector<uint32_t> &spirv) {
     options.platform = spirv_cross::CompilerMSL::Options::macOS;
     options.set_msl_version(3, 0);
     options.use_framebuffer_fetch_subpasses = true;
+    // Guest clip distances are consumed by rasterization, never by the
+    // fragment interface. Do not allocate additional user varying locations.
+    options.enable_clip_distance_user_varying = false;
     compiler.set_msl_options(options);
 
     const auto resources = compiler.get_shader_resources();
@@ -221,7 +224,9 @@ Program convert_spirv(const std::vector<uint32_t> &spirv) {
                 throw std::invalid_argument("Unexpected GXM Metal attachment binding");
             // SPIRV-Cross interprets msl_texture as [[color(n)]] for native
             // framebuffer fetch, not as a sampled/storage texture slot.
-            remap.msl_texture = framebuffer_fetch ? 0 : COLOR_ATTACHMENT_TEXTURE + binding;
+            remap.msl_texture = framebuffer_fetch
+                ? compiler.get_decoration(resource.id,spv::DecorationInputAttachmentIndex)
+                : COLOR_ATTACHMENT_TEXTURE + binding;
         } else {
             if (set != (vertex ? 2u : 3u) || binding >= TEXTURE_COUNT)
                 throw std::invalid_argument("Unexpected GXM Metal texture binding");
@@ -244,7 +249,8 @@ Program convert_spirv(const std::vector<uint32_t> &spirv) {
     for (const auto &resource : resources.storage_images)
         bind(resource, false, true);
     for (const auto &resource : resources.subpass_inputs) {
-        if (compiler.get_decoration(resource.id, spv::DecorationInputAttachmentIndex) != 0)
+        const auto index=compiler.get_decoration(resource.id,spv::DecorationInputAttachmentIndex);
+        if (index>1 || compiler.get_decoration(resource.id,spv::DecorationBinding)!=(index ? 2u : 0u))
             throw std::invalid_argument("Unexpected GXM Metal framebuffer attachment index");
         bind(resource, false, true, true);
     }
@@ -275,6 +281,7 @@ using namespace metal;
 struct PointReplayOutput {
     float4 gl_Position [[position]];
     float gl_PointSize [[point_size]];
+    float gl_ClipDistance [[clip_distance]] [8];
     float4 v_Color0 [[user(locn1)]];
     float4 v_Color1 [[user(locn2)]];
     float4 v_Fog [[user(locn3)]];
@@ -309,6 +316,8 @@ vertex PointReplayOutput point_replay_vs(const device float4* outputs [[buffer(4
     result.v_TexCoord7 = outputs[base + 11];
     result.v_TexCoord8 = outputs[base + 12];
     result.v_TexCoord9 = outputs[base + 13];
+    for (uint plane = 0; plane < 8; ++plane)
+        result.gl_ClipDistance[plane] = outputs[base + 15 + plane].x;
     return result;
 }
 )";

@@ -71,6 +71,7 @@ bool is_cmd_ready(MemState &mem, CommandList &command_list);
 void process_batch(State &state, MemState &mem, Config &config, CommandList &command_list);
 void process_batches(State &state, const FeatureState &features, MemState &mem, Config &config, int64_t max_wait_ms = 500);
 void start_render_thread(State &state, DisplayState &display, GxmState &gxm, MemState &mem, Config &config);
+void request_metal_render_abort(State &state);
 void stop_render_thread(State &state);
 bool init(FrameHost &frame, std::unique_ptr<State> &state, Backend backend, const Config &config, const Root &root_paths);
 
@@ -81,7 +82,8 @@ void set_point_line_width(State &state, Context *ctx, bool is_front, unsigned in
 void set_polygon_mode(State &state, Context *ctx, bool is_front, SceGxmPolygonMode mode);
 void set_stencil_func(State &state, Context *ctx, bool is_front, SceGxmStencilFunc func, SceGxmStencilOp stencilFail, SceGxmStencilOp depthFail, SceGxmStencilOp depthPass, unsigned char compareMask, unsigned char writeMask);
 void set_stencil_ref(State &state, Context *ctx, bool is_front, unsigned char sref);
-void set_program(State &state, Context *ctx, Ptr<const void> program, const bool is_fragment);
+void set_program(State &state, Context *ctx, Ptr<const void> program, const bool is_fragment,
+    const std::shared_ptr<const metal::ProgramBinding> &metal_binding = {});
 void set_cull_mode(State &state, Context *ctx, SceGxmCullMode cull);
 void set_texture(State &state, Context *ctx, const std::uint32_t tex_index, const SceGxmTexture tex);
 void set_yuv_profile(State &state, Context *ctx, uint32_t index, SceGxmYuvProfile profile);
@@ -102,6 +104,8 @@ void transfer_copy(State &state, uint32_t colorKeyValue, uint32_t colorKeyMask, 
 void transfer_downscale(State &state, const SceGxmTransferImage *src, const SceGxmTransferImage *dest);
 void transfer_fill(State &state, uint32_t fillColor, const SceGxmTransferImage *dest);
 void sync_surface_data(State &state, Context *ctx, const SceGxmNotification vertex_notification, const SceGxmNotification fragment_notification);
+// Metal CPU readers wait for matching recent render surfaces before reading RAM.
+int sync_guest_range(State &state, Address address, uint32_t size);
 
 bool create_context(State &state, std::unique_ptr<Context> &context);
 void destroy_context(State &state, std::unique_ptr<Context> &context);
@@ -113,17 +117,25 @@ void destroy_render_target_during_shutdown(State &state, std::unique_ptr<RenderT
 Command *generic_command_allocate();
 void generic_command_free(Command *cmd);
 void destroy_command_payload(Command &cmd);
+void mark_metal_command_payload(Command &cmd);
+void mark_metal_command_payload(const State &state, Command &cmd);
+void destroy_metal_command_payload(Command &cmd);
+void discard_metal_commands(Context *context, Command *first, Command *last);
 
 template <typename... Args>
 bool add_command(Context *ctx, const CommandOpcode opcode, int *status, Args... arguments) {
     if (!ctx) {
         return false;
     }
-    auto cmd_maked = make_command(ctx->alloc_func, ctx->free_func, opcode, status, arguments...);
+    auto cmd_maked = ctx->metal_gxm.enabled
+        ? make_command<true>(ctx->alloc_func, ctx->free_func, opcode, status, arguments...)
+        : make_command(ctx->alloc_func, ctx->free_func, opcode, status, arguments...);
 
     if (!cmd_maked) {
         return false;
     }
+    if (ctx->metal_gxm.enabled)
+        mark_metal_command_payload(*cmd_maked);
 
     if (!ctx->command_list.first) {
         ctx->command_list.first = cmd_maked;
@@ -145,12 +157,19 @@ template <typename... Args>
 int send_single_command(State &state, Context *ctx, const CommandOpcode opcode, bool wait, Args... arguments) {
     // Make a temporary command list
     int status = CommandErrorCodePending; // Pending.
-    auto cmd = make_command(ctx ? ctx->alloc_func : generic_command_allocate, ctx ? ctx->free_func : generic_command_free,
-        opcode, wait ? &status : nullptr, arguments...);
+    auto metal_status = make_metal_command_status(state, wait);
+    int *status_ptr = wait ? (metal_status ? metal_status.get() : &status) : nullptr;
+    auto cmd = ctx && ctx->metal_gxm.enabled
+        ? make_command<true>(ctx->alloc_func, ctx->free_func, opcode, status_ptr, arguments...)
+        : make_command(ctx ? ctx->alloc_func : generic_command_allocate, ctx ? ctx->free_func : generic_command_free,
+              opcode, status_ptr, arguments...);
 
     if (!cmd) {
         return CommandErrorArgumentsTooLarge;
     }
+    mark_metal_command_payload(state, *cmd);
+    if (metal_status)
+        retain_metal_command_status(*cmd);
 
     CommandList list;
     list.first = cmd;
@@ -158,8 +177,10 @@ int send_single_command(State &state, Context *ctx, const CommandOpcode opcode, 
 
     // Submit it
     submit_command_list(state, ctx, list);
+    if (metal_status)
+        return wait_for_metal_command(state, status_ptr);
     if (wait)
-        return wait_for_status(state, &status, CommandErrorCodePending, false);
+        return wait_for_status(state, status_ptr, CommandErrorCodePending, false);
     else
         return 0;
 }

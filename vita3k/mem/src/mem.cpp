@@ -314,7 +314,39 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
         return true;
     }
 
-    Address previous_beg = it->first;
+    if (!write && std::any_of(info.blocks.begin(), info.blocks.end(), [](const auto &entry) {
+            return entry.second.retain_on_read;
+        })) {
+        // A legacy read trap may overlap a Metal write watch. Consume the
+        // read callbacks while retaining the write registrations and their
+        // tokens. Do not invoke them for a read or allocate replacement nodes
+        // from the signal handler.
+        for (auto block = info.blocks.begin(); block != info.blocks.end();) {
+            if (block->second.retain_on_read) {
+                ++block;
+            } else {
+                block->second.callback(vaddr, false);
+                block = info.blocks.erase(block);
+            }
+        }
+        info.perm = MemPerm::ReadOnly;
+        info.write_watch_ranges_only = true;
+        // Downgrade watched pages directly from None to ReadOnly. Temporarily
+        // making the whole merged segment writable would lose a concurrent
+        // CPU store between the two mprotect calls. Only gaps lose protection.
+        uint64_t cursor = it->first;
+        for (const auto &[address, block] : info.blocks) {
+            if (address > cursor)
+                unprotect_inner(state, Address(cursor), uint32_t(address - cursor));
+            protect_inner(state, address, block.size, MemPerm::ReadOnly);
+            cursor = std::max(cursor, uint64_t(address) + block.size);
+        }
+        const uint64_t end = uint64_t(it->first) + info.size;
+        if (cursor < end)
+            unprotect_inner(state, Address(cursor), uint32_t(end - cursor));
+        return true;
+    }
+
     for (auto &[block_addr, block] : info.blocks) {
         block.callback(vaddr, write);
     }
@@ -325,7 +357,8 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
     return true;
 }
 
-bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPerm perm, const ProtectCallback &callback) {
+static bool add_protect_impl(MemState &state, Address addr, const uint32_t size, const MemPerm perm,
+    const ProtectCallback &callback, bool retain_on_read) {
     const std::lock_guard<std::mutex> lock(state.protect_mutex);
     ProtectSegmentInfo protect(size, perm);
     align_to_page(state, addr, protect.size);
@@ -333,6 +366,7 @@ bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPe
     ProtectBlockInfo block;
     block.size = size;
     block.callback = callback;
+    block.retain_on_read = retain_on_read;
 
     protect.blocks.emplace(addr, std::move(block));
 
@@ -366,11 +400,30 @@ bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPe
     return true;
 }
 
+bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPerm perm, const ProtectCallback &callback) {
+    return add_protect_impl(state, addr, size, perm, callback, false);
+}
+
+bool add_write_watch(MemState &state, Address addr, uint32_t size, const ProtectCallback &callback) {
+    // A partial host page can fault outside its logical tree interval. Reject
+    // it rather than silently removing another owner's protection there.
+    const uint32_t page = state.host_page_size;
+    const uint64_t end = uint64_t(addr) + size;
+    if (state.use_page_table || !page || !addr || !size || addr % page || size % page
+        || end > uint64_t(UINT32_MAX) - page || !callback
+        || !is_valid_addr_range(state, addr, Address(end))) return false;
+    return add_protect_impl(state, addr, size, MemPerm::ReadOnly, callback, true);
+}
+
 bool is_protecting(MemState &state, Address addr, MemPerm *perm) {
     const std::lock_guard<std::mutex> lock(state.protect_mutex);
     auto ite = state.protect_tree.lower_bound(addr);
 
     if (ite != state.protect_tree.end() && addr < ite->first + ite->second.size) {
+        if (ite->second.write_watch_ranges_only
+            && std::none_of(ite->second.blocks.begin(), ite->second.blocks.end(), [addr](const auto &entry) {
+                return addr >= entry.first && uint64_t(addr) < uint64_t(entry.first) + entry.second.size;
+            })) return false;
         if (perm)
             *perm = ite->second.perm;
 

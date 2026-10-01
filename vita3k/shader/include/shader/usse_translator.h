@@ -24,6 +24,7 @@
 #include <shader/usse_utilities.h>
 
 #include <SPIRV/SpvBuilder.h>
+#include <map>
 
 struct FeatureState;
 
@@ -136,6 +137,9 @@ private:
     [[maybe_unused]] int src2_repeat_offset = get_repeat_offset(inst.opr.src2, current_repeat, repeat_mode, inst.opr.src2.bank);
 
     const int get_repeat_offset(Operand &op, const std::uint8_t repeat_index, RepeatMode repeat_mode, RegisterBank bank) {
+        if (m_spirv_params.native_metal && repeat_mode == RepeatMode::INTERNAL
+            && !(op.flags & RegisterFlags::GPI) && op.index != 3)
+            return 0;
         if (repeat_mode == RepeatMode::INTERNAL || repeat_mode == RepeatMode::BOTH) {
             if (bank == RegisterBank::FPINTERNAL) {
                 return repeat_index;
@@ -156,6 +160,8 @@ private:
         if (repeat_mode == RepeatMode::EXTERNAL && bank != RegisterBank::FPINTERNAL) {
             return repeat_index * 4;
         }
+        if (m_spirv_params.native_metal && repeat_mode == RepeatMode::EXTERNAL)
+            return repeat_index;
         if (repeat_mode == RepeatMode::SLMSI) {
             auto inc = repeat_increase[op.index][repeat_index];
 
@@ -197,7 +203,18 @@ private:
 
     bool m_second_program{ false };
 
-    spv::Id do_alu_op(Instruction &inst, const Imm4 source_mask, const Imm4 possible_dest_mask);
+    std::map<uint32_t, uint8_t> m_vpck_written_bytes;
+    bool m_store_from_vpck = false;
+    bool m_store_from_texture_sample = false;
+    std::map<uint32_t, DataType> m_word_store_types;
+    DataType m_raw_move_types[4]{DataType::UNK, DataType::UNK, DataType::UNK, DataType::UNK};
+    bool m_store_is_raw_move = false;
+    bool m_raw_move_keeps_declared = false;
+    void track_raw_move(const Instruction &, uint8_t mask, int component_size,
+        int src1_offset, int src2_offset, int dest_offset, bool conditional);
+
+    spv::Id do_alu_op(Instruction &inst, const Imm4 source_mask, const Imm4 possible_dest_mask,
+        int src1_repeat_offset = 0, int src2_repeat_offset = 0);
 
 public:
     void set_secondary_program(const bool is_it) {
@@ -823,7 +840,7 @@ public:
         Imm7 src2_n);
     // Instructions end
 private:
-    spv::Id vtst_impl(Instruction inst, ExtPredicate pred, int zero_test, int sign_test, Imm4 load_mask, bool mask);
+    spv::Id vtst_impl(Instruction inst, ExtPredicate pred, int zero_test, int sign_test, Imm4 load_mask, bool mask, spv::Id *alu_result = nullptr);
 
     // SPIR-V emitter
     spv::Builder &m_b;
@@ -847,6 +864,7 @@ struct USSERecompiler final {
     const std::uint64_t *inst;
     std::size_t count;
     spv::Builder &b;
+    const bool native_metal;
     USSETranslatorVisitor visitor;
     std::uint64_t cur_instr;
     usse::USSEOffset cur_pc;

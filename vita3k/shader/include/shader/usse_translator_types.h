@@ -51,6 +51,7 @@ struct SpirvShaderParameters {
     bool native_metal = false;
     bool native_cube_float_filter = false;
     spv::Id native_texture_info = 0;
+    spv::Id native_frag_coord = 0;
     float native_texture_lod_bias[SCE_GXM_MAX_TEXTURE_UNITS] = {};
     // Native fragment emulation of SGX global registers 16, 23, 24 and 43.
     spv::Id native_global_regs = 0;
@@ -64,6 +65,7 @@ struct SpirvShaderParameters {
 
     // Mapped to 'r' (temporary) USSE registers
     SpirvVarRegBank temps;
+    spv::Id frag_output_holds_declared_type = 0;
 
     // Mapped to 'i' (internal) usse registers
     SpirvVarRegBank internals;
@@ -93,6 +95,7 @@ struct SpirvShaderParameters {
 
     // ids for the given fields in the uniform block container
     int buffer_addresses_id;
+    uint32_t buffer_count = 0;
     int viewport_ratio_id;
     int viewport_offset_id;
 
@@ -109,6 +112,7 @@ struct SpirvShaderParameters {
     int thread_buffer_sa_offset = -1;
     int thread_buffer_base;
     spv::Id thread_buffer;
+    uint32_t thread_buffer_f32_count = 0;
 
     spv::Id render_info_id;
 
@@ -131,6 +135,7 @@ struct NonDependentTextureQueryCallInfo {
 
     DataType component_type;
     uint8_t component_count;
+    uint8_t store_component_count = 0; // Metal: program-derived query write width, zero keeps the hint.
 };
 
 using NonDependentTextureQueryCallInfos = std::vector<NonDependentTextureQueryCallInfo>;

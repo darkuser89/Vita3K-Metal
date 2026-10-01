@@ -369,8 +369,26 @@ static spv::Id create_builtin_sampler_for_raw(spv::Builder &b, const FeatureStat
     return sampler;
 }
 
-static DataType fragment_color_register_type(const SceGxmProgram &program, const TranslationState &state) {
+static DataType fragment_color_register_type(const SceGxmProgram &program, const TranslationState &state,
+    DataType *declared_out = nullptr) {
     auto type = std::get<0>(shader::get_parameter_type_store_and_name(program.get_fragment_output_type()));
+    if (state.is_metal && (type == DataType::INT32 || type == DataType::UINT32))
+        type = DataType::F32;
+    if (declared_out) *declared_out = type;
+    if (state.is_metal && state.hints->metal_output_register_format != SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED) {
+        // The patcher converts non-native/explicitly declared output. Native
+        // programs can instead leave packed integer bytes in their tile words.
+        if (!program.is_native_color() || (program.program_flags & SCE_GXM_PROGRAM_FLAG_OUTPUT_IN_DECLARED_FORMAT)
+            || !is_float_data_type(type))
+            return type;
+        switch (state.hints->metal_output_register_format) {
+        case SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4: return DataType::UINT8;
+        case SCE_GXM_OUTPUT_REGISTER_FORMAT_CHAR4: return DataType::INT8;
+        case SCE_GXM_OUTPUT_REGISTER_FORMAT_USHORT2: return DataType::UINT16;
+        case SCE_GXM_OUTPUT_REGISTER_FORMAT_SHORT2: return DataType::INT16;
+        default: return type;
+        }
+    }
     // Native-color programs access packed tile words. On U8 targets the F16
     // declaration can describe a final register move, while SOP2 operates on
     // four packed bytes (as in Stealth Inc.'s programmable blending shaders).
@@ -768,6 +786,34 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
             // Size of this extra pa occupied
             // Force this to be PRIVATE
             const auto size = ((descriptor->size >> 6) & 3) + 1;
+            if (translation_state.is_metal) {
+                // Plus derives the query's write width from the PA register
+                // allocation. Texture hints alone can overwrite the next
+                // iterator, or omit default channels requested by the program.
+                const auto effective_type = store_type == DataType::UNK
+                    ? tex_query_info.component_type : store_type;
+                uint32_t components_per_register = 0;
+                switch (effective_type) {
+                case DataType::F32: case DataType::UINT32: case DataType::INT32:
+                    components_per_register = 1;
+                    break;
+                case DataType::F16: case DataType::UINT16: case DataType::INT16:
+                    components_per_register = 2;
+                    break;
+                case DataType::UINT8: case DataType::INT8: case DataType::C10:
+                    components_per_register = 4;
+                    break;
+                default:
+                    break;
+                }
+                if (components_per_register) {
+                    const uint32_t capacity = size * components_per_register;
+                    if (!(descriptor->component_info & 0x40))
+                        tex_query_info.store_component_count = std::min(capacity, num_component);
+                    else if (tex_query_info.component_count > capacity)
+                        tex_query_info.store_component_count = capacity;
+                }
+            }
             tex_query_info.dest_offset = pa_offset;
 
             tex_query_info.coord_index = tex_coord_index;
@@ -918,7 +964,20 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
             source = b.createOp(spv::OpImageRead, fetch_type, { b.createLoad(last_frag_data, spv::NoPrecision), coord_0 });
             b.setPrecision(source, precision);
 
-            if (native_half) {
+            if (translation_state.is_metal && translation_state.hints->metal_raw_color_fetch) {
+                const auto u32=b.makeUintType(32);
+                const auto raw_type=b.makeVectorType(u32,4);
+                const auto raw_image=b.makeImageType(u32,spv::DimSubpassData,false,false,false,2,spv::ImageFormatUnknown);
+                const auto raw_input=b.createVariable(spv::NoPrecision,spv::StorageClassUniformConstant,raw_image,"last_frag_data_raw");
+                b.addDecoration(raw_input,spv::DecorationInputAttachmentIndex,1);
+                b.addDecoration(raw_input,spv::DecorationBinding,2);
+                b.addDecoration(raw_input,spv::DecorationDescriptorSet,1);
+                const auto bits=b.createOp(spv::OpImageRead,raw_type,{b.createLoad(raw_input,spv::NoPrecision),coord_0});
+                auto raw_target=target_to_store;
+                raw_target.type=DataType::UINT16;
+                utils::store(b,parameters,utils,features,raw_target,bits,0b1111,0);
+                source=spv::NoResult;
+            } else if (native_half) {
                 // Preserve all tile bits, including NaN payloads used for
                 // packed normals, instead of half -> float -> half conversion.
                 auto raw_target = target_to_store;
@@ -1098,7 +1157,7 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
 
     std::vector<literal_pair> literal_pairs;
 
-    const auto program_input = shader::get_program_input(program);
+    const auto program_input = shader::get_program_input(program, translation_state.is_metal);
 
     std::map<int, int> buffer_bases;
     std::map<int, std::uint32_t> buffer_sizes;
@@ -1191,6 +1250,8 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
     int curr_field_id = 0;
 
     const uint16_t uniform_buffer_count = features.enable_memory_mapping ? buffer_count : 0;
+    if (translation_state.is_metal)
+        spv_params.buffer_count = uniform_buffer_count;
     const uint16_t uniform_texture_count = features.use_texture_viewport ? texture_count : 0;
 
     if (program_type == SceGxmProgramType::Vertex) {
@@ -1312,11 +1373,12 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
     if (translation_state.is_metal && translation_state.hints->metal_mip_sampling && texture_count) {
         const auto sizes=b.makeArrayType(uvec2,b.makeUintConstant(16),0);
         b.addDecoration(sizes,spv::DecorationArrayStride,8);
-        const auto info=b.makeStructType({b.makeVectorType(u32,4),sizes},"MetalTextureMipInfo");
+        const auto info=b.makeStructType({b.makeVectorType(u32,4),sizes,b.makeVectorType(b.makeFloatType(32),4)},"MetalTextureMipInfo");
         b.addMemberName(info,0,"control");b.addMemberDecoration(info,0,spv::DecorationOffset,0);
         b.addMemberName(info,1,"sizes");b.addMemberDecoration(info,1,spv::DecorationOffset,16);
+        b.addMemberName(info,2,"cast_coords");b.addMemberDecoration(info,2,spv::DecorationOffset,144);
         const auto infos=b.makeArrayType(info,b.makeUintConstant(16),0);
-        b.addDecoration(infos,spv::DecorationArrayStride,144);
+        b.addDecoration(infos,spv::DecorationArrayStride,160);
         const auto block=b.makeStructType({infos},"MetalTextureMipBlock");
         b.addDecoration(block,spv::DecorationBlock);b.addMemberName(block,0,"textures");
         b.addMemberDecoration(block,0,spv::DecorationOffset,0);
@@ -1513,7 +1575,12 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
     if (program.thread_buffer_count > 0) {
         // there are 4 cores, each having 4 pipelines, assume the thread buffer is evenly divided
         // between all of them and each pipeline only does things in its segment
-        const uint32_t size_in_f32 = program.thread_buffer_count / (4 * 4 * sizeof(float));
+        uint32_t size_in_f32 = program.thread_buffer_count / (4 * 4 * sizeof(float));
+        if (translation_state.is_metal) {
+            // Keep the bounded LOCAL path valid even for a sub-word segment.
+            size_in_f32 = std::max(1u, size_in_f32);
+            spv_params.thread_buffer_f32_count = size_in_f32;
+        }
         spv::Id thread_buffer = b.makeArrayType(f32, b.makeUintConstant(size_in_f32), sizeof(float));
 
         spv_params.thread_buffer = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, thread_buffer, "thread_buffer");
@@ -1649,6 +1716,8 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
 
     if (translation_state.is_fragment)
         create_fragment_inputs(b, spv_params, utils, features, translation_state, texture_queries, samplers, program);
+    if (translation_state.is_metal && translation_state.is_fragment)
+        spv_params.native_frag_coord = translation_state.frag_coord_id;
 
     if (translation_state.is_metal && translation_state.is_fragment) {
         // SGX543 special-bank 16/23/24/43: BFCONTROL, local X/Y and TILEXY.
@@ -1892,7 +1961,8 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
     color_val_operand.bank = program.is_native_color() ? RegisterBank::OUTPUT : RegisterBank::PRIMATTR;
     color_val_operand.num = 0;
     color_val_operand.swizzle = SWIZZLE_CHANNEL_4_DEFAULT;
-    color_val_operand.type = fragment_color_register_type(program, translate_state);
+    DataType declared_output_type;
+    color_val_operand.type = fragment_color_register_type(program, translate_state, &declared_output_type);
     // if the shader tries to write a INT32 or UINT32, it means the raw content
     if (color_val_operand.type == DataType::INT32 || color_val_operand.type == DataType::UINT32)
         color_val_operand.type = DataType::F32;
@@ -1903,6 +1973,8 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
     if (gxm::get_base_format(translate_state.hints->color_format) == SCE_GXM_COLOR_BASE_FORMAT_F32F32 && vertex_varyings_ptr->output_comp_count > 2) {
         if (color_val_operand.type == DataType::F16)
             color_val_operand.type = DataType::F32;
+        if (declared_output_type == DataType::F16)
+            declared_output_type = DataType::F32;
     }
 
     spv::Decoration precision = get_data_type_size(color_val_operand.type) < 4 ? spv::DecorationRelaxedPrecision : spv::NoPrecision;
@@ -1911,7 +1983,8 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
         precision = spv::NoPrecision;
 
     int reg_off = 0;
-    if (!program.is_native_color() && vertex_varyings_ptr->output_param_type == 1) {
+    if (!program.is_native_color() && (vertex_varyings_ptr->output_param_type == 1
+        || (translate_state.is_metal && vertex_varyings_ptr->output_param_type == 3))) {
         reg_off = vertex_varyings_ptr->fragment_output_start;
         if (reg_off != 0) {
             LOG_INFO("Non zero pa offset: {} at {}", reg_off, translate_state.hash.c_str());
@@ -1924,6 +1997,18 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
 
     if (!is_float_data_type(color_val_operand.type))
         color = utils::convert_to_float(b, utils, color, color_val_operand.type, true);
+
+    if (parameters.frag_output_holds_declared_type && color_val_operand.type != declared_output_type) {
+        auto declared_operand = color_val_operand;
+        declared_operand.type = declared_output_type;
+        auto declared_color = utils::load(b, parameters, utils, features, declared_operand, 0xF, reg_off);
+        if (!is_float_data_type(declared_output_type))
+            declared_color = utils::convert_to_float(b, utils, declared_color, declared_output_type, true);
+        const auto holds_declared = b.createLoad(parameters.frag_output_holds_declared_type, spv::NoPrecision);
+        const auto condition = b.createCompositeConstruct(b.makeVectorType(b.makeBoolType(), 4),
+            {holds_declared, holds_declared, holds_declared, holds_declared});
+        color = b.createTriOp(spv::OpSelect, b.getTypeId(color), condition, declared_color, color);
+    }
 
     if (program.is_frag_color_used() && features.should_use_shader_interlock()) {
         spv::Id signed_i32 = b.makeIntType(32);
@@ -1997,7 +2082,8 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
         }
         b.createStore(color, out);
 
-        if (features.preserve_f16_nan_as_u16) {
+        if (features.preserve_f16_nan_as_u16
+            || (translate_state.is_metal && translate_state.hints->metal_raw_color_attachment)) {
             const spv::Id u4 = b.makeVectorType(b.makeUintType(32), 4);
             const spv::Id out_u16_raw = b.createVariable(spv::NoPrecision, spv::StorageClassOutput, u4, "out_color_ui");
             translate_state.interfaces.push_back(out_u16_raw);
@@ -2107,15 +2193,13 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
     add_vertex_output_info(SCE_GXM_VERTEX_PROGRAM_OUTPUT_TEXCOORD9, "v_TexCoord9", calculate_copy_comp_count(coord_infos[9]), 13);
 
     add_vertex_output_info(SCE_GXM_VERTEX_PROGRAM_OUTPUT_PSIZE, "v_Psize", 1, 14);
-    // TODO: these should be translated to gl_ClipDistance
-    // add_vertex_output_info(SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP0, "v_Clip0", 1);
-    // add_vertex_output_info(SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP1, "v_Clip1", 1);
-    // add_vertex_output_info(SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP2, "v_Clip2", 1);
-    // add_vertex_output_info(SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP3, "v_Clip3", 1);
-    // add_vertex_output_info(SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP4, "v_Clip4", 1);
-    // add_vertex_output_info(SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP5, "v_Clip5", 1);
-    // add_vertex_output_info(SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP6, "v_Clip6", 1);
-    // add_vertex_output_info(SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP7, "v_Clip7", 1);
+    // Each declared guest clip output consumes one scalar register after PSIZE.
+    // Keep the existing output interface of other backends unchanged.
+    if (translation_state.is_metal) {
+        for (uint32_t i = 0; i < metal::CAPTURE_CLIP_COUNT; ++i)
+            add_vertex_output_info(static_cast<SceGxmVertexProgramOutputs>(SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP0 << i),
+                "v_Clip", 1, metal::CAPTURE_CLIP_SLOT + i);
+    }
 
     Operand o_op;
     o_op.bank = RegisterBank::OUTPUT;
@@ -2127,7 +2211,8 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
     if (translation_state.is_metal && translation_state.hints->metal_capture_vertex_outputs) {
         // Capture the values leaving the guest vertex stage, including the
         // position after viewport/depth mapping. Slots match output locations;
-        // point size occupies slot 14. Sparse indices use a distinct variant
+        // point size occupies slot 14, rasterizer clip distances slots 15..22.
+        // Sparse indices use a distinct variant
         // whose output starts at the renderer-selected buffer offset.
         if (!translation_state.hints->metal_capture_vertex_outputs_compact
             && translation_state.metal_vertex_id == spv::NoResult) {
@@ -2175,10 +2260,47 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
             capture_output(slot, zero4);
     }
 
+    spv::Id clip_var = spv::NoResult;
+    uint32_t clip_count = 0, clip_written = 0;
+    const uint32_t guard_count = translation_state.is_metal && (vertex_outputs & SCE_GXM_VERTEX_PROGRAM_OUTPUT_POSITION) ? 3 : 0;
+    if (translation_state.is_metal) {
+        for (uint32_t i = 0; i < metal::CAPTURE_CLIP_COUNT; ++i)
+            clip_count += bool(vertex_outputs & (SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP0 << i));
+        const uint32_t available = metal::CAPTURE_CLIP_COUNT - guard_count;
+        if (clip_count > available) {
+            LOG_WARN("Metal vertex program declares {} clip planes, only {} fit with depth-clamp guards", clip_count, available);
+            clip_count = available;
+        }
+        clip_count += guard_count;
+        if (clip_count) {
+            b.addCapability(spv::CapabilityClipDistance);
+            const auto type = b.makeArrayType(b.makeFloatType(32), b.makeUintConstant(clip_count), 0);
+            clip_var = b.createVariable(spv::NoPrecision, spv::StorageClassOutput, type, "gl_ClipDistance");
+            b.addDecoration(clip_var, spv::DecorationBuiltIn, spv::BuiltInClipDistance);
+            translation_state.interfaces.push_back(clip_var);
+        }
+    }
+    const auto store_clip_distance = [&](uint32_t index, spv::Id distance) {
+        const auto target = utils::create_access_chain(b, spv::StorageClassOutput, clip_var,
+            {b.makeIntConstant(index)});
+        b.createStore(distance, target);
+        if (capture != spv::NoResult) {
+            const auto zero = b.makeFloatConstant(0.0f);
+            capture_output(metal::CAPTURE_CLIP_SLOT + index, b.createCompositeConstruct(
+                b.makeVectorType(b.makeFloatType(32), 4), {distance, zero, zero, zero}));
+        }
+    };
     for (const auto vo : vertex_outputs_list) {
         if (vertex_outputs & vo) {
             const auto vo_typed = static_cast<SceGxmVertexProgramOutputs>(vo);
             const VertexProgramOutputProperties &properties = vertex_properties_map.at(vo_typed);
+
+            if (translation_state.is_metal && vo >= SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP0) {
+                if (guard_count + clip_written < clip_count)
+                    store_clip_distance(guard_count + clip_written++, utils::load(b, parameters, utils, features, o_op, 0b1, 0));
+                o_op.num += properties.component_count;
+                continue;
+            }
 
             // TODO: use real component_count, for now only force PSIZE to have a component count of 1 and other to 4
             const int32_t used_component_count = (vo == SCE_GXM_VERTEX_PROGRAM_OUTPUT_PSIZE) ? 1 : 4;
@@ -2244,12 +2366,12 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
 
                 b.createStore(o_val2, out_var);
 
-                // Note: Depth range and user clip planes are ineffective in this mode
-                // However, that can't be directly translated, so we just gonna set it to w here
+                // Plus keeps guest screen-space Z when the viewport is disabled.
                 spv::Id z_ref = utils::create_access_chain(b, spv::StorageClassOutput, out_var, { b.makeIntConstant(2) });
                 spv::Id w_ref = utils::create_access_chain(b, spv::StorageClassOutput, out_var, { b.makeIntConstant(3) });
 
-                b.createStore(b.createLoad(w_ref, spv::NoPrecision), z_ref);
+                if (!translation_state.is_metal)
+                    b.createStore(b.createLoad(w_ref, spv::NoPrecision), z_ref);
 
                 cond_builder.makeBeginElse();
 
@@ -2278,8 +2400,10 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
                     z = b.createBinOp(spv::OpFMul, f32, z, z_scale);
                     z = b.createBinOp(spv::OpFAdd, f32, z, z_offset);
 
-                    // z values below 0 get clamped
-                    z = b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450FMax, { z, zero });
+                    // Metal clamps per fragment in the rasterizer. Clamping
+                    // vertices here would change the interpolated depth plane.
+                    if (!translation_state.is_metal)
+                        z = b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450FMax, { z, zero });
 
                     if (!translation_state.is_vulkan) {
                         // convert [0,1] depth range (gxp, vulkan) to [-1,1] depth range (opengl)
@@ -2294,6 +2418,19 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
                 }
 
                 cond_builder.makeEndIf();
+                if (guard_count) {
+                    const auto position = b.createLoad(out_var, spv::NoPrecision);
+                    const auto clip_z = b.createCompositeExtract(position, f32, 2);
+                    const auto clip_w = b.createCompositeExtract(position, f32, 3);
+                    store_clip_distance(0, clip_w);
+                    store_clip_distance(1, b.createBinOp(spv::OpFAdd, f32, clip_z, clip_w));
+                    auto far_distance = one;
+                    if (translation_state.hints->metal_far_clip) {
+                        const auto tolerant_w = b.createBinOp(spv::OpFMul, f32, clip_w, b.makeFloatConstant(1.0f + 1e-5f));
+                        far_distance = b.createBinOp(spv::OpFSub, f32, tolerant_w, clip_z);
+                    }
+                    store_clip_distance(2, far_distance);
+                }
                 if (capture != spv::NoResult)
                     capture_output(properties.location, b.createLoad(out_var, spv::NoPrecision));
             } else if (vo == SCE_GXM_VERTEX_PROGRAM_OUTPUT_PSIZE) {
@@ -2326,15 +2463,15 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
             && vo != SCE_GXM_VERTEX_PROGRAM_OUTPUT_POSITION && vo != SCE_GXM_VERTEX_PROGRAM_OUTPUT_PSIZE) {
             // Some guest pairs request varyings the vertex program never
             // exports. Metal requires a matching interface even for these
-            // unwritten values. Choose deterministic zero, consistent with
-            // the output register initialization, without consuming registers.
+            // unwritten values. Match Plus's iterator fallback (0,0,0,1)
+            // without consuming the declared output registers.
             const auto &properties = vertex_properties_map.at(vo);
             const auto type = b.makeVectorType(b.makeFloatType(32), 4);
             const auto out = b.createVariable(spv::NoPrecision, spv::StorageClassOutput, type, properties.name.c_str());
             b.addDecoration(out, spv::DecorationLocation, properties.location);
             translation_state.interfaces.push_back(out);
             const auto zero = b.makeFloatConstant(0.0f);
-            const auto value = b.makeCompositeConstant(type, {zero, zero, zero, zero});
+            const auto value = b.makeCompositeConstant(type, {zero, zero, zero, b.makeFloatConstant(1.0f)});
             b.createStore(value, out);
             capture_output(properties.location, value);
         }
@@ -2521,6 +2658,15 @@ static SpirvCode convert_gxp_to_spirv_impl(const SceGxmProgram &program, const s
 
     // Generate parameters
     SpirvShaderParameters parameters = create_parameters(b, program, utils, features, translation_state, program_type, texture_queries);
+
+    if (translation_state.is_metal && program.is_fragment() && !translation_state.is_maskupdate
+        && translation_state.hints->metal_output_register_format != SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED) {
+        DataType declared;
+        const auto requested = fragment_color_register_type(program, translation_state, &declared);
+        if (requested != declared)
+            parameters.frag_output_holds_declared_type = b.createVariable(spv::NoPrecision,
+                spv::StorageClassPrivate, b.makeBoolType(), "o0_holds_declared_type", b.makeBoolConstant(false));
+    }
 
     if (!translation_state.is_maskupdate) {
         if (program.is_fragment()) {

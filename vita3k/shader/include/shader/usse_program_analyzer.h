@@ -48,7 +48,7 @@ bool is_kill(const std::uint64_t inst);
 bool is_branch(const std::uint64_t inst, std::uint8_t &pred, std::int32_t &br_off);
 bool is_buffer_fetch_or_store(const std::uint64_t inst, int &base, int &cursor, int &offset, int &size);
 bool does_write_to_predicate(const std::uint64_t inst, std::uint8_t &pred);
-std::uint8_t get_predicate(const std::uint64_t inst);
+std::uint8_t get_predicate(const std::uint64_t inst, bool native_metal = false);
 
 enum USSENodeType {
     USSE_ABSTRACT_NODE,
@@ -238,5 +238,5 @@ void get_attribute_informations(const SceGxmProgram &program, AttributeInformati
 // return the max used buffer index + 1
 int get_uniform_buffer_sizes(const SceGxmProgram &program, UniformBufferSizes &sizes);
 
-void analyze(USSEBlockNode &root, USSEOffset end_offset, const AnalyzeReadFunction &read_func);
+void analyze(USSEBlockNode &root, USSEOffset end_offset, const AnalyzeReadFunction &read_func, bool native_metal = false);
 } // namespace shader::usse

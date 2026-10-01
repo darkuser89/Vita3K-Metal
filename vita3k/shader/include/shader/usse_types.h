@@ -48,7 +48,8 @@ enum class ExtPredicate : uint8_t {
     P3,
     NEGP0,
     NEGP1,
-    PN
+    PN,
+    NEGP2
 };
 
 enum class ExtVecPredicate : uint8_t {
@@ -84,7 +85,7 @@ inline ExtPredicate short_predicate_to_ext(ShortPredicate pred) {
     }
 }
 
-inline ExtPredicate ext_vec_predicate_to_ext(ExtVecPredicate pred) {
+inline ExtPredicate ext_vec_predicate_to_ext(ExtVecPredicate pred, bool native_metal = false) {
     switch (pred) {
     case ExtVecPredicate::NONE:
         return ExtPredicate::NONE;
@@ -99,6 +100,8 @@ inline ExtPredicate ext_vec_predicate_to_ext(ExtVecPredicate pred) {
     case ExtVecPredicate::NEGP1:
         return ExtPredicate::NEGP1;
     case ExtVecPredicate::NEGP2:
+        if (native_metal)
+            return ExtPredicate::NEGP2;
         // TODO
         assert(false);
         LOG_CRITICAL("ExtVecPredicate::NEGP2 case hit, report this to devs.");

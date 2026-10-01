@@ -7,6 +7,9 @@
 #include <renderer/texture_cache.h>
 #include <array>
 #include <memory>
+#include <span>
+#include <utility>
+#include <vector>
 
 namespace renderer::metal {
 struct MetalState;
@@ -16,6 +19,8 @@ struct MetalContext : renderer::Context {
     struct UniformBinding { uint8_t *data = nullptr; size_t size = 0; Address address{}; };
     std::array<std::array<UniformBinding, SCE_GXM_REAL_MAX_UNIFORM_BUFFER>, 2> uniforms;
     std::array<SceGxmTexture, 2 * SCE_GXM_MAX_TEXTURE_UNITS> textures{};
+    std::array<uint64_t, SCE_GXM_MAX_VERTEX_STREAMS> vertex_stream_snapshots;
+    std::shared_ptr<const ProgramBinding> vertex_program, fragment_program;
     std::array<float, 4> viewport = {0, 0, 960, 544};
     MetalContext();
     ~MetalContext() override;
@@ -28,7 +33,19 @@ struct MetalRenderTarget : renderer::RenderTarget {
 };
 struct MetalFragmentProgram : renderer::FragmentProgram {
     SceGxmBlendInfo blend{};
+    SceGxmOutputRegisterFormat output_register_format = SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED;
 };
+struct ProgramBinding {
+    std::vector<uint8_t> gxp;
+    std::shared_ptr<const VertexProgram> vertex_program;
+    std::shared_ptr<const MetalFragmentProgram> fragment_program;
+    std::vector<SceGxmVertexStream> streams;
+    std::vector<SceGxmVertexAttribute> attributes;
+    bool is_maskupdate = false;
+    const SceGxmProgram *program() const { return reinterpret_cast<const SceGxmProgram *>(gxp.data()); }
+};
+void freeze_program(SceGxmVertexProgram &, const MemState &);
+void freeze_program(SceGxmFragmentProgram &, const MemState &);
 
 struct MetalTextureCache : renderer::TextureCache {
     struct Impl;
@@ -78,10 +95,17 @@ struct MetalState : renderer::State {
     void precompile_shader(const ShadersHash &) override;
     void set_async_compilation(bool enable) override;
     void preclose_action() override;
+    void snapshot_vertex_streams(MemState &, CommandList &);
+    void disable_vertex_stream_snapshots();
+    void reset_vertex_stream_snapshots();
     void set_context(MetalContext &, MemState &);
+    void new_frame();
     void draw(MetalContext &, MemState &, SceGxmPrimitiveType, SceGxmIndexFormat,
         const void *indices, uint32_t count, uint32_t instances);
-    bool finish(MetalContext &, bool publish_color = true);
+    bool finish(MetalContext &, bool publish_color = true, bool wait_without_publication = false);
+    // After the render thread has joined, retire submitted work even if the
+    // normal finish/publication path fails, before releasing context storage.
+    void finish_for_shutdown(MetalContext &);
     // Diagnostic readback of exact native RGBA8 MSAA samples, before guest
     // sample packing or resolution scaling can duplicate/drop output pixels.
     uint64_t count_nonzero_color_samples(MetalContext &);
@@ -91,12 +115,19 @@ struct MetalState : renderer::State {
     void set_visibility_index(MetalContext &, bool enable, uint32_t index, bool increment);
     void set_back_visibility_index(MetalContext &, bool enable, uint32_t index, bool increment);
     bool sync_surface(MemState &, const SceGxmColorSurface &);
+    int sync_surfaces_for_cpu_read(MemState &, Address address, uint32_t size);
     bool transfer_fill(MemState &, const SceGxmTransferImage &, uint32_t color);
     bool transfer_copy(MemState &, const SceGxmTransferImage &source, const SceGxmTransferImage &destination,
         SceGxmTransferType source_type, SceGxmTransferType destination_type,
         SceGxmTransferColorKeyMode mode, uint32_t key, uint32_t mask);
     bool transfer_downscale(MemState &, const SceGxmTransferImage &source, const SceGxmTransferImage &destination);
 private:
+    bool try_transfer_depth_gpu(MemState &, const SceGxmTransferImage &source, const SceGxmTransferImage &destination,
+        SceGxmTransferType source_type, SceGxmTransferType destination_type,
+        std::span<const std::pair<uint64_t, uint64_t>> reads,
+        std::span<const std::pair<uint64_t, uint64_t>> writes);
+    std::vector<uint8_t> vertex_stream_snapshot(uint64_t handle, size_t size);
+    void retire_cpu_overwritten_surfaces(MemState &, std::span<const std::pair<uint64_t, uint64_t>> ranges);
     bool transfer_image(MemState &, const SceGxmTransferImage &source, const SceGxmTransferImage &destination,
         SceGxmTransferType source_type, SceGxmTransferType destination_type,
         SceGxmTransferColorKeyMode mode, uint32_t key, uint32_t mask, bool downscale);

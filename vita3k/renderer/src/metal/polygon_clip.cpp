@@ -36,10 +36,21 @@ void append_vertex(std::vector<PolygonClipVertex> &vertices, const PolygonClipVe
     vertices.push_back(vertex);
 }
 
+auto captured_clip_distances(const std::array<CapturedVertexOutputs, 3> &source) {
+    std::array<std::array<float, 3>, shader::metal::CAPTURE_CLIP_COUNT> result{};
+    for (size_t plane = 0; plane < result.size(); ++plane)
+        for (size_t corner = 0; corner < 3; ++corner)
+            result[plane][corner] = source[corner][shader::metal::CAPTURE_CLIP_SLOT + plane][0];
+    return result;
+}
+
 } // namespace
 
-ClippedPolygon clip_triangle_positions(const std::array<std::array<float, 4>, 3> &positions) {
+ClippedPolygon clip_triangle_positions(const std::array<std::array<float, 4>, 3> &positions,
+    std::span<const std::array<float, 3>> clip_distances, bool depth_clamp) {
     ClippedPolygon result;
+    for (const auto &plane : clip_distances)
+        if (!std::all_of(plane.begin(), plane.end(), [](float value) { return std::isfinite(value); })) return result;
     for (unsigned i = 0; i < 3; ++i) {
         if (!std::all_of(positions[i].begin(), positions[i].end(),
                 [](float value) { return std::isfinite(value); })) return result;
@@ -48,14 +59,21 @@ ClippedPolygon clip_triangle_positions(const std::array<std::array<float, 4>, 3>
         vertex.weights[i] = 1.0f;
         result.vertices.push_back(vertex);
     }
-    for (unsigned plane = 0; plane < 6 && !result.vertices.empty(); ++plane) {
+    for (size_t plane = 0; plane < 6 + clip_distances.size() && !result.vertices.empty(); ++plane) {
+        // With native depth clamp the captured shader guards replace Z planes.
+        if (depth_clamp && (plane == 4 || plane == 5)) continue;
+        const auto distance = [&](const PolygonClipVertex &vertex) {
+            if (plane < 6) return plane_distance(vertex.position, unsigned(plane));
+            const auto &values = clip_distances[plane - 6];
+            return vertex.weights[0] * values[0] + vertex.weights[1] * values[1] + vertex.weights[2] * values[2];
+        };
         std::vector<PolygonClipVertex> clipped;
         clipped.reserve(result.vertices.size() + 1);
         auto previous = result.vertices.back();
-        float previous_distance = plane_distance(previous.position, plane);
+        float previous_distance = distance(previous);
         bool previous_inside = previous_distance >= 0;
         for (const auto &current : result.vertices) {
-            const float current_distance = plane_distance(current.position, plane);
+            const float current_distance = distance(current);
             const bool current_inside = current_distance >= 0;
             if (previous_inside != current_inside)
                 append_vertex(clipped, between(previous, current, previous_distance, current_distance));
@@ -98,20 +116,34 @@ std::vector<CapturedVertexOutputs> interpolate_polygon_outputs(
                     outputs[slot][component] += vertex.weights[corner] * source[corner][slot][component];
             }
         }
+        // All returned vertices passed the clip planes. Avoid clipping them
+        // again in the replay shader because interpolation rounded below zero.
+        for (size_t plane = 0; plane < shader::metal::CAPTURE_CLIP_COUNT; ++plane) {
+            auto &distance = outputs[shader::metal::CAPTURE_CLIP_SLOT + plane][0];
+            distance = std::max(distance, 0.0f);
+        }
         result.push_back(outputs);
     }
     return result;
 }
 
 std::optional<std::array<CapturedVertexOutputs, 2>> clip_line_outputs(
-    const std::array<CapturedVertexOutputs, 2> &source) {
+    const std::array<CapturedVertexOutputs, 2> &source, bool depth_clamp) {
     auto endpoints = source;
     for (const auto &endpoint : endpoints)
         if (!std::all_of(endpoint[0].begin(), endpoint[0].end(),
                 [](float value) { return std::isfinite(value); })) return std::nullopt;
-    for (unsigned plane = 0; plane < 6; ++plane) {
-        const float first = plane_distance(endpoints[0][0], plane);
-        const float second = plane_distance(endpoints[1][0], plane);
+    for (const auto &endpoint : endpoints)
+        for (size_t plane = 0; plane < shader::metal::CAPTURE_CLIP_COUNT; ++plane)
+            if (!std::isfinite(endpoint[shader::metal::CAPTURE_CLIP_SLOT + plane][0])) return std::nullopt;
+    for (unsigned plane = 0; plane < 6 + shader::metal::CAPTURE_CLIP_COUNT; ++plane) {
+        if (depth_clamp && (plane == 4 || plane == 5)) continue;
+        const auto distance = [&](const CapturedVertexOutputs &vertex) {
+            return plane < 6 ? plane_distance(vertex[0], plane)
+                : vertex[shader::metal::CAPTURE_CLIP_SLOT + plane - 6][0];
+        };
+        const float first = distance(endpoints[0]);
+        const float second = distance(endpoints[1]);
         if (first < 0 && second < 0) return std::nullopt;
         if ((first < 0) == (second < 0)) continue;
         const float t = std::clamp(first / (first - second), 0.0f, 1.0f);
@@ -123,6 +155,11 @@ std::optional<std::array<CapturedVertexOutputs, 2>> clip_line_outputs(
         endpoints[first < 0 ? 0 : 1] = clipped;
     }
     if (endpoints[0][0][3] <= 0 || endpoints[1][0][3] <= 0) return std::nullopt;
+    for (auto &endpoint : endpoints)
+        for (size_t plane = 0; plane < shader::metal::CAPTURE_CLIP_COUNT; ++plane) {
+            auto &distance = endpoint[shader::metal::CAPTURE_CLIP_SLOT + plane][0];
+            distance = std::max(distance, 0.0f);
+        }
     return endpoints;
 }
 
@@ -186,7 +223,8 @@ std::vector<RoutedPointPolygon> route_point_polygons(PolygonTopology topology,
             source[corner] = captured[corners[corner]];
             positions[corner] = source[corner][0];
         }
-        auto polygon = clip_triangle_positions(positions);
+        const auto distances = captured_clip_distances(source);
+        auto polygon = clip_triangle_positions(positions, distances, true);
         if (polygon.vertices.empty()
             || (polygon.face == PolygonFace::Front && cull_front)
             || (polygon.face == PolygonFace::Back && cull_back)) continue;
@@ -210,7 +248,7 @@ std::vector<RoutedWideLine> route_wide_lines(bool triangles, PolygonTopology top
     };
     const auto add_segment = [&](uint32_t primitive_index, PolygonFace face,
                                  const CapturedVertexOutputs &a, const CapturedVertexOutputs &b) {
-        auto clipped = clip_line_outputs({a, b});
+        auto clipped = clip_line_outputs({a, b}, true);
         if (!clipped) return;
         RoutedWideLine line;
         line.primitive_index = primitive_index;
@@ -245,7 +283,8 @@ std::vector<RoutedWideLine> route_wide_lines(bool triangles, PolygonTopology top
             source[corner] = source_at(corners[corner]);
             positions[corner] = source[corner][0];
         }
-        const auto polygon = clip_triangle_positions(positions);
+        const auto distances = captured_clip_distances(source);
+        const auto polygon = clip_triangle_positions(positions, distances, true);
         if (polygon.vertices.size() < 2
             || (polygon.face == PolygonFace::Front && cull_front)
             || (polygon.face == PolygonFace::Back && cull_back)) continue;

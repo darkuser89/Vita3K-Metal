@@ -28,9 +28,11 @@ struct ClippedPolygon {
 
 using CapturedVertexOutputs = std::array<std::array<float, 4>, shader::metal::CAPTURE_OUTPUT_SLOT_COUNT>;
 
-// Metal GXP shaders use Vulkan clip coordinates: -w <= x,y <= w and
-// 0 <= z <= w. Positions already contain the renderer's viewport flip.
-ClippedPolygon clip_triangle_positions(const std::array<std::array<float, 4>, 3> &positions);
+// Positions already contain the renderer's viewport flip. The default clips
+// -w <= x,y <= w and 0 <= z <= w; depth-clamped draws instead supply the
+// shader's eye/far guards among clip_distances and leave Z for the rasterizer.
+ClippedPolygon clip_triangle_positions(const std::array<std::array<float, 4>, 3> &positions,
+    std::span<const std::array<float, 3>> clip_distances = {}, bool depth_clamp = false);
 
 // Reconstruct values at the clipped vertices from the three captured guest
 // vertex outputs. Slot zero uses the clipped position directly.
@@ -40,7 +42,7 @@ std::vector<CapturedVertexOutputs> interpolate_polygon_outputs(
 // Clip an already transformed line while interpolating every GXP output.
 // The returned endpoints can be replayed as a wide screen-space quad.
 std::optional<std::array<CapturedVertexOutputs, 2>> clip_line_outputs(
-    const std::array<CapturedVertexOutputs, 2> &source);
+    const std::array<CapturedVertexOutputs, 2> &source, bool depth_clamp = false);
 std::array<CapturedVertexOutputs, 6> expand_line_outputs(
     const std::array<CapturedVertexOutputs, 2> &endpoints,
     float viewport_width, float viewport_height, float native_width);

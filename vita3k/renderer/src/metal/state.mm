@@ -8,6 +8,8 @@
 #include <renderer/metal/screen.h>
 #include <renderer/metal/textures.h>
 #include <renderer/metal/state.h>
+#include <renderer/metal/vertex_layout.h>
+#include <renderer/metal/surface_write_watch.h>
 #include <renderer/functions.h>
 #include <renderer/shaders.h>
 #include <shader/msl_recompiler.h>
@@ -32,7 +34,9 @@
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <limits>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <set>
 #include <stdexcept>
@@ -236,13 +240,51 @@ id<MTLTexture> make_texture(Device &device, MTLPixelFormat format, uint32_t w, u
 }
 }
 
+// Match Plus: only discard beyond the far plane when both active faces fail
+// the depth test there and discarding cannot suppress a stencil side effect.
+static bool draw_drops_fragments_beyond_far_plane(const GxmRecordState &record) {
+    const auto depth_fails = [](SceGxmDepthFunc func) {
+        return func == SCE_GXM_DEPTH_FUNC_NEVER || func == SCE_GXM_DEPTH_FUNC_LESS
+            || func == SCE_GXM_DEPTH_FUNC_EQUAL || func == SCE_GXM_DEPTH_FUNC_LESS_EQUAL;
+    };
+    const auto stencil_quiet = [](const GxmStencilStateOp &op) {
+        return (op.func == SCE_GXM_STENCIL_FUNC_ALWAYS || op.stencil_fail == SCE_GXM_STENCIL_OP_KEEP)
+            && op.depth_fail == SCE_GXM_STENCIL_OP_KEEP;
+    };
+    return depth_fails(record.front_depth_func) && stencil_quiet(record.front_stencil_state_op)
+        && (record.two_sided == SCE_GXM_TWO_SIDED_DISABLED
+            || (depth_fails(record.back_depth_func) && stencil_quiet(record.back_stencil_state_op)));
+}
+
+struct SurfaceWriteBounds {
+    uint32_t x0 = UINT32_MAX, y0 = UINT32_MAX, x1 = 0, y1 = 0;
+    bool empty() const { return x1 <= x0 || y1 <= y0; }
+    void include(uint32_t left, uint32_t top, uint32_t right, uint32_t bottom) {
+        if (right <= left || bottom <= top) return;
+        x0 = std::min(x0, left); y0 = std::min(y0, top);
+        x1 = std::max(x1, right); y1 = std::max(y1, bottom);
+    }
+};
+struct HalfPixelStrips {
+    uint32_t columns = 0, rows = 0;
+    SurfaceWriteBounds column_span, row_span;
+};
 struct Surface {
     uint64_t revision = 0;
+    uint64_t last_frame_rendered = 0;
+    uint64_t binding_generation = 0;
     id<MTLTexture> color;
+    // A float view of an independently written RGBA16Uint attachment. Keep
+    // normal color for blending/display; raw register bits serve guest reads.
+    id<MTLTexture> raw_color;
+    bool raw_color_invalidated = false;
+    id<MTLTexture> raw_multisample_color;
+    bool raw_multisample_dirty = true;
     id<MTLTexture> multisample_color;
     bool multisample_dirty = true;
     float multisample_scale = 1;
-    std::map<std::pair<uint32_t, bool>, id<MTLTexture>> rgba8_casts;
+    std::map<std::array<uint32_t, 3>, id<MTLTexture>> rgba8_casts;
+    bool has_word_offset_view = false;
     std::map<std::array<uint32_t,4>,id<MTLTexture>> subrectangles;
     SceGxmColorSurface guest{};
     // Last CPU bytes imported or published. Compare against this baseline,
@@ -250,7 +292,23 @@ struct Surface {
     std::vector<uint8_t> cpu_snapshot;
     uint64_t cpu_hash = 0;
     size_t cpu_hash_size = 0;
+    SurfaceWriteStamp cpu_writes;
+    SurfaceWriteBounds scene_writes, written_tiles;
+    // Scene-wide logical macroblock render area in native pixels, plus its
+    // guest-space publication bounds. Keep the native union before rounding.
+    SurfaceWriteBounds scene_render_area, scene_macroblock_bounds;
+    uint32_t rendered_width = 0, rendered_height = 0;
+    float render_scale = 1.f;
+    uint32_t publication_samples_x = 1, publication_samples_y = 1;
 };
+static id<MTLTexture> raw_surface_color(const Surface &surface) {
+    return surface.raw_color && !surface.raw_color_invalidated ? surface.raw_color : surface.color;
+}
+static bool write_surface_storage(Surface &surface, const SceGxmColorSurface &guest,
+    std::span<const uint8_t> bytes, std::span<const SurfaceMemoryRange> ranges) {
+    return write_surface_memory(surface.color,guest,bytes,ranges)
+        && (!surface.raw_color || write_surface_memory(surface.raw_color,guest,bytes,ranges));
+}
 static void update_cpu_snapshot(Surface &surface, std::span<const uint8_t> bytes,
     std::span<const SurfaceMemoryRange> ranges) {
     surface.cpu_hash = XXH3_64bits(bytes.data(), bytes.size());
@@ -259,16 +317,131 @@ static void update_cpu_snapshot(Surface &surface, std::span<const uint8_t> bytes
     for (const auto &range : ranges)
         std::memcpy(surface.cpu_snapshot.data()+range.offset, bytes.data()+range.offset, range.size);
 }
+static bool surface_cpu_bytes_changed(const Surface &entry, std::span<const uint8_t> bytes) {
+    if (entry.cpu_writes.changed()) return true;
+    if (bytes.empty()) return false;
+    return entry.cpu_snapshot.size() == bytes.size()
+        ? std::memcmp(entry.cpu_snapshot.data(), bytes.data(), bytes.size()) != 0
+        : entry.cpu_hash_size == bytes.size() && XXH3_64bits(bytes.data(), bytes.size()) != entry.cpu_hash;
+}
+// Keep Plus' accumulated write ownership and render-target extent separate
+// from the latest scene rectangle. Conversion must not publish unowned bytes.
+enum class SurfacePublication { Unavailable, Published, CpuNewer };
+static SurfacePublication read_surface_publication(const Surface &entry, const SceGxmColorSurface &surface,
+    std::span<uint8_t> output, std::vector<SurfaceMemoryRange> &written,
+    Device &device, std::unique_ptr<SurfaceCaster> &caster) {
+    written.clear();
+    // Plus suppresses small-surface writeback after a CPU write. Native guest
+    // snapshots identify changed bytes even while this surface is still bound
+    // (and therefore excluded from retire_cpu_overwritten_surfaces). Compare
+    // before conversion replaces RAM, and never acknowledge these CPU bytes
+    // in the GPU baseline: the next bind must still import them.
+    const bool same_layout = entry.guest.width == surface.width && entry.guest.height == surface.height
+        && entry.guest.strideInPixels == surface.strideInPixels && entry.guest.colorFormat == surface.colorFormat
+        && entry.guest.surfaceType == surface.surfaceType;
+    if (surface.width <= 512 && surface.height <= 512 && same_layout && surface_cpu_bytes_changed(entry, output))
+        return SurfacePublication::CpuNewer;
+    SurfaceWriteBounds bounds{0, 0, surface.width, surface.height};
+    const auto intersect = [&](const SurfaceWriteBounds &limit) {
+        const auto previous = bounds;
+        bounds.x0 = std::max(bounds.x0, limit.x0); bounds.y0 = std::max(bounds.y0, limit.y0);
+        bounds.x1 = std::min(bounds.x1, limit.x1); bounds.y1 = std::min(bounds.y1, limit.y1);
+        return bounds.x0 != previous.x0 || bounds.y0 != previous.y0
+            || bounds.x1 != previous.x1 || bounds.y1 != previous.y1;
+    };
+    const auto base = gxm::get_base_format(surface.colorFormat);
+    const bool raw = entry.raw_color && !entry.raw_color_invalidated;
+    // These two native attachments need the expanded-format conversion path
+    // which Plus excludes from its general ownership clamp. Native ABGR4 and
+    // RGB9E5 are already packed, unlike Plus' optional expanded fallbacks.
+    const bool repack = base == SCE_GXM_COLOR_BASE_FORMAT_U8U8U8
+        || base == SCE_GXM_COLOR_BASE_FORMAT_U2F10F10F10;
+    bool macroblock_clamped = false, ownership_clamped = false;
+    if (!raw && !repack) {
+        if (!entry.scene_render_area.empty()) macroblock_clamped = intersect(entry.scene_macroblock_bounds);
+        ownership_clamped |= intersect(entry.written_tiles);
+        if (entry.rendered_width && entry.rendered_height)
+            ownership_clamped |= intersect({0, 0, entry.rendered_width, entry.rendered_height});
+    }
+    const bool small_linear = surface.surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR
+        && surface.width <= 512 && surface.height <= 512;
+    const bool small_tiled = surface.surfaceType == SCE_GXM_COLOR_SURFACE_TILED
+        && surface.width <= 512 && surface.height <= 512;
+    const auto &tiles = entry.written_tiles;
+    const bool covers_all = !tiles.empty() && tiles.x0 == 0 && tiles.y0 == 0
+        && tiles.x1 >= surface.width && tiles.y1 >= surface.height;
+    // Plus defers incomplete small tiled writebacks. Keep the existing native
+    // small-linear conversion support while restricting it to the scene.
+    if (small_tiled && !covers_all) return SurfacePublication::Published;
+    if (small_linear && !covers_all) {
+        intersect(entry.scene_writes);
+        ownership_clamped = true;
+    }
+    if (bounds.empty()) return SurfacePublication::Published;
+    if (!surface_memory_ranges(surface,
+            {bounds.x0, bounds.y0, bounds.x1 - bounds.x0, bounds.y1 - bounds.y0}, written)) return SurfacePublication::Unavailable;
+    for (const auto &range : written) {
+        if (range.offset > output.size() || range.size > output.size() - range.offset) {
+            written.clear();
+            return SurfacePublication::Unavailable;
+        }
+    }
+    id<MTLTexture> source = raw_surface_color(entry);
+    if (entry.render_scale != 1.f) {
+        SurfaceWriteBounds input{0, 0, uint32_t(source.width), uint32_t(source.height)};
+        if (ownership_clamped) {
+            const auto edge = [&](uint32_t value, NSUInteger limit) {
+                return uint32_t(std::clamp(std::floor(value * double(entry.render_scale)), 0.0, double(limit)));
+            };
+            input = {edge(bounds.x0, source.width), edge(bounds.y0, source.height),
+                edge(bounds.x1, source.width), edge(bounds.y1, source.height)};
+        } else if (macroblock_clamped) {
+            // The unclipped native macroblock interval is the blit source;
+            // its truncated guest interval is the destination (Plus rt_clamped=false).
+            const auto &area = entry.scene_render_area;
+            input = {std::min<uint32_t>(area.x0 * entry.publication_samples_x, source.width),
+                std::min<uint32_t>(area.y0 * entry.publication_samples_y, source.height),
+                std::min<uint32_t>(area.x1 * entry.publication_samples_x, source.width),
+                std::min<uint32_t>(area.y1 * entry.publication_samples_y, source.height)};
+        }
+        if (!caster) caster = std::make_unique<SurfaceCaster>(device);
+        source = caster->resample_publication(source, surface.width, surface.height,
+            {input.x0,input.y0,input.x1-input.x0,input.y1-input.y0},
+            {bounds.x0,bounds.y0,bounds.x1-bounds.x0,bounds.y1-bounds.y0},
+            raw || base == SCE_GXM_COLOR_BASE_FORMAT_F32 || base == SCE_GXM_COLOR_BASE_FORMAT_F32F32);
+    }
+    if (bounds.x0 == 0 && bounds.y0 == 0 && bounds.x1 == surface.width && bounds.y1 == surface.height)
+        return read_surface_memory(source, surface, output) ? SurfacePublication::Published : SurfacePublication::Unavailable;
+    // Convert into temporary guest-layout storage, then copy only the owned
+    // bytes. Padding remains untouched for every layout and packed format.
+    std::vector<uint8_t> converted(output.size());
+    if (!read_surface_memory(source, surface, converted)) return SurfacePublication::Unavailable;
+    for (const auto &range : written)
+        std::memcpy(output.data() + range.offset, converted.data() + range.offset, range.size);
+    return SurfacePublication::Published;
+}
 struct DepthSurface {
+    uint64_t last_attached_frame = 0;
     std::map<std::array<uint32_t,5>,id<MTLTexture>> subrectangles;
     id<MTLTexture> texture;
+    id<MTLTexture> mask;
+    id<MTLTexture> sample_rate_copy, sample_rate_mask;
+    // Expanded source grid whose target-based extent and guest mapping were
+    // established at allocation. A new scene must not infer it from its color.
+    uint32_t sample_grid_width = 0, sample_grid_height = 0;
     std::map<SceGxmTextureBaseFormat,id<MTLTexture>> snapshots;
     SceGxmDepthStencilSurface guest{};
     uint32_t width = 0, height = 0;
+    float scale = 1;
     SceGxmMultisampleMode multisample = SCE_GXM_MULTISAMPLE_NONE;
-    std::vector<uint8_t> published_depth, published_stencil;
-    float published_background_depth = 0;
-    uint32_t published_background_stencil = 0;
+    // Last observed/imported or published guest bytes. A no-store scene may
+    // keep newer native contents while these bytes stay unchanged in RAM.
+    std::vector<uint8_t> guest_depth_snapshot, guest_stencil_snapshot;
+    float snapshot_background_depth = 0;
+    uint32_t snapshot_background_stencil = 0;
+    bool guest_snapshot_valid = false;
+    bool depth_content_stored = true;
+    Address last_scene_color_addr = 0;
     bool published = false;
 };
 struct MetalContext::Impl {
@@ -292,20 +465,28 @@ struct MetalContext::Impl {
     id<MTLTexture> transient_depth;
     id<MTLTexture> transient_color;
     id<MTLTexture> render_color;
+    id<MTLTexture> raw_color;
+    id<MTLTexture> raw_render_color;
+    id<MTLTexture> raw_attachment;
+    id<MTLTexture> raw_clip_snapshot;
     id<MTLTexture> color_clip_snapshot;
     bool color_clip_restore_pending = false;
     bool color_clip_samplewise = false;
     uint32_t samples = 1;
     float sample_scale = 1;
+    float surface_downscale = 1;
     bool expanded_color = false, custom_samples = false;
     std::array<MTLSamplePosition,4> sample_positions{};
     std::pair<Address, Address> depth_key{};
+    bool depth_is_sample_rate_copy = false;
     id<MTLTexture> mask;
+    id<MTLTexture> transient_mask;
     bool mask_constant_valid = false;
     bool mask_constant_value = false;
     SceGxmColorSurface guest_color{};
     SceGxmDepthStencilSurface guest_depth{};
     std::optional<DepthMemoryLayout> depth_layout;
+    uint32_t depth_scene_width = 0, depth_scene_height = 0;
     bool scene_active=false;
     uint32_t width = 0, height = 0;
     uint16_t macroblock_last_x = ~0u, macroblock_last_y = ~0u;
@@ -315,12 +496,18 @@ struct MetalContext::Impl {
     bool transient_color_initialized = false;
     bool depth_written = false;
     bool depth_scene_written = false;
+    bool scene_depth_drawn = false;
     bool direct_guest_memory_used = false;
+    // Watch restoration belongs to GPU retirement, including failed draws.
+    bool guest_write_watches_pending = false;
     uint32_t pending_draws = 0;
     bool pending_color_writes = false;
+    HalfPixelStrips half_pixel_strips;
     // A mid-scene finish may already have published the current color image.
     bool color_guest_current = false;
     bool color_guest_dirty = false;
+    uint64_t color_binding_generation = 0;
+    bool color_publication_discarded = false;
     size_t pending_upload_bytes = 0;
     size_t pending_uniform_bytes = 0;
     size_t pending_stream_bytes = 0;
@@ -348,13 +535,145 @@ struct MetalContext::Impl {
     std::map<std::array<uint64_t, 3>, bool> published_set_results;
 };
 
-static void begin_pass(MetalContext &ctx, bool mask, bool clear_depth = false) {
-    if (ctx.impl->encoder) [ctx.impl->encoder endEncoding];
+static bool owns_color_binding(const Surface &surface, const MetalContext &ctx) {
+    return ctx.impl->color_binding_generation
+        && surface.binding_generation == ctx.impl->color_binding_generation
+        && surface.color == ctx.impl->color;
+}
+
+static void note_half_pixel_origin(MetalContext &ctx, const MTLViewport &viewport, const MTLScissorRect &scissor,
+    uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) {
+    const float scale = ctx.impl->sample_scale * ctx.impl->surface_downscale;
+    if (ctx.impl->samples != 1 || std::abs(scale - 1.0f) < 1e-4f || scale <= 0) return;
+    const auto format = gxm::get_base_format(ctx.impl->guest_color.colorFormat);
+    const bool raw_words = format == SCE_GXM_COLOR_BASE_FORMAT_F32 || format == SCE_GXM_COLOR_BASE_FORMAT_F32F32;
+    const auto lines_to_fill = [&](float edge, NSUInteger scissor_start, uint32_t limit) -> uint32_t {
+        if (!std::isfinite(edge)) return 0;
+        const float native_edge = edge / scale;
+        const float native_pixel = std::floor(native_edge + 1e-4f);
+        const float fraction = native_edge - native_pixel;
+        if (std::abs(fraction) < 1e-3f || native_pixel != 0 || fraction > 0.5f + 1e-3f || scissor_start > 0)
+            return 0;
+        const float first = std::floor(edge - 0.5f + 1e-4f) + 1;
+        if (first <= 0 || first >= limit || (raw_words && (first + 0.5f) / scale >= 1.0f - 1e-4f)) return 0;
+        return uint32_t(first);
+    };
+    auto &pending = ctx.impl->half_pixel_strips;
+    const auto columns = lines_to_fill(float(std::min(viewport.originX, viewport.originX + viewport.width)), scissor.x, x1);
+    const auto rows = lines_to_fill(float(std::min(viewport.originY, viewport.originY + viewport.height)), scissor.y, y1);
+    if (columns) {
+        pending.columns = std::max(pending.columns, columns);
+        pending.column_span.include(0, y0, columns, y1);
+    }
+    if (rows) {
+        pending.rows = std::max(pending.rows, rows);
+        pending.row_span.include(x0, 0, x1, rows);
+    }
+}
+
+static void fill_half_pixel_strips(MetalContext &ctx) {
+    const auto pending = ctx.impl->half_pixel_strips;
+    ctx.impl->half_pixel_strips = {};
+    if ((!pending.columns && !pending.rows) || !ctx.impl->commands || !ctx.impl->guest_color.data
+        || !ctx.impl->color || ctx.impl->samples != 1) return;
+    const auto fill = [&](id<MTLTexture> color) {
+        if (!color) return;
+        const uint32_t width = uint32_t(color.width), height = uint32_t(color.height);
+        uint32_t left = 0, top = 0, right = width, bottom = height;
+        const auto &surface = ctx.impl->guest_color;
+        if (surface.clip_enabled) {
+            // Keep Metal's existing guest color-clip ownership, even at a pass
+            // restart before the deferred outside-color restoration runs.
+            const auto edge = [&](uint32_t value, uint32_t limit) {
+                return uint32_t(std::clamp(std::floor(double(value) * ctx.impl->sample_scale), 0.0, double(limit)));
+            };
+            left = edge(surface.clip_x_min, width); top = edge(surface.clip_y_min, height);
+            right = edge(uint32_t(surface.clip_x_max) + 1, width);
+            bottom = edge(uint32_t(surface.clip_y_max) + 1, height);
+        }
+        const uint32_t col_y0 = std::max(pending.column_span.y0, top);
+        const uint32_t col_y1 = std::min(pending.column_span.y1, bottom);
+        const bool fill_columns = pending.columns > left && pending.columns < right && col_y1 > col_y0;
+        const uint32_t row_x0 = fill_columns ? left : std::max(pending.row_span.x0, left);
+        const uint32_t row_x1 = std::min(pending.row_span.x1, right);
+        const bool fill_rows = pending.rows > top && pending.rows < bottom && row_x1 > row_x0;
+        if (!fill_columns && !fill_rows) return;
+        // Copy exact texel bits via a one-column/one-row scratch texture. The row
+        // snapshot follows the column writes, so their common corner is filled.
+        const auto scratch = [&](uint32_t w, uint32_t h) {
+            auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:color.pixelFormat width:w height:h mipmapped:NO];
+            desc.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> texture = [ctx.impl->commands.device newTextureWithDescriptor:desc];
+            require(texture != nil, "Metal: cannot allocate half-pixel strip snapshot");
+            return texture;
+        };
+        id<MTLTexture> column = fill_columns ? scratch(1, col_y1 - col_y0) : nil;
+        id<MTLTexture> row = fill_rows ? scratch(row_x1 - row_x0, 1) : nil;
+        auto blit = [ctx.impl->commands blitCommandEncoder];
+        require(blit != nil, "Metal: cannot fill half-pixel strips");
+        if (fill_columns) {
+            const auto size = MTLSizeMake(1, col_y1 - col_y0, 1);
+            [blit copyFromTexture:color sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(pending.columns, col_y0, 0)
+                sourceSize:size toTexture:column destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+            for (uint32_t x = left; x < pending.columns; ++x)
+                [blit copyFromTexture:column sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                    sourceSize:size toTexture:color destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(x, col_y0, 0)];
+        }
+        if (fill_rows) {
+            const auto size = MTLSizeMake(row_x1 - row_x0, 1, 1);
+            [blit copyFromTexture:color sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(row_x0, pending.rows, 0)
+                sourceSize:size toTexture:row destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+            for (uint32_t y = top; y < pending.rows; ++y)
+                [blit copyFromTexture:row sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                    sourceSize:size toTexture:color destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(row_x0, y, 0)];
+        }
+        [blit endEncoding];
+    };
+    fill(ctx.impl->color);
+    fill(ctx.impl->raw_color);
+}
+
+static void end_pass(MetalContext &ctx) {
+    if (ctx.impl->encoder) {
+        [ctx.impl->encoder endEncoding];
+        ctx.impl->encoder = nil;
+    }
+    fill_half_pixel_strips(ctx);
+}
+
+// Raw register halves follow the same guest sample grid as normal color, but
+// are moved through integer views. Never resolve them by averaging the words.
+static void expand_color_samples(MetalContext &ctx, SurfaceCaster &caster,
+    id<MTLCommandBuffer> commands = nil) {
+    caster.expand_multisample(ctx.impl->render_color,ctx.impl->color,ctx.impl->sample_scale,
+        ctx.impl->guest_color.width,ctx.impl->guest_color.height,commands);
+    if (ctx.impl->raw_render_color)
+        caster.expand_multisample(ctx.impl->raw_render_color,ctx.impl->raw_color,ctx.impl->sample_scale,
+            ctx.impl->guest_color.width,ctx.impl->guest_color.height,commands);
+}
+
+static void configure_raw_attachment(MTLRenderPipelineDescriptor *descriptor, id<MTLTexture> texture,
+    MTLColorWriteMask mask) {
+    if (!texture) return;
+    descriptor.colorAttachments[1].pixelFormat=texture.pixelFormat;
+    descriptor.colorAttachments[1].blendingEnabled=NO;
+    descriptor.colorAttachments[1].writeMask=mask;
+}
+
+static void begin_pass(MetalContext &ctx, bool mask, bool clear_depth = false, bool clear_stencil = false) {
+    end_pass(ctx);
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.renderTargetWidth=ctx.impl->width;
+    pass.renderTargetHeight=ctx.impl->height;
     pass.colorAttachments[0].texture = mask ? ctx.impl->mask : ctx.impl->render_color;
     pass.colorAttachments[0].loadAction = !mask && !ctx.impl->guest_color.data
             && !ctx.impl->transient_color_initialized ? MTLLoadActionDontCare : MTLLoadActionLoad;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    if (!mask && ctx.impl->raw_attachment) {
+        pass.colorAttachments[1].texture = ctx.impl->raw_attachment;
+        pass.colorAttachments[1].loadAction = MTLLoadActionLoad;
+        pass.colorAttachments[1].storeAction = MTLStoreActionStore;
+    }
     if (!mask && !ctx.impl->guest_color.data) ctx.impl->transient_color_initialized = true;
     if (!mask && ctx.impl->samples > 1 && ctx.impl->color && !ctx.impl->expanded_color) {
         pass.colorAttachments[0].resolveTexture = ctx.impl->color;
@@ -362,7 +681,8 @@ static void begin_pass(MetalContext &ctx, bool mask, bool clear_depth = false) {
     }
     if (ctx.impl->custom_samples) [pass setSamplePositions:ctx.impl->sample_positions.data() count:ctx.impl->samples];
     pass.depthAttachment.texture = pass.stencilAttachment.texture = ctx.impl->depth;
-    pass.depthAttachment.loadAction = pass.stencilAttachment.loadAction = clear_depth ? MTLLoadActionClear : MTLLoadActionLoad;
+    pass.depthAttachment.loadAction = clear_depth ? MTLLoadActionClear : MTLLoadActionLoad;
+    pass.stencilAttachment.loadAction = clear_stencil ? MTLLoadActionClear : MTLLoadActionLoad;
     pass.depthAttachment.clearDepth = ctx.record.depth_stencil_surface.background_depth;
     pass.stencilAttachment.clearStencil = ctx.record.depth_stencil_surface.stencil;
     pass.depthAttachment.storeAction = pass.stencilAttachment.storeAction = MTLStoreActionStore;
@@ -382,8 +702,9 @@ static void begin_pass(MetalContext &ctx, bool mask, bool clear_depth = false) {
     }
     ctx.impl->encoder = [ctx.impl->commands renderCommandEncoderWithDescriptor:pass];
     ctx.impl->mask_pass = mask;
-    ctx.impl->depth_written |= clear_depth;
+    ctx.impl->depth_written |= clear_depth || clear_stencil;
     require(ctx.impl->encoder != nil, "Metal: cannot begin GXM render pass");
+    [ctx.impl->encoder setDepthClipMode:MTLDepthClipModeClamp];
 }
 
 static void restore_color_outside_clip(MetalContext &ctx, SurfaceCaster *caster) {
@@ -395,6 +716,10 @@ static void restore_color_outside_clip(MetalContext &ctx, SurfaceCaster *caster)
         caster->restore_clipped_multisample(ctx.impl->color_clip_snapshot,
             ctx.impl->render_color, surface, ctx.impl->commands,
             ctx.impl->custom_samples ? ctx.impl->sample_positions.data() : nullptr);
+        if (ctx.impl->raw_clip_snapshot)
+            caster->restore_clipped_multisample(ctx.impl->raw_clip_snapshot,
+                ctx.impl->raw_render_color, surface, ctx.impl->commands,
+                ctx.impl->custom_samples ? ctx.impl->sample_positions.data() : nullptr);
         ctx.impl->color_clip_restore_pending = false;
         return;
     }
@@ -420,6 +745,11 @@ static void restore_color_outside_clip(MetalContext &ctx, SurfaceCaster *caster)
             sourceOrigin:MTLOriginMake(x, y, 0) sourceSize:MTLSizeMake(w, h, 1)
             toTexture:ctx.impl->render_color destinationSlice:0 destinationLevel:0
             destinationOrigin:MTLOriginMake(x, y, 0)];
+        if (ctx.impl->raw_clip_snapshot)
+            [blit copyFromTexture:ctx.impl->raw_clip_snapshot sourceSlice:0 sourceLevel:0
+                sourceOrigin:MTLOriginMake(x,y,0) sourceSize:MTLSizeMake(w,h,1)
+                toTexture:ctx.impl->raw_render_color destinationSlice:0 destinationLevel:0
+                destinationOrigin:MTLOriginMake(x,y,0)];
     };
     if (x1 <= x0 || y1 <= y0) copy(0, 0, width, height);
     else {
@@ -444,12 +774,28 @@ static void restore_color_outside_clip(MetalContext &ctx, SurfaceCaster *caster)
     ctx.impl->color_clip_restore_pending = false;
 }
 struct MetalState::Impl {
+    static constexpr size_t STREAM_SNAPSHOT_RING_SIZE = 64u * 1024u * 1024u;
+    static constexpr size_t STREAM_SNAPSHOT_MAX_BYTES = 16u * 1024u;
+    struct StreamSnapshotHeader {
+        uint64_t handle;
+        uint32_t size;
+        uint32_t reserved = 0;
+    };
+    std::mutex stream_snapshot_mutex;
+    std::vector<uint8_t> stream_snapshot_ring;
+    uint64_t stream_snapshot_cursor = 0;
+    bool stream_snapshots_disabled = false;
+    uint64_t frame_timestamp = 0;
     struct PipelineResult {
         id<MTLRenderPipelineState> pipeline = nil;
         std::string error;
     };
     std::atomic_bool async_compilation = false;
     std::map<std::string, std::future<PipelineResult>> compiling_pipelines;
+    std::set<std::string> failed_shaders, failed_pipelines;
+    // Cached variants are speculative. A warmup failure must not suppress a
+    // later rebuild from the actual draw's GXP and native descriptor.
+    std::set<std::string> warmup_failed_shaders, warmup_failed_pipelines;
     bool cache_enabled = false;
     bool cache_reported = false;
     bool sync_draws = std::getenv("VITA3K_METAL_SYNC_DRAWS") != nullptr;
@@ -549,6 +895,9 @@ struct MetalState::Impl {
     std::unique_ptr<OverlayRenderer> overlay;
     std::string gpu_name;
     std::map<Address, Surface> surfaces;
+    SurfaceWriteTracker surface_writes;
+    // Never reset on cache clear: an old context must not match a reused entry.
+    uint64_t next_color_binding_generation = 1;
     MappedGuestRegions mapped_memory;
     DirectGuestBufferCache direct_guest_buffers;
     struct RenderedImage {
@@ -556,6 +905,7 @@ struct MetalState::Impl {
         std::vector<id<MTLTexture>> sources;
     };
     std::map<std::string, RenderedImage> rendered_images;
+    std::map<std::string, RenderedImage> rendered_cubes;
     struct CubeAlias {
         id<MTLTexture> source = nil;
         id<MTLTexture> cube = nil;
@@ -602,7 +952,7 @@ fragment void macroblock_clear_fragment() {}
     }
     const std::string pipeline_key = "metal-macroblock-depth-clear-"
         + std::to_string(uint32_t(ctx.impl->render_color.pixelFormat)) + "-"
-        + std::to_string(ctx.impl->samples);
+        + std::to_string(ctx.impl->samples) + "-" + std::to_string(bool(ctx.impl->raw_attachment));
     auto &pipeline = state.impl->pipelines[pipeline_key];
     if (!pipeline) {
         auto desc = [MTLRenderPipelineDescriptor new];
@@ -612,6 +962,7 @@ fragment void macroblock_clear_fragment() {}
         desc.depthAttachmentPixelFormat = desc.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
         desc.colorAttachments[0].pixelFormat = ctx.impl->render_color.pixelFormat;
         desc.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
+        configure_raw_attachment(desc,ctx.impl->raw_attachment,MTLColorWriteMaskNone);
         pipeline = device.create_pipeline(desc, error);
         require(pipeline != nil, "Metal macroblock clear pipeline: " + error);
     }
@@ -698,7 +1049,32 @@ static std::vector<uint32_t> display_border_pixels(const DisplayFrameInfo &frame
     }
     return pixels;
 }
-MetalContext::MetalContext() : impl(std::make_unique<Impl>()) {}
+MetalContext::MetalContext() : impl(std::make_unique<Impl>()) {
+    vertex_stream_snapshots.fill(~0ull);
+}
+void freeze_program(SceGxmVertexProgram &program, const MemState &mem) {
+    auto binding = std::make_shared<ProgramBinding>();
+    const auto *gxp = program.program.get(mem);
+    const auto *bytes = reinterpret_cast<const uint8_t *>(gxp);
+    binding->gxp.assign(bytes, bytes + gxp->size);
+    auto metadata = std::make_shared<VertexProgram>(*program.renderer_data);
+    metadata->metal_binding.reset();
+    binding->vertex_program = std::move(metadata);
+    binding->streams = program.streams;
+    binding->attributes = program.attributes;
+    program.renderer_data->metal_binding = std::move(binding);
+}
+void freeze_program(SceGxmFragmentProgram &program, const MemState &mem) {
+    auto binding = std::make_shared<ProgramBinding>();
+    const auto *gxp = program.program.get(mem);
+    const auto *bytes = reinterpret_cast<const uint8_t *>(gxp);
+    binding->gxp.assign(bytes, bytes + gxp->size);
+    auto metadata = std::make_shared<MetalFragmentProgram>(static_cast<const MetalFragmentProgram &>(*program.renderer_data));
+    metadata->metal_binding.reset();
+    binding->fragment_program = std::move(metadata);
+    binding->is_maskupdate = program.is_maskupdate;
+    program.renderer_data->metal_binding = std::move(binding);
+}
 MetalContext::~MetalContext() = default;
 MetalState::MetalState() : impl(std::make_unique<Impl>()), texture_cache(*this) {
     current_backend = Backend::Metal;
@@ -760,6 +1136,10 @@ bool MetalState::init() {
 void MetalState::set_app(const char *title_id, const char *self_name) {
     // Workers may still be using the previous game's cache and device.
     impl->compiling_pipelines.clear();
+    impl->failed_shaders.clear();
+    impl->failed_pipelines.clear();
+    impl->warmup_failed_shaders.clear();
+    impl->warmup_failed_pipelines.clear();
     State::set_app(title_id, self_name);
     impl->known_shader_pairs.clear();
     shaders_cache_hashs.clear();
@@ -771,14 +1151,35 @@ void MetalState::set_app(const char *title_id, const char *self_name) {
     if (!impl->device->cache_directory().empty())
         LOG_INFO("Metal persistent cache: {}", impl->device->cache_directory().string());
 }
+// The native backend commits directly; it never reserves queue slots with
+// enqueue(). Uncommitted buffers have no GPU users and may be discarded.
+// Wait also on terminal errors so completion handlers have returned before
+// owners of no-copy guest memory or uploads are released.
+static bool retire_commands_for_shutdown(id<MTLCommandBuffer> commands) {
+    if (!commands || commands.status == MTLCommandBufferStatusNotEnqueued
+        || commands.status == MTLCommandBufferStatusEnqueued)
+        return false;
+    [commands waitUntilCompleted];
+    return commands.status == MTLCommandBufferStatusError;
+}
+
 void MetalState::cleanup() {
+    assert(!render_thread);
+    reset_vertex_stream_snapshots();
     // std::async futures join here, before the cache or its device is released.
     impl->compiling_pipelines.clear();
-    if (context) finish(*static_cast<MetalContext *>(context));
+    impl->failed_shaders.clear();
+    impl->failed_pipelines.clear();
+    impl->warmup_failed_shaders.clear();
+    impl->warmup_failed_pipelines.clear();
+    if (context) finish_for_shutdown(*static_cast<MetalContext *>(context));
     if (impl->screen_commands) {
-        std::string error;
-        require(impl->device->submit_and_wait(impl->screen_commands, error), error);
+        // A failed swap may leave an already submitted buffer here. Never
+        // resubmit it, or submit an incomplete presentation during teardown.
+        const bool failed = retire_commands_for_shutdown(impl->screen_commands);
         impl->screen_commands = nil;
+        impl->drawable = nil;
+        if (failed) LOG_ERROR("Metal shutdown: presentation command buffer failed");
     }
     if (impl->device && !impl->cache_reported) {
         impl->device->flush_cache();
@@ -790,6 +1191,7 @@ void MetalState::cleanup() {
         impl->cache_reported = true;
     }
     impl->rendered_images.clear();
+    impl->rendered_cubes.clear();
     impl->direct_guest_buffers.clear();
     impl->surfaces.clear(); impl->depth_surfaces.clear(); impl->pipelines.clear(); impl->depth_states.clear(); impl->shaders.clear();
 }
@@ -838,6 +1240,9 @@ int MetalState::get_supported_filters() {
         | int(Filter::FXAA) | int(Filter::FSR)
         | ([MTLFXSpatialScalerDescriptor supportsDevice:impl->device->native_device()] ? int(Filter::METALFX_SPATIAL) : 0);
 }
+void MetalState::new_frame() {
+    ++impl->frame_timestamp;
+}
 void MetalState::set_screen_filter(const std::string_view &filter) {
     if (!impl->screen) impl->screen = std::make_unique<ScreenRenderer>(*impl->device, std::filesystem::path(static_assets.string()));
     impl->screen->set_filter(filter);
@@ -845,60 +1250,79 @@ void MetalState::set_screen_filter(const std::string_view &filter) {
 void MetalState::set_anisotropic_filtering(int value) { texture_cache.anisotropic_filtering = std::clamp(value, 1, 16); }
 std::string_view MetalState::get_gpu_name() { return impl->gpu_name; }
 void MetalState::precompile_shader(const ShadersHash &hash) {
-    impl->known_shader_pairs.emplace(hash.frag, hash.vert);
-    // A GXM hash alone cannot reconstruct Metal's draw-specific shader key.
-    // Warm only complete variants that an earlier draw recorded in the cache.
-    for (const auto &[guest_hash, stage] : {std::pair{hex_string(hash.vert), shader::metal::Stage::Vertex},
-             std::pair{hex_string(hash.frag), shader::metal::Stage::Fragment}}) {
-        for (const auto &variant : impl->device->cached_variants(guest_hash)) {
-            if (impl->shaders.contains(variant.key)) continue;
-            auto program = impl->device->load_cached_program(variant.key);
-            if (!program || program->stage != stage) continue;
-            std::string error;
-            auto compiled = impl->device->compile(*program, variant.gamma_correction, error);
-            if (!compiled) {
-                LOG_WARN("Metal: cached shader warmup failed; draw will rebuild it: {}", error);
-                continue;
+    @autoreleasepool {
+        try {
+            impl->known_shader_pairs.emplace(hash.frag, hash.vert);
+            const auto remember_warmup_failure = [](std::set<std::string> &failures,
+                                                     const std::string &key, const char *kind, const char *error) {
+                if (failures.insert(key).second)
+                    LOG_WARN("Metal: cached {} warmup {:016x} failed; draw will rebuild it: {}",
+                        kind, XXH3_64bits(key.data(), key.size()), error);
+            };
+            const auto warm_shader = [&](const std::string &key, shader::metal::Stage stage, bool gamma) {
+                if (render_abort.load(std::memory_order_relaxed) || impl->shaders.contains(key)
+                    || impl->warmup_failed_shaders.contains(key)) return;
+                try {
+                    auto program = impl->device->load_cached_program(key);
+                    if (!program || program->stage != stage) {
+                        impl->warmup_failed_shaders.insert(key);
+                        return;
+                    }
+                    std::string error;
+                    auto compiled = impl->device->compile(*program, gamma, error);
+                    require(bool(compiled), error.empty() ? "compiler returned no shader" : error);
+                    impl->shaders.emplace(key, std::move(compiled));
+                    ++shaders_count_compiled;
+                } catch (const std::exception &error) {
+                    remember_warmup_failure(impl->warmup_failed_shaders, key, "shader", error.what());
+                }
+            };
+            // A GXM hash alone cannot reconstruct a draw-specific Metal key.
+            // Warm only complete variants recorded by an earlier draw.
+            for (const auto &[guest_hash, stage] : {std::pair{hex_string(hash.vert), shader::metal::Stage::Vertex},
+                     std::pair{hex_string(hash.frag), shader::metal::Stage::Fragment}}) {
+                if (render_abort.load(std::memory_order_relaxed)) break;
+                for (const auto &variant : impl->device->cached_variants(guest_hash)) {
+                    if (render_abort.load(std::memory_order_relaxed)) break;
+                    warm_shader(variant.key, stage, variant.gamma_correction);
+                }
             }
-            impl->shaders.emplace(variant.key, std::move(compiled));
-            ++shaders_count_compiled;
-        }
-    }
-    for (auto &saved : impl->device->cached_pipeline_templates(hex_string(hash.frag),hex_string(hash.vert))) {
-        if (const auto found=impl->pipelines.find(saved.key);
-            found!=impl->pipelines.end() && found->second) continue;
-        auto vertex=impl->shaders.find(saved.vertex_key);
-        auto fragment=impl->shaders.find(saved.fragment_key);
-        if (fragment==impl->shaders.end() && saved.fragment_key.starts_with("metal-depth-only")) {
-            if (auto program=impl->device->load_cached_program(saved.fragment_key)) {
-                std::string error;
-                if (program->stage==shader::metal::Stage::Fragment) {
-                    auto compiled=impl->device->compile(*program,false,error);
-                    if (compiled) {
-                        fragment=impl->shaders.emplace(saved.fragment_key,std::move(compiled)).first;
-                        ++shaders_count_compiled;
+            if (!render_abort.load(std::memory_order_relaxed)) {
+                for (auto &saved : impl->device->cached_pipeline_templates(hex_string(hash.frag), hex_string(hash.vert))) {
+                    if (render_abort.load(std::memory_order_relaxed)) break;
+                    if (impl->warmup_failed_pipelines.contains(saved.key)) continue;
+                    if (const auto found = impl->pipelines.find(saved.key);
+                        found != impl->pipelines.end() && found->second) continue;
+                    try {
+                        if (saved.fragment_key.starts_with("metal-depth-only"))
+                            warm_shader(saved.fragment_key, shader::metal::Stage::Fragment, false);
+                        if (render_abort.load(std::memory_order_relaxed)) break;
+                        const auto vertex = impl->shaders.find(saved.vertex_key);
+                        const auto fragment = impl->shaders.find(saved.fragment_key);
+                        if (vertex == impl->shaders.end() || fragment == impl->shaders.end()
+                            || !vertex->second || !fragment->second
+                            || vertex->second->stage != shader::metal::Stage::Vertex
+                            || fragment->second->stage != shader::metal::Stage::Fragment
+                            || std::string_view(vertex->second->function.name.UTF8String ?: "") != saved.vertex_function
+                            || std::string_view(fragment->second->function.name.UTF8String ?: "") != saved.fragment_function) continue;
+                        saved.descriptor.vertexFunction = vertex->second->function;
+                        saved.descriptor.fragmentFunction = fragment->second->function;
+                        std::string error;
+                        auto pipeline = impl->device->create_pipeline(saved.descriptor, error);
+                        require(pipeline != nil, error.empty() ? "compiler returned no pipeline" : error);
+                        impl->pipelines[saved.key] = pipeline;
+                        ++pipelines_count_precompiled;
+                    } catch (const std::exception &error) {
+                        remember_warmup_failure(impl->warmup_failed_pipelines, saved.key, "pipeline", error.what());
                     }
                 }
             }
+        } catch (const std::exception &error) {
+            // Match Plus: a cache loading failure is not a render-thread failure.
+            LOG_WARN("Metal: cached program pair warmup skipped: {}", error.what());
         }
-        if (vertex==impl->shaders.end() || fragment==impl->shaders.end()
-            || !vertex->second || !fragment->second
-            || vertex->second->stage!=shader::metal::Stage::Vertex
-            || fragment->second->stage!=shader::metal::Stage::Fragment
-            || std::string_view(vertex->second->function.name.UTF8String ?: "")!=saved.vertex_function
-            || std::string_view(fragment->second->function.name.UTF8String ?: "")!=saved.fragment_function) continue;
-        saved.descriptor.vertexFunction=vertex->second->function;
-        saved.descriptor.fragmentFunction=fragment->second->function;
-        std::string error;
-        auto pipeline=impl->device->create_pipeline(saved.descriptor,error);
-        if (!pipeline) {
-            LOG_WARN("Metal: cached pipeline warmup failed; draw will rebuild it: {}",error);
-            continue;
-        }
-        impl->pipelines[saved.key]=pipeline;
-        ++pipelines_count_precompiled;
+        ++programs_count_pre_compiled;
     }
-    ++programs_count_pre_compiled;
 }
 void MetalState::preclose_action() {
     // Called on the UI thread before stop_render_thread joins the GXM worker.
@@ -908,9 +1332,141 @@ void MetalState::preclose_action() {
 void MetalState::set_async_compilation(bool enable) {
     impl->async_compilation.store(enable, std::memory_order_relaxed);
 }
-bool MetalState::finish(MetalContext &ctx, bool publish_color) {
+void MetalState::snapshot_vertex_streams(MemState &mem, CommandList &list) {
+    if (!list.first) return;
+    Command *from = list.first;
+    // Earlier flushes already captured their own vertex inputs. Repeated
+    // kicks must not replace those bytes with the guest's current contents.
+    for (Command *cmd = list.first; cmd; cmd = cmd == list.last ? nullptr : cmd->next)
+        if (cmd->opcode == CommandOpcode::MidSceneFlush)
+            from = cmd == list.last ? nullptr : cmd->next;
+
+    const std::lock_guard lock(impl->stream_snapshot_mutex);
+    if (impl->stream_snapshots_disabled) return;
+    for (Command *cmd = from; cmd; cmd = cmd == list.last ? nullptr : cmd->next) {
+        if (cmd->opcode != CommandOpcode::SetState) continue;
+        CommandHelper helper(cmd);
+        if (helper.pop<GXMState>() != GXMState::VertexStream) continue;
+        const auto stream = helper.pop<Ptr<const uint8_t>>();
+        helper.pop<size_t>();
+        const auto size = helper.pop<size_t>();
+        uint64_t handle = ~0ull;
+        const uint64_t end = uint64_t(stream.address()) + size;
+        if (stream && size && size <= Impl::STREAM_SNAPSHOT_MAX_BYTES
+            && end <= uint64_t(UINT32_MAX) - 4095
+            && is_valid_addr_range(mem, stream.address(), Address(end))) {
+            auto &ring = impl->stream_snapshot_ring;
+            if (ring.empty()) ring.resize(Impl::STREAM_SNAPSHOT_RING_SIZE);
+            const size_t slot = (sizeof(Impl::StreamSnapshotHeader) + size + 63) & ~size_t(63);
+            handle = impl->stream_snapshot_cursor;
+            size_t offset = size_t(handle % ring.size());
+            if (offset + slot > ring.size()) {
+                handle += ring.size() - offset;
+                offset = 0;
+            }
+            impl->stream_snapshot_cursor = handle + slot;
+            const Impl::StreamSnapshotHeader header{handle, uint32_t(size)};
+            std::memcpy(ring.data() + offset, &header, sizeof(header));
+            auto *destination = ring.data() + offset + sizeof(header);
+            if (!mem.use_page_table) {
+                std::memcpy(destination, stream.get(mem), size);
+            } else {
+                // Ptr::get resolves only its first page. Resolve each guest
+                // page separately when external mappings are not contiguous.
+                for (size_t copied = 0; copied < size;) {
+                    const Address address = Address(uint64_t(stream.address()) + copied);
+                    const size_t chunk = std::min(size - copied, size_t(4096 - (address & 4095)));
+                    std::memcpy(destination + copied, Ptr<const uint8_t>(address).get(mem), chunk);
+                    copied += chunk;
+                }
+            }
+        }
+        require(helper.push(handle), "Metal: vertex snapshot handle exceeds command storage");
+    }
+}
+std::vector<uint8_t> MetalState::vertex_stream_snapshot(uint64_t handle, size_t size) {
+    if (handle == ~0ull || !size || size > Impl::STREAM_SNAPSHOT_MAX_BYTES) return {};
+    const std::lock_guard lock(impl->stream_snapshot_mutex);
+    const auto &ring = impl->stream_snapshot_ring;
+    if (impl->stream_snapshots_disabled || ring.empty() || impl->stream_snapshot_cursor < handle
+        || impl->stream_snapshot_cursor - handle > ring.size()) return {};
+    const size_t offset = size_t(handle % ring.size());
+    if (offset > ring.size() - sizeof(Impl::StreamSnapshotHeader)) return {};
+    Impl::StreamSnapshotHeader header;
+    std::memcpy(&header, ring.data() + offset, sizeof(header));
+    if (header.handle != handle || size > header.size || size > ring.size() - offset - sizeof(header)) return {};
+    const auto *bytes = ring.data() + offset + sizeof(header);
+    // Own the returned bytes: a guest-thread kick may wrap the ring as soon
+    // as this lock is released, before the render thread uploads the stream.
+    return {bytes, bytes + size};
+}
+void MetalState::disable_vertex_stream_snapshots() {
+    const std::lock_guard lock(impl->stream_snapshot_mutex);
+    impl->stream_snapshots_disabled = true;
+    std::vector<uint8_t>().swap(impl->stream_snapshot_ring);
+}
+void MetalState::reset_vertex_stream_snapshots() {
+    const std::lock_guard lock(impl->stream_snapshot_mutex);
+    impl->stream_snapshots_disabled = false;
+    std::vector<uint8_t>().swap(impl->stream_snapshot_ring);
+    // Keep handles monotonic so an old command cannot match a new slot after
+    // GXM termination/reinitialization on the same MetalState.
+}
+void MetalState::finish_for_shutdown(MetalContext &ctx) {
+    assert(!render_thread);
+    const auto discard_remaining = [&]() {
+        // Avoid end_pass here: its half-pixel restoration can allocate and
+        // encode more work. Discard unfinished work after closing its encoder.
+        if (ctx.impl->encoder) {
+            [ctx.impl->encoder endEncoding];
+            ctx.impl->encoder = nil;
+        }
+        size_t failed = retire_commands_for_shutdown(ctx.impl->commands);
+        for (const auto &batch : ctx.impl->pending_batches)
+            failed += retire_commands_for_shutdown(batch.commands);
+        // No uploads or guest-memory bindings are released before all known
+        // submitted buffers have reached a terminal state, including errors.
+        ctx.impl->commands = nil;
+        ctx.impl->pending_batches.clear();
+        ctx.impl->uploads.reset_after_completion();
+        ctx.impl->visibility_results.clear();
+        ctx.impl->pass_visibility_buffer = nil;
+        ctx.impl->half_pixel_strips = {};
+        ctx.impl->color_clip_restore_pending = false;
+        ctx.impl->color_guest_dirty = false;
+        ctx.impl->pending_color_writes = false;
+        ctx.impl->pending_draws = 0;
+        ctx.impl->scene_active = false;
+        if (ctx.impl->guest_write_watches_pending && ctx.impl->mem) {
+            impl->surface_writes.complete_gpu_writes(*ctx.impl->mem);
+            ctx.impl->guest_write_watches_pending = false;
+        }
+        return failed;
+    };
+    const bool submitted_current = ctx.impl->commands
+        && ctx.impl->commands.status != MTLCommandBufferStatusNotEnqueued;
+    const bool failed_pending = std::any_of(ctx.impl->pending_batches.begin(), ctx.impl->pending_batches.end(),
+        [](const auto &batch) { return batch.commands.status == MTLCommandBufferStatusError; });
+    if (submitted_current || failed_pending) {
+        // finish restores clipped color before submission. An interrupted
+        // already-submitted buffer must never receive more encoding work.
+        const size_t failed = discard_remaining();
+        LOG_ERROR("Metal shutdown: retired interrupted submitted work, {} GPU errors", failed);
+        return;
+    }
+    try {
+        finish(ctx);
+    } catch (const std::exception &error) {
+        const size_t failed = discard_remaining();
+        LOG_ERROR("Metal shutdown: finish failed ({}); retired remaining buffers, {} GPU errors",
+            error.what(), failed);
+    }
+}
+
+bool MetalState::finish(MetalContext &ctx, bool publish_color, bool wait_without_publication) {
     bool published_color = false;
-    if (ctx.impl->encoder) { [ctx.impl->encoder endEncoding]; ctx.impl->encoder = nil; }
+    wait_without_publication |= ctx.impl->guest_write_watches_pending;
+    end_pass(ctx);
     if (ctx.impl->color_clip_samplewise && ctx.impl->color_clip_restore_pending && !impl->caster)
         impl->caster = std::make_unique<SurfaceCaster>(*impl->device);
     restore_color_outside_clip(ctx, impl->caster.get());
@@ -936,7 +1492,7 @@ bool MetalState::finish(MetalContext &ctx, bool publish_color) {
         // Internal draw limits have no guest-visible result. Keep at most two
         // completed-or-running batches ahead of the CPU, retaining their upload
         // slices until the corresponding GPU command buffer has finished.
-        const bool deferred = !publish_color && !ctx.impl->expanded_color
+        const bool deferred = !publish_color && !wait_without_publication && !ctx.impl->expanded_color
             && ctx.impl->visibility_results.empty();
         if (deferred) {
             require(ctx.impl->commands.status == MTLCommandBufferStatusNotEnqueued,
@@ -1001,8 +1557,7 @@ bool MetalState::finish(MetalContext &ctx, bool publish_color) {
         ctx.impl->pass_visibility_buffer = nil;
         if (ctx.impl->samples > 1 && ctx.impl->expanded_color && ctx.impl->color) {
             if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
-            impl->caster->expand_multisample(ctx.impl->render_color,ctx.impl->color,ctx.impl->sample_scale,
-                ctx.impl->guest_color.width,ctx.impl->guest_color.height);
+            expand_color_samples(ctx,*impl->caster);
         }
         const bool drew_color=ctx.impl->pending_color_writes;
         if (drew_color) {
@@ -1024,19 +1579,38 @@ bool MetalState::finish(MetalContext &ctx, bool publish_color) {
         ctx.impl->depth_scene_written |= ctx.impl->depth_written;
         if (ctx.impl->depth_written) {
             auto found = impl->depth_surfaces.find(ctx.impl->depth_key);
-            if (found != impl->depth_surfaces.end()) {
+            if (found != impl->depth_surfaces.end() && found->second.texture==ctx.impl->depth) {
                 found->second.snapshots.clear();
                 found->second.subrectangles.clear();
             }
             ctx.impl->depth_written = false;
         }
     }
-    if (publish_color)
+    if (publish_color || wait_without_publication)
         while (!ctx.impl->pending_batches.empty()) wait_pending_batch(false);
+    // All guest-buffer GPU users are now retired. Restore watches before
+    // publication, which can itself throw or perform guarded guest writes.
+    if (ctx.impl->guest_write_watches_pending && ctx.impl->mem) {
+        impl->surface_writes.complete_gpu_writes(*ctx.impl->mem);
+        ctx.impl->guest_write_watches_pending = false;
+    }
     // Batch-size flushes only retain upload resources; no guest-visible
     // notification has been signaled. Keep their color writes on the GPU and
     // publish the completed surface at the next CPU-visible boundary.
     const auto &surface = ctx.impl->guest_color;
+    if (publish_color && surface.data && ctx.impl->color_binding_generation) {
+        const auto cached = impl->surfaces.find(surface.data.address());
+        if (cached == impl->surfaces.end() || !owns_color_binding(cached->second, ctx)) {
+            // Plus drops post-sync requests when their cache generation was
+            // destroyed. Native contexts can likewise outlive a retired or
+            // rebound cache entry; their retained texture is not proof that
+            // they still own these guest bytes. Never use a full-copy fallback.
+            ctx.impl->color_guest_dirty = false;
+            ctx.impl->color_guest_current = false;
+            ctx.impl->color_publication_discarded = true;
+            LOG_WARN_ONCE("Metal: discarding color publication from a retired surface binding");
+        }
+    }
     if (publish_color && ctx.impl->color_guest_dirty && !disable_surface_sync
         && ctx.impl->mem && surface.data && ctx.impl->color) {
         const size_t bytes=surface_memory_size(surface);
@@ -1046,32 +1620,35 @@ bool MetalState::finish(MetalContext &ctx, bool publish_color) {
             const std::span<uint8_t> output{static_cast<uint8_t *>(surface.data.get(*ctx.impl->mem)),bytes};
             std::chrono::steady_clock::time_point publication_started{};
             if (impl->trace_finish_timing) publication_started = std::chrono::steady_clock::now();
-            bool published=false;
-            if (surface.colorFormat==SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR
-                && surface.surfaceType==SCE_GXM_COLOR_SURFACE_LINEAR
-                && ctx.impl->color.width==surface.width && ctx.impl->color.height==surface.height
-                && (ctx.impl->color.pixelFormat==MTLPixelFormatRGBA8Unorm
-                    || ctx.impl->color.pixelFormat==MTLPixelFormatRGBA8Unorm_sRGB)) {
-                [ctx.impl->color getBytes:output.data() bytesPerRow:surface.strideInPixels*4
-                    fromRegion:MTLRegionMake2D(0,0,surface.width,surface.height) mipmapLevel:0];
-                published=true;
-            } else published=read_surface_memory(ctx.impl->color,surface,output);
+            auto publication = SurfacePublication::Unavailable;
+            std::vector<SurfaceMemoryRange> written;
+            const auto cached = impl->surfaces.find(surface.data.address());
+            if (cached != impl->surfaces.end() && owns_color_binding(cached->second, ctx)) {
+                publication = impl->surface_writes.writeback(*ctx.impl->mem, [&] {
+                    return read_surface_publication(cached->second, surface, output, written, *impl->device, impl->caster);
+                });
+            }
             if (impl->trace_finish_timing) {
                 impl->publication_ms += std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - publication_started).count();
                 ++impl->timed_publications;
             }
-            if (!published)
+            if (publication == SurfacePublication::CpuNewer) {
+                // This synchronization is handled by retaining the newer CPU
+                // contents. Do not let EndScene's explicit-sync fallback or a
+                // later finish publish the same obsolete image over them.
+                published_color = true;
+                ctx.impl->color_guest_dirty = false;
+                ctx.impl->color_guest_current = false;
+                ctx.impl->color_publication_discarded = true;
+            } else if (publication == SurfacePublication::Unavailable)
                 LOG_WARN_ONCE("Metal: automatic color surface sync unavailable for format={:#x}",
                     uint32_t(surface.colorFormat));
             else {
                 published_color = true;
                 ctx.impl->color_guest_current = true;
                 ctx.impl->color_guest_dirty = false;
-                if (const auto found=impl->surfaces.find(surface.data.address());found!=impl->surfaces.end()) {
-                    const SurfaceMemoryRange all{0,bytes};
-                    update_cpu_snapshot(found->second,output,{&all,1});
-                }
+                update_cpu_snapshot(cached->second,output,written);
             }
         }
     }
@@ -1135,13 +1712,11 @@ void MetalState::mid_scene_flush(MetalContext &ctx, bool wait_for_completion) {
         return;
     }
     if (ctx.impl->encoder) {
-        // A flush without a notification is a GPU ordering point, not a CPU
-        // readback. Keep the command buffer pending and restart the render pass.
-        [ctx.impl->encoder memoryBarrierWithScope:MTLBarrierScopeBuffers
-            afterStages:MTLRenderStageVertex | MTLRenderStageFragment
-            beforeStages:MTLRenderStageVertex];
-        [ctx.impl->encoder endEncoding];
-        ctx.impl->encoder = nil;
+        // End the pass to order its tracked resources before subsequent
+        // encoders. Guest buffers are declared with useResource as well.
+        // Apple GPUs cannot encode a within-pass barrier after Fragment;
+        // no such barrier is needed across this encoder boundary.
+        end_pass(ctx);
         ctx.impl->pass_visibility_active = false;
         if (ctx.impl->color_clip_samplewise && ctx.impl->color_clip_restore_pending && !impl->caster)
             impl->caster = std::make_unique<SurfaceCaster>(*impl->device);
@@ -1162,6 +1737,28 @@ static std::pair<std::span<uint8_t>,std::span<uint8_t>> depth_memory_spans(MemSt
     };
     return {span(surface.depth_data,layout.depth_size),span(surface.stencil_data,layout.stencil_size)};
 }
+static std::vector<SurfaceMemoryRange> depth_scene_ranges(const MetalContext &ctx,bool stencil) {
+    const auto &layout=*ctx.impl->depth_layout;
+    require(ctx.impl->depth_scene_width<=layout.width && ctx.impl->depth_scene_height<=layout.height,
+        "Metal: depth scene exceeds retained storage");
+    const size_t size=stencil ? layout.stencil_size : layout.depth_size;
+    if (!size) return {};
+    if (ctx.impl->depth_scene_width==layout.width && ctx.impl->depth_scene_height==layout.height) return {{0,size}};
+    const size_t bytes=stencil ? (layout.packed ? 4 : 1) : layout.depth_bytes;
+    std::vector<SurfaceMemoryRange> result;
+    for (uint32_t y=0;y<ctx.impl->depth_scene_height;++y) {
+        if (!layout.tiled) {
+            result.push_back({size_t(y)*layout.stride*bytes,size_t(ctx.impl->depth_scene_width)*bytes});
+            continue;
+        }
+        for (uint32_t x=0;x<ctx.impl->depth_scene_width;) {
+            const uint32_t count=std::min(32u,ctx.impl->depth_scene_width-x);
+            const size_t offset=((size_t(y/32)*(layout.stride/32)+x/32)*1024+(y%32)*32)*bytes;
+            result.push_back({offset,size_t(count)*bytes});x+=count;
+        }
+    }
+    return result;
+}
 bool MetalState::end_scene(MetalContext &ctx, bool allow_deferred) {
     @autoreleasepool {
     if (impl->trace_batches && ctx.impl->scene_active
@@ -1180,7 +1777,7 @@ bool MetalState::end_scene(MetalContext &ctx, bool allow_deferred) {
         const auto &layout=*ctx.impl->depth_layout;
         const auto [depth,stencil]=depth_memory_spans(*ctx.impl->mem,ctx.impl->guest_depth,layout);
         if(!depth.empty() || !stencil.empty()) {
-            if(ctx.impl->encoder) { [ctx.impl->encoder endEncoding]; ctx.impl->encoder=nil; }
+            end_pass(ctx);
             if(!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
             require(impl->caster->enqueue_depth_store(ctx.impl->depth,ctx.impl->guest_depth,layout,
                 ctx.impl->sample_scale,depth.size(),stencil.size(),ctx.impl->mask,
@@ -1198,10 +1795,10 @@ bool MetalState::end_scene(MetalContext &ctx, bool allow_deferred) {
         const auto [depth,stencil]=depth_memory_spans(*ctx.impl->mem,ctx.impl->guest_depth,layout);
         const auto &entry=cached_depth->second;
         return (!depth.empty() || !stencil.empty())
-            && entry.published_depth.size()==depth.size()
-            && entry.published_stencil.size()==stencil.size()
-            && std::equal(entry.published_depth.begin(),entry.published_depth.end(),depth.begin())
-            && std::equal(entry.published_stencil.begin(),entry.published_stencil.end(),stencil.begin());
+            && entry.guest_depth_snapshot.size()==depth.size()
+            && entry.guest_stencil_snapshot.size()==stencil.size()
+            && std::equal(entry.guest_depth_snapshot.begin(),entry.guest_depth_snapshot.end(),depth.begin())
+            && std::equal(entry.guest_stencil_snapshot.begin(),entry.guest_stencil_snapshot.end(),stencil.begin());
     };
     bool reused_published_depth=published_depth_matches_guest();
     // With guest color synchronization disabled, EndScene has no CPU-visible
@@ -1225,7 +1822,7 @@ bool MetalState::end_scene(MetalContext &ctx, bool allow_deferred) {
     // depth range visible after the first comparison.
     if (reused_published_depth) reused_published_depth=published_depth_matches_guest();
     if (submits_deferred) ++deferred_scene_submits;
-    if(!ctx.impl->scene_active) return false;
+    if(!ctx.impl->scene_active) return ctx.impl->color_publication_discarded;
     bool stored_depth = false;
     if(ctx.impl->guest_depth.force_store && ctx.impl->depth_layout && ctx.impl->mem) {
         const auto &layout=*ctx.impl->depth_layout;
@@ -1233,13 +1830,27 @@ bool MetalState::end_scene(MetalContext &ctx, bool allow_deferred) {
         if(!depth.empty() || !stencil.empty()) {
             if (!reused_published_depth) {
                 if(!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+                const bool partial=ctx.impl->depth_scene_width!=layout.width || ctx.impl->depth_scene_height!=layout.height;
+                std::vector<uint8_t> depth_copy,stencil_copy;
+                std::span<uint8_t> depth_output=depth,stencil_output=stencil;
+                if (partial) {
+                    depth_copy.assign(depth.begin(),depth.end());depth_output=depth_copy;
+                    if (layout.packed && layout.stencil_size) stencil_output=depth_output;
+                    else { stencil_copy.assign(stencil.begin(),stencil.end());stencil_output=stencil_copy; }
+                }
                 if (pending_depth_store.depth) {
-                    impl->caster->finish_depth_store(pending_depth_store,ctx.impl->guest_depth,layout,depth,stencil);
+                    impl->caster->finish_depth_store(pending_depth_store,ctx.impl->guest_depth,layout,depth_output,stencil_output);
                     ++inline_depth_stores;
                 } else
                     require(impl->caster->store_depth_memory(ctx.impl->depth,ctx.impl->guest_depth,layout,
-                        ctx.impl->sample_scale,depth,stencil,ctx.impl->mask),
+                        ctx.impl->sample_scale,depth_output,stencil_output,ctx.impl->mask),
                         "Metal: cannot publish guest depth/stencil storage");
+                if (partial) {
+                    for (const auto &range:depth_scene_ranges(ctx,false))
+                        std::memcpy(depth.data()+range.offset,depth_output.data()+range.offset,range.size);
+                    for (const auto &range:depth_scene_ranges(ctx,true))
+                        std::memcpy(stencil.data()+range.offset,stencil_output.data()+range.offset,range.size);
+                }
                 stored_depth = true;
                 if (!impl->trace_depth_store_trigger.empty()
                     && std::filesystem::exists(impl->trace_depth_store_trigger)
@@ -1256,18 +1867,38 @@ bool MetalState::end_scene(MetalContext &ctx, bool allow_deferred) {
             if (cached_depth!=impl->depth_surfaces.end() && cached_depth->second.texture==ctx.impl->depth) {
                 auto &entry=cached_depth->second;
                 if (stored_depth) {
-                    entry.published_depth.assign(depth.begin(),depth.end());
-                    entry.published_stencil.assign(stencil.begin(),stencil.end());
-                    entry.published_background_depth=ctx.impl->guest_depth.background_depth;
-                    entry.published_background_stencil=ctx.impl->guest_depth.stencil;
-                    entry.published=true;
+                    const bool complete=ctx.impl->depth_scene_width==layout.width && ctx.impl->depth_scene_height==layout.height;
+                    if (complete) {
+                        entry.guest_depth_snapshot.assign(depth.begin(),depth.end());
+                        entry.guest_stencil_snapshot.assign(stencil.begin(),stencil.end());
+                    } else {
+                        require(entry.guest_depth_snapshot.size()==depth.size() && entry.guest_stencil_snapshot.size()==stencil.size(),
+                            "Metal: partial depth publication lost its storage baseline");
+                        for (const auto &range:depth_scene_ranges(ctx,false))
+                            std::memcpy(entry.guest_depth_snapshot.data()+range.offset,depth.data()+range.offset,range.size);
+                        for (const auto &range:depth_scene_ranges(ctx,true))
+                            std::memcpy(entry.guest_stencil_snapshot.data()+range.offset,stencil.data()+range.offset,range.size);
+                    }
+                    entry.snapshot_background_depth=ctx.impl->guest_depth.background_depth;
+                    entry.snapshot_background_stencil=ctx.impl->guest_depth.stencil;
+                    entry.guest_snapshot_valid=true;
+                    entry.published=complete;
                 }
             }
         }
     }
-    if (cached_depth!=impl->depth_surfaces.end() && !stored_depth && !reused_published_depth)
+    if (cached_depth!=impl->depth_surfaces.end() && cached_depth->second.texture==ctx.impl->depth
+        && !stored_depth && !reused_published_depth)
         cached_depth->second.published=false;
+    if (cached_depth!=impl->depth_surfaces.end()
+        && (cached_depth->second.texture==ctx.impl->depth || ctx.impl->depth_is_sample_rate_copy)
+        && ctx.impl->scene_depth_drawn)
+        cached_depth->second.depth_content_stored=ctx.impl->guest_depth.force_store;
     ctx.impl->scene_active=false;
+    // A dropped obsolete publication is handled. Returning false here would
+    // make the automatic scene-end caller sync a newer cache binding or retry
+    // a GPU image whose publication was suppressed by newer CPU contents.
+    if (ctx.impl->color_publication_discarded) return true;
     const auto &published = ctx.impl->guest_color;
     const auto &recorded = ctx.record.color_surface;
     // A previous mid-scene finish can have published the last color draw.
@@ -1278,11 +1909,12 @@ bool MetalState::end_scene(MetalContext &ctx, bool allow_deferred) {
         const auto found = impl->surfaces.find(published.data.address());
         const size_t bytes = surface_memory_size(published);
         const uint64_t end = uint64_t(published.data.address()) + bytes;
-        if (found != impl->surfaces.end() && bytes && found->second.cpu_snapshot.size() == bytes
+        if (found != impl->surfaces.end() && owns_color_binding(found->second, ctx)
+            && bytes && found->second.cpu_snapshot.size() == bytes
             && end <= uint64_t(UINT32_MAX) - 4095
             && is_valid_addr_range(*ctx.impl->mem, published.data.address(), Address(end))) {
             const auto *guest = static_cast<const uint8_t *>(published.data.get(*ctx.impl->mem));
-            earlier_color_publication = std::memcmp(guest, found->second.cpu_snapshot.data(), bytes) == 0;
+            earlier_color_publication = !surface_cpu_bytes_changed(found->second, {guest, bytes});
         }
     }
     // A depth/stencil store after finish can touch aliased color guest bytes.
@@ -1340,6 +1972,28 @@ void MetalState::set_back_visibility_index(MetalContext &ctx, bool enable, uint3
     ctx.impl->back_visibility_index = index;
     ctx.impl->back_visibility_increment = increment;
 }
+void MetalState::retire_cpu_overwritten_surfaces(MemState &mem,
+    std::span<const std::pair<uint64_t, uint64_t>> ranges) {
+    const auto *active = context ? static_cast<const MetalContext *>(context) : nullptr;
+    for (auto it = impl->surfaces.begin(); it != impl->surfaces.end();) {
+        const auto &surface = it->second;
+        const size_t bytes = surface.cpu_hash_size;
+        const uint64_t surface_end = uint64_t(it->first) + bytes;
+        // An active render target is owned by its current scene. Completed
+        // surfaces may have been repurposed by CPU writes since publication.
+        const bool rendering = active && active->impl->scene_active && surface.color == active->impl->color;
+        const auto overlap = std::find_if(ranges.begin(), ranges.end(), [&](const auto &range) {
+            return it->first < range.second && surface_end > range.first;
+        });
+        if (!rendering && bytes && overlap != ranges.end()
+            && surface_end <= uint64_t(UINT32_MAX) - 4095
+            && is_valid_addr_range(mem, it->first, Address(surface_end))
+            && (surface.cpu_writes.changed() || XXH3_64bits(surface.guest.data.get(mem), bytes) != surface.cpu_hash)) {
+            LOG_INFO("Metal: retiring CPU-overwritten color surface at {:#x} before access {:#x}", it->first, overlap->first);
+            it = impl->surfaces.erase(it);
+        } else ++it;
+    }
+}
 bool MetalState::sync_surface(MemState &mem, const SceGxmColorSurface &surface) {
     if (context) finish(*static_cast<MetalContext *>(context));
     const auto found = impl->surfaces.find(surface.data.address());
@@ -1351,13 +2005,191 @@ bool MetalState::sync_surface(MemState &mem, const SceGxmColorSurface &surface) 
         || end > uint64_t(UINT32_MAX) - 4095
         || !is_valid_addr_range(mem, surface.data.address(), Address(end))) return false;
     const std::span<uint8_t> output{static_cast<uint8_t *>(surface.data.get(mem)), bytes};
-    if (!read_surface_memory(found->second.color, surface, output)) return false;
+    std::vector<SurfaceMemoryRange> written;
+    const auto publication = impl->surface_writes.writeback(mem, [&] {
+        return read_surface_publication(found->second, surface, output, written, *impl->device, impl->caster);
+    });
+    if (publication == SurfacePublication::Unavailable) return false;
+    if (publication == SurfacePublication::CpuNewer) return true;
     if (found->second.guest.strideInPixels == surface.strideInPixels
         && found->second.guest.surfaceType == surface.surfaceType) {
-        const SurfaceMemoryRange all{0,bytes};
-        update_cpu_snapshot(found->second, output, {&all,1});
+        update_cpu_snapshot(found->second, output, written);
     } else found->second.cpu_snapshot.clear();
     return true;
+}
+int MetalState::sync_surfaces_for_cpu_read(MemState &mem, Address address, uint32_t size) {
+    if (disable_surface_sync || !size) return 0;
+    const uint64_t range_end = uint64_t(address) + size;
+    if (!address || range_end > uint64_t(UINT32_MAX) - 4095
+        || !is_valid_addr_range(mem, address, Address(range_end))) return CommandErrorSurfaceSyncFailed;
+    // Finish producers without first publishing the active target: CPU readers
+    // must exclude CPU-newer surfaces of every size, unlike normal scene sync.
+    if (context) finish(*static_cast<MetalContext *>(context), false, true);
+    std::vector<Surface *> candidates;
+    for (auto &[base, entry] : impl->surfaces) {
+        const size_t bytes = surface_memory_size(entry.guest);
+        const uint64_t end = uint64_t(base) + bytes;
+        // Match Plus's three-frame window using subtraction to avoid overflow.
+        if (!bytes || base >= range_end || end <= address
+            || impl->frame_timestamp < entry.last_frame_rendered
+            || impl->frame_timestamp - entry.last_frame_rendered >= 3
+            || end > uint64_t(UINT32_MAX) - 4095
+            || !is_valid_addr_range(mem, base, Address(end))) continue;
+        const std::span<const uint8_t> guest{static_cast<const uint8_t *>(entry.guest.data.get(mem)), bytes};
+        if (!surface_cpu_bytes_changed(entry, guest)) candidates.push_back(&entry);
+    }
+    int synced = 0;
+    for (auto *entry : candidates) {
+        const std::span<uint8_t> guest{static_cast<uint8_t *>(entry->guest.data.get(mem)), surface_memory_size(entry->guest)};
+        std::vector<SurfaceMemoryRange> written;
+        const auto result = impl->surface_writes.writeback(mem, [&] {
+            return read_surface_publication(*entry, entry->guest, guest, written, *impl->device, impl->caster);
+        });
+        if (result == SurfacePublication::Unavailable) return CommandErrorSurfaceSyncFailed;
+        if (result == SurfacePublication::CpuNewer) continue;
+        update_cpu_snapshot(*entry, guest, written);
+        if (context) {
+            auto &ctx = *static_cast<MetalContext *>(context);
+            if (owns_color_binding(*entry, ctx)) {
+                ctx.impl->color_guest_dirty = false;
+                ctx.impl->color_guest_current = true;
+            }
+        }
+        ++synced;
+    }
+    return synced;
+}
+namespace {
+std::vector<SurfaceMemoryRange> surface_intersections(uint64_t address,size_t bytes,
+    std::span<const std::pair<uint64_t,uint64_t>> ranges) {
+    std::vector<SurfaceMemoryRange> result;
+    for (const auto &[begin,end]:ranges) {
+        const auto first=std::max(begin,address),last=std::min(end,address+bytes);
+        if (first<last) result.push_back({size_t(first-address),size_t(last-first)});
+    }
+    return result;
+}
+struct DepthTransfer {
+    DepthSurface *surface;
+    DepthMemoryLayout layout;
+    bool read_depth=false,read_stencil=false;
+    std::vector<SurfaceMemoryRange> cpu_depth_changes,cpu_stencil_changes;
+    std::vector<uint8_t> depth,stencil;
+};
+std::vector<SurfaceMemoryRange> changed_memory_ranges(std::span<const uint8_t> bytes,std::span<const uint8_t> baseline) {
+    if (bytes.empty()) return {};
+    if (bytes.size()!=baseline.size()) return {{0,bytes.size()}};
+    std::vector<SurfaceMemoryRange> ranges;
+    if (!std::memcmp(bytes.data(),baseline.data(),bytes.size())) return ranges;
+    for (size_t at=0;at<bytes.size();) {
+        if (bytes[at]==baseline[at]) { ++at;continue; }
+        const size_t first=at++;
+        while (at<bytes.size() && bytes[at]!=baseline[at]) ++at;
+        ranges.push_back({first,at-first});
+    }
+    return ranges;
+}
+void depth_memory_changed(MetalState &state,DepthSurface &surface,DepthMemoryWrite written) {
+    if (!written.depth && !written.stencil && !written.mask) return;
+    surface.snapshots.clear();surface.subrectangles.clear();surface.published=false;
+    if (written.depth) surface.depth_content_stored=true;
+    if (state.context) {
+        auto &ctx=*static_cast<MetalContext *>(state.context);
+        if (ctx.impl->depth==surface.texture) ctx.impl->depth_scene_written=true;
+        if (written.mask && surface.mask && ctx.impl->mask==surface.mask) ctx.impl->mask_constant_valid=false;
+    }
+}
+bool prepare_depth_transfers(MetalState &state,MemState &mem,
+    std::span<const std::pair<uint64_t,uint64_t>> reads,
+    std::span<const std::pair<uint64_t,uint64_t>> writes,std::vector<DepthTransfer> &transfers) {
+    const auto mapped=[&](Address address,size_t size) {
+        return !size || (address && uint64_t(address)+size<=uint64_t(UINT32_MAX)-4095
+            && is_valid_addr_range(mem,address,Address(uint64_t(address)+size)));
+    };
+    for (auto &[key,surface]:state.impl->depth_surfaces) {
+        // First exclude unrelated entries even if their descriptor cannot be
+        // decoded. This bound includes 4X sample rows and packed stencil bytes.
+        const size_t bound=size_t(std::min<__uint128_t>(UINT32_MAX,
+            __uint128_t(surface.guest.get_stride())*((uint64_t(surface.height)*2+31)&~uint64_t(31))*4));
+        const auto touches=[&](Address address,size_t size,auto ranges) {
+            return address && !surface_intersections(address,size,ranges).empty();
+        };
+        if (!touches(key.first,bound,reads) && !touches(key.first,bound,writes)
+            && !touches(key.second,bound,reads) && !touches(key.second,bound,writes)) continue;
+        const auto layout=depth_memory_layout(surface.guest,surface.width,surface.height,surface.multisample);
+        if (!layout) return false;
+        DepthTransfer transfer{&surface,*layout};
+        transfer.read_depth=touches(key.first,layout->depth_size,reads);
+        transfer.read_stencil=touches(key.second,layout->stencil_size,reads);
+        if (!transfer.read_depth && !transfer.read_stencil
+            && !touches(key.first,layout->depth_size,writes) && !touches(key.second,layout->stencil_size,writes)) continue;
+        if (!surface.guest_snapshot_valid || surface.guest_depth_snapshot.size()!=layout->depth_size
+            || surface.guest_stencil_snapshot.size()!=layout->stencil_size
+            || !mapped(key.first,layout->depth_size) || !mapped(key.second,layout->stencil_size)) return false;
+        const auto [depth,stencil]=depth_memory_spans(mem,surface.guest,*layout);
+        if (!state.impl->caster) state.impl->caster=std::make_unique<SurfaceCaster>(*state.impl->device);
+        if (!state.impl->caster->patch_depth_memory(surface.texture,surface.guest,*layout,surface.scale,
+            depth,stencil,{},{},surface.mask)) return false;
+        transfer.cpu_depth_changes=changed_memory_ranges(depth,surface.guest_depth_snapshot);
+        transfer.cpu_stencil_changes=changed_memory_ranges(stencil,surface.guest_stencil_snapshot);
+        transfers.push_back(std::move(transfer));
+    }
+    // CPU edits precede this transfer. Import only those bytes, retaining every
+    // other native pixel/sample, before reading a GPU-produced source image.
+    for (auto &transfer:transfers) {
+        auto &surface=*transfer.surface;
+        const auto [depth,stencil]=depth_memory_spans(mem,surface.guest,transfer.layout);
+        if (!transfer.cpu_depth_changes.empty() || !transfer.cpu_stencil_changes.empty()) {
+            DepthMemoryWrite written;
+            require(state.impl->caster->patch_depth_memory(surface.texture,surface.guest,transfer.layout,surface.scale,
+                depth,stencil,transfer.cpu_depth_changes,transfer.cpu_stencil_changes,surface.mask,nil,&written),
+                "Metal: cannot import CPU depth edits before transfer");
+            surface.guest_depth_snapshot.assign(depth.begin(),depth.end());
+            surface.guest_stencil_snapshot.assign(stencil.begin(),stencil.end());
+            depth_memory_changed(state,surface,written);
+        }
+        if (transfer.read_depth || transfer.read_stencil) {
+            transfer.depth.assign(depth.begin(),depth.end());transfer.stencil.assign(stencil.begin(),stencil.end());
+            if (!state.impl->caster->store_depth_memory(surface.texture,surface.guest,transfer.layout,surface.scale,
+                transfer.depth,transfer.stencil,surface.mask)) return false;
+            const auto restore_cpu=[](auto bytes,const auto &ranges,auto &output) {
+                for (const auto &range:ranges)
+                    std::memcpy(output.data()+range.offset,bytes.data()+range.offset,range.size);
+            };
+            // CPU writes are newer than the preceding GPU producer, including
+            // bytes that a reduced native extent cannot represent separately.
+            restore_cpu(depth,transfer.cpu_depth_changes,transfer.depth);
+            if (transfer.layout.packed && transfer.layout.stencil_size)
+                restore_cpu(stencil,transfer.cpu_stencil_changes,transfer.depth);
+            else restore_cpu(stencil,transfer.cpu_stencil_changes,transfer.stencil);
+            // Packed stencil aliases the entire depth allocation. The direct
+            // readback can write depth only; expose one consistent byte image.
+            if (transfer.layout.packed && transfer.layout.stencil_size) transfer.stencil=transfer.depth;
+        }
+    }
+    return true;
+}
+void finish_depth_transfers(MetalState &state,MemState &mem,std::span<DepthTransfer> transfers,
+    std::span<const std::pair<uint64_t,uint64_t>> writes) {
+    for (auto &transfer:transfers) {
+        auto &surface=*transfer.surface;
+        const auto depth_changes=surface_intersections(surface.guest.depth_data.address(),transfer.layout.depth_size,writes);
+        const auto stencil_changes=surface_intersections(surface.guest.stencil_data.address(),transfer.layout.stencil_size,writes);
+        if (depth_changes.empty() && stencil_changes.empty()) continue;
+        const auto [depth,stencil]=depth_memory_spans(mem,surface.guest,transfer.layout);
+        DepthMemoryWrite written;
+        require(state.impl->caster->patch_depth_memory(surface.texture,surface.guest,transfer.layout,surface.scale,
+            depth,stencil,depth_changes,stencil_changes,surface.mask,nil,&written),
+            "Metal: validated depth transfer destination could not be updated");
+        const auto update=[](auto bytes,const auto &ranges,auto &baseline) {
+            for (const auto &range:ranges)
+                std::memcpy(baseline.data()+range.offset,bytes.data()+range.offset,range.size);
+        };
+        update(depth,depth_changes,surface.guest_depth_snapshot);
+        update(stencil,stencil_changes,surface.guest_stencil_snapshot);
+        depth_memory_changed(state,surface,written);
+    }
+}
 }
 bool MetalState::transfer_fill(MemState &mem, const SceGxmTransferImage &image, uint32_t color) {
     const uint32_t bits = gxm::get_bits_per_pixel(image.format);
@@ -1384,6 +2216,9 @@ bool MetalState::transfer_fill(MemState &mem, const SceGxmTransferImage &image, 
     }
     if (context) finish(*static_cast<MetalContext *>(context));
     struct Update { Surface *surface; size_t bytes; std::vector<SurfaceMemoryRange> ranges; };
+    // Retire stale aliases before saving pointers or modifying the destination;
+    // otherwise a partial fill would hide earlier CPU writes outside its rows.
+    retire_cpu_overwritten_surfaces(mem, writes);
     std::vector<Update> updates;
     for (auto &[address,surface] : impl->surfaces) {
         // Estimate unsupported representations too, so an overlapping write
@@ -1400,10 +2235,12 @@ bool MetalState::transfer_fill(MemState &mem, const SceGxmTransferImage &image, 
         if (update.ranges.empty()) continue;
         const uint64_t end = uint64_t(address)+update.bytes;
         if (!update.bytes || end > uint64_t(UINT32_MAX)-4095 || !is_valid_addr_range(mem,address,Address(end))
-            || !write_surface_memory(surface.color,surface.guest,
+            || !write_surface_storage(surface,surface.guest,
                 {static_cast<const uint8_t *>(surface.guest.data.get(mem)),update.bytes},{})) return false;
         updates.push_back(std::move(update));
     }
+    std::vector<DepthTransfer> depth_transfers;
+    if (!prepare_depth_transfers(*this,mem,{},writes,depth_transfers)) return false;
     std::array<uint8_t,4> bytes;
     std::memcpy(bytes.data(),&color,4);
     // Keep row origins: a packed 24-bit pattern must restart at every pixel,
@@ -1416,7 +2253,7 @@ bool MetalState::transfer_fill(MemState &mem, const SceGxmTransferImage &image, 
     }
     for (auto &update : updates) {
         auto &surface = *update.surface;
-        require(write_surface_memory(surface.color,surface.guest,
+        require(write_surface_storage(surface,surface.guest,
             {static_cast<const uint8_t *>(surface.guest.data.get(mem)),update.bytes},update.ranges),
             "Metal: validated transfer destination could not be updated");
         update_cpu_snapshot(surface,
@@ -1429,8 +2266,14 @@ bool MetalState::transfer_fill(MemState &mem, const SceGxmTransferImage &image, 
                 {static_cast<const uint8_t *>(surface.guest.data.get(mem)),update.bytes},update.ranges),
                 "Metal: validated transfer could not preserve multisample storage");
         }
-
+        if (surface.raw_multisample_color && !surface.raw_multisample_dirty) {
+            if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+            require(impl->caster->patch_multisample(surface.raw_multisample_color,surface.guest,surface.multisample_scale,
+                {static_cast<const uint8_t *>(surface.guest.data.get(mem)),update.bytes},update.ranges),
+                "Metal: validated transfer could not preserve raw multisample storage");
+        }
     }
+    finish_depth_transfers(*this,mem,depth_transfers,writes);
     return true;
 }
 namespace {
@@ -1515,14 +2358,6 @@ size_t cached_surface_extent(const Surface &surface) {
         ? (size_t(surface.guest.height)+31)&~size_t(31) : surface.guest.height;
     return rows*surface.guest.strideInPixels*((gxm::bits_per_pixel(gxm::get_base_format(surface.guest.colorFormat))+7)/8);
 }
-std::vector<SurfaceMemoryRange> surface_intersections(uint64_t address, size_t bytes, const TransferRanges &ranges) {
-    std::vector<SurfaceMemoryRange> result;
-    for (const auto &[begin,end] : ranges) {
-        const auto first=std::max(begin,address), last=std::min(end,address+bytes);
-        if (first<last) result.push_back({size_t(first-address),size_t(last-first)});
-    }
-    return result;
-}
 }
 bool MetalState::transfer_copy(MemState &mem, const SceGxmTransferImage &source, const SceGxmTransferImage &destination,
     SceGxmTransferType source_type, SceGxmTransferType destination_type,
@@ -1532,6 +2367,168 @@ bool MetalState::transfer_copy(MemState &mem, const SceGxmTransferImage &source,
 bool MetalState::transfer_downscale(MemState &mem, const SceGxmTransferImage &source, const SceGxmTransferImage &destination) {
     return transfer_image(mem,source,destination,SCE_GXM_TRANSFER_LINEAR,SCE_GXM_TRANSFER_LINEAR,
         SCE_GXM_TRANSFER_COLORKEY_NONE,0,0,true);
+}
+bool MetalState::try_transfer_depth_gpu(MemState &mem, const SceGxmTransferImage &source,
+    const SceGxmTransferImage &destination, SceGxmTransferType source_type, SceGxmTransferType destination_type,
+    std::span<const std::pair<uint64_t,uint64_t>> reads,
+    std::span<const std::pair<uint64_t,uint64_t>> writes) {
+    // Guest depth words and separate stencil bytes may share a native image,
+    // but only packed S8D24 transfers own both aspects of that image.
+    const auto overlaps=[](uint64_t address,size_t size,auto ranges) {
+        return size && std::any_of(ranges.begin(),ranges.end(),[&](const auto &range) {
+            return address<range.second && range.first<address+size;
+        });
+    };
+    struct Candidate { DepthSurface *entry; DepthMemoryLayout layout; bool stencil; };
+    const auto find=[&](const SceGxmTransferImage &image) -> std::optional<Candidate> {
+        std::optional<Candidate> result;
+        const uint32_t bits=gxm::get_bits_per_pixel(image.format);
+        for (auto &[key,entry]:impl->depth_surfaces) {
+            if (key.first!=image.address.address() && key.second!=image.address.address()) continue;
+            const auto layout=depth_memory_layout(entry.guest,entry.width,entry.height,entry.multisample);
+            if (!layout) return std::nullopt;
+            const bool depth=key.first==image.address.address() && layout->depth_size && bits==layout->depth_bytes*8;
+            const bool stencil=key.second==image.address.address() && !layout->packed && layout->stencil_size && bits==8;
+            if (!depth && !stencil) continue;
+            if (result || (depth && stencil)) return std::nullopt;
+            result=Candidate{&entry,*layout,stencil};
+        }
+        return result;
+    };
+    const auto source_entry=find(source),destination_entry=find(destination);
+    if (!source_entry || !destination_entry || source_entry->stencil!=destination_entry->stencil) return false;
+    auto *src=source_entry->entry,*dst=destination_entry->entry;
+    const bool stencil=source_entry->stencil;
+    if (!src || !dst || src==dst || !src->texture || !dst->texture
+        || src->texture==dst->texture || src->texture.sampleCount!=dst->texture.sampleCount
+        || (!stencil && src->guest.get_format()!=dst->guest.get_format()))
+        return false;
+    const auto *src_layout=&source_entry->layout,*dst_layout=&destination_entry->layout;
+    const size_t destination_size=stencil ? dst_layout->stencil_size : dst_layout->depth_size;
+    for (const auto &[first,last]:writes)
+        if (first<destination.address.address() || last<first
+            || last>uint64_t(destination.address.address())+destination_size) return false;
+    const auto region=[stencil](const DepthSurface &entry,const DepthMemoryLayout &layout,
+                          const SceGxmTransferImage &image,SceGxmTransferType type) -> std::optional<SurfaceRect> {
+        const uint32_t bytes=stencil ? 1 : layout.depth_bytes;
+        if (!bytes || image.stride<=0
+            || uint64_t(image.stride)!=uint64_t(layout.stride)*bytes
+            || type!=(layout.tiled ? SCE_GXM_TRANSFER_TILED : SCE_GXM_TRANSFER_LINEAR)
+            || uint64_t(image.x)+image.width>layout.width || uint64_t(image.y)+image.height>layout.height)
+            return std::nullopt;
+        const uint32_t sx=entry.texture.sampleCount>1 ? uint32_t(entry.texture.sampleCount/2) : 1;
+        const uint32_t sy=entry.texture.sampleCount>1 ? 2 : 1;
+        if (image.x%sx || image.width%sx || image.y%sy || image.height%sy) return std::nullopt;
+        const uint64_t left=uint64_t(image.x)*entry.texture.width;
+        const uint64_t right=(uint64_t(image.x)+image.width)*entry.texture.width;
+        const uint64_t top=uint64_t(image.y)*entry.texture.height;
+        const uint64_t bottom=(uint64_t(image.y)+image.height)*entry.texture.height;
+        // The copy must address whole native pixels and whole sample groups.
+        // Fractional-resolution edges are eligible only when exactly aligned.
+        if (left%layout.width || right%layout.width || top%layout.height || bottom%layout.height)
+            return std::nullopt;
+        return SurfaceRect{uint32_t(left/layout.width),uint32_t(top/layout.height),
+            uint32_t((right-left)/layout.width),uint32_t((bottom-top)/layout.height)};
+    };
+    const auto src_rect=region(*src,*src_layout,source,source_type);
+    const auto dst_rect=region(*dst,*dst_layout,destination,destination_type);
+    if (!src_rect || !dst_rect || !src_rect->width || !src_rect->height
+        || src_rect->width!=dst_rect->width || src_rect->height!=dst_rect->height)
+        return false;
+    // A second overlapping representation needs ownership/order resolution,
+    // not a source chosen by address-map iteration order.
+    const auto touches=[&](const DepthSurface &entry,const DepthMemoryLayout &layout,auto ranges) {
+        return overlaps(entry.guest.depth_data.address(),layout.depth_size,ranges)
+            || overlaps(entry.guest.stencil_data.address(),layout.stencil_size,ranges);
+    };
+    const auto aliased=[](const DepthSurface &entry,const DepthMemoryLayout &layout) {
+        return !layout.packed && layout.depth_size && layout.stencil_size
+            && uint64_t(entry.guest.depth_data.address())<uint64_t(entry.guest.stencil_data.address())+layout.stencil_size
+            && uint64_t(entry.guest.stencil_data.address())<uint64_t(entry.guest.depth_data.address())+layout.depth_size;
+    };
+    if (touches(*src,*src_layout,writes) || touches(*dst,*dst_layout,reads)
+        || aliased(*src,*src_layout) || aliased(*dst,*dst_layout)) return false;
+    for (const auto &[address,entry]:impl->surfaces)
+        if (overlaps(address,cached_surface_extent(entry),reads)
+            || overlaps(address,cached_surface_extent(entry),writes)) return false;
+    for (const auto &[key,entry]:impl->depth_surfaces) {
+        if (&entry==src || &entry==dst) continue;
+        const auto layout=depth_memory_layout(entry.guest,entry.width,entry.height,entry.multisample);
+        if (!layout) return false;
+        if (overlaps(key.first,layout->depth_size,reads) || overlaps(key.first,layout->depth_size,writes)
+            || overlaps(key.second,layout->stencil_size,reads) || overlaps(key.second,layout->stencil_size,writes))
+            return false;
+    }
+    const auto unchanged=[&](const DepthSurface &entry,const DepthMemoryLayout &layout) {
+        const auto matches=[&](Address address,size_t size,const std::vector<uint8_t> &snapshot) {
+            if (!size) return true;
+            const uint64_t end=uint64_t(address)+size;
+            return snapshot.size()==size && end<=uint64_t(UINT32_MAX)-4095
+                && is_valid_addr_range(mem,address,Address(end))
+                && std::memcmp(snapshot.data(),Ptr<uint8_t>(address).get(mem),size)==0;
+        };
+        return entry.guest_snapshot_valid
+            && matches(entry.guest.depth_data.address(),layout.depth_size,entry.guest_depth_snapshot)
+            && matches(entry.guest.stencil_data.address(),layout.stencil_size,entry.guest_stencil_snapshot);
+    };
+    if (!unchanged(*src,*src_layout) || !unchanged(*dst,*dst_layout)) return false;
+    const auto masked=[](const DepthSurface &entry) {
+        return entry.guest.get_format()==SCE_GXM_DEPTH_STENCIL_FORMAT_DF32M
+            || entry.guest.get_format()==SCE_GXM_DEPTH_STENCIL_FORMAT_DF32M_S8;
+    };
+    const auto valid_mask=[](const DepthSurface &entry) {
+        return entry.mask && entry.mask.pixelFormat==MTLPixelFormatRGBA8Unorm
+            && entry.mask.width==entry.texture.width && entry.mask.height==entry.texture.height
+            && entry.mask.sampleCount==entry.texture.sampleCount;
+    };
+    const bool copy_mask=!stencil && masked(*src);
+    if ((masked(*dst) && !valid_mask(*dst)) || (copy_mask && !valid_mask(*src))) return false;
+    std::vector<uint8_t> depth_output=dst->guest_depth_snapshot,stencil_output=dst->guest_stencil_snapshot;
+    if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+    auto commands=scene_command_buffer(*impl->device);
+    const auto copy=[&](id<MTLTexture> input,id<MTLTexture> output) {
+        auto blit=[commands blitCommandEncoder];
+        require(blit!=nil,"Metal: cannot encode depth transfer");
+        [blit copyFromTexture:input sourceSlice:0 sourceLevel:0
+            sourceOrigin:MTLOriginMake(src_rect->x,src_rect->y,0)
+            sourceSize:MTLSizeMake(src_rect->width,src_rect->height,1)
+            toTexture:output destinationSlice:0 destinationLevel:0
+            destinationOrigin:MTLOriginMake(dst_rect->x,dst_rect->y,0)];
+        [blit endEncoding];
+    };
+    if (src_layout->packed) copy(src->texture,dst->texture);
+    else if (!impl->caster->copy_depth_stencil_region(src->texture,dst->texture,*src_rect,*dst_rect,stencil,commands))
+        return false;
+    if (copy_mask) copy(src->mask,dst->mask);
+    DepthStoreReadback readback;
+    // Retain native precision in the destination, but keep Metal's existing
+    // guest-visible transfer write. Convert behind the copy in the same buffer.
+    require(impl->caster->enqueue_depth_store(dst->texture,dst->guest,*dst_layout,dst->scale,
+        dst_layout->depth_size,dst_layout->stencil_size,dst->mask,commands,readback),
+        "Metal: cannot read back depth transfer");
+    std::string error;
+    require(impl->device->submit_and_wait(commands,error),error);
+    impl->caster->finish_depth_store(readback,dst->guest,*dst_layout,depth_output,stencil_output);
+    const auto &output=stencil ? stencil_output : depth_output;
+    auto &baseline=stencil ? dst->guest_stencil_snapshot : dst->guest_depth_snapshot;
+    auto *guest=static_cast<uint8_t *>(destination.address.get(mem));
+    for (const auto &[first,last]:writes) {
+        const size_t offset=first-destination.address.address(),size=last-first;
+        std::memcpy(guest+offset,output.data()+offset,size);
+        std::memcpy(baseline.data()+offset,output.data()+offset,size);
+    }
+    if (dst_layout->packed && dst_layout->stencil_size) dst->guest_stencil_snapshot=dst->guest_depth_snapshot;
+    dst->snapshots.clear();dst->subrectangles.clear();
+    if (!stencil) dst->depth_content_stored=true;
+    // Only transferred bytes were published; untouched native pixels may still
+    // differ from RAM, so this is not a complete surface publication.
+    dst->published=false;
+    if (context) {
+        auto &ctx=*static_cast<MetalContext *>(context);
+        if (ctx.impl->depth==dst->texture) ctx.impl->depth_scene_written=true;
+        if (copy_mask && ctx.impl->mask==dst->mask) ctx.impl->mask_constant_valid=false;
+    }
+    return true;
 }
 bool MetalState::transfer_image(MemState &mem, const SceGxmTransferImage &source, const SceGxmTransferImage &destination,
     SceGxmTransferType source_type, SceGxmTransferType destination_type,
@@ -1556,6 +2553,14 @@ bool MetalState::transfer_image(MemState &mem, const SceGxmTransferImage &source
             destination.address.address(), destination.width, destination.height, destination.stride, destination.x, destination.y,
             uint32_t(destination_type), uint32_t(source.format), downscale);
     if (context) finish(*static_cast<MetalContext *>(context));
+    // A transfer can read a former render target without binding it as a
+    // texture first. Apply the same CPU-authority check before GPU snapshots
+    // replace source bytes or partial writes update destination cache hashes.
+    retire_cpu_overwritten_surfaces(mem, reads);
+    retire_cpu_overwritten_surfaces(mem, destinations);
+    if (!downscale && (bits==8 || bits==16 || bits==32) && mode==SCE_GXM_TRANSFER_COLORKEY_NONE
+        && try_transfer_depth_gpu(mem,source,destination,source_type,destination_type,reads,destinations))
+        return true;
     struct Snapshot { uint64_t address; std::vector<uint8_t> data; };
     struct Update { Surface *surface; size_t bytes; };
     std::vector<Snapshot> snapshots;
@@ -1575,7 +2580,7 @@ bool MetalState::transfer_image(MemState &mem, const SceGxmTransferImage &source
         if (!size || end>uint64_t(UINT32_MAX)-4095 || !is_valid_addr_range(mem,address,Address(end))) return false;
         const auto *guest=static_cast<const uint8_t *>(surface.guest.data.get(mem));
         if (write) {
-            if (!write_surface_memory(surface.color,surface.guest,{guest,size},{})) return false;
+            if (!write_surface_storage(surface,surface.guest,{guest,size},{})) return false;
             updates.push_back({&surface,size});
         }
         if (read) {
@@ -1586,9 +2591,31 @@ bool MetalState::transfer_image(MemState &mem, const SceGxmTransferImage &source
                 if (first<last && !surface_intersections(first,last-first,reads).empty()) return false;
             }
             Snapshot snapshot{address,std::vector<uint8_t>(guest,guest+size)};
-            if (!read_surface_memory(surface.color,surface.guest,snapshot.data)) return false;
+            // Plus transfers read through perform_surface_sync, including its
+            // write-ownership bounds and scaled blit. Preserve guest bytes
+            // outside those bounds in this private source snapshot as well.
+            // This is not a guest publication: leave the CPU baseline intact.
+            std::vector<SurfaceMemoryRange> readback_ranges;
+            if (read_surface_publication(surface,surface.guest,snapshot.data,readback_ranges,
+                    *impl->device,impl->caster) == SurfacePublication::Unavailable) return false;
             snapshots.push_back(std::move(snapshot));
         }
+    }
+    std::vector<DepthTransfer> depth_transfers;
+    if (!prepare_depth_transfers(*this,mem,reads,destinations,depth_transfers)) return false;
+    const auto add_depth_snapshot=[&](uint64_t address,std::vector<uint8_t> &data) {
+        const uint64_t end=address+data.size();
+        for (const auto &other:snapshots) {
+            const auto first=std::max(address,other.address),last=std::min(end,other.address+other.data.size());
+            if (first<last && !surface_intersections(first,last-first,reads).empty()) return false;
+        }
+        snapshots.push_back({address,std::move(data)});
+        return true;
+    };
+    for (auto &transfer:depth_transfers) {
+        if (transfer.read_depth && !add_depth_snapshot(transfer.surface->guest.depth_data.address(),transfer.depth)) return false;
+        if (transfer.read_stencil && (!transfer.layout.packed || !transfer.read_depth)
+            && !add_depth_snapshot(transfer.surface->guest.stencil_data.address(),transfer.stencil)) return false;
     }
     // Snapshot the complete source rectangle before any destination writes:
     // overlapping copies never consume bytes already replaced by this command.
@@ -1669,7 +2696,7 @@ bool MetalState::transfer_image(MemState &mem, const SceGxmTransferImage &source
         auto &surface=*update.surface;
         const auto ranges=surface_intersections(surface.guest.data.address(),update.bytes,writes);
         if (ranges.empty()) continue;
-        require(write_surface_memory(surface.color,surface.guest,
+        require(write_surface_storage(surface,surface.guest,
             {static_cast<const uint8_t *>(surface.guest.data.get(mem)),update.bytes},ranges),
             "Metal: validated transfer copy destination could not be updated");
         update_cpu_snapshot(surface,
@@ -1682,8 +2709,14 @@ bool MetalState::transfer_image(MemState &mem, const SceGxmTransferImage &source
                 {static_cast<const uint8_t *>(surface.guest.data.get(mem)),update.bytes},ranges),
                 "Metal: validated transfer could not preserve multisample storage");
         }
-
+        if (surface.raw_multisample_color && !surface.raw_multisample_dirty) {
+            if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+            require(impl->caster->patch_multisample(surface.raw_multisample_color,surface.guest,surface.multisample_scale,
+                {static_cast<const uint8_t *>(surface.guest.data.get(mem)),update.bytes},ranges),
+                "Metal: validated transfer could not preserve raw multisample storage");
+        }
     }
+    finish_depth_transfers(*this,mem,depth_transfers,writes);
     return true;
 }
 void MetalState::set_context(MetalContext &ctx, MemState &mem) {
@@ -1694,10 +2727,15 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
         context = &ctx; ctx.impl->mem = &mem;
         ctx.impl->color_guest_current = false;
         ctx.impl->color_guest_dirty = false;
+        ctx.impl->color_binding_generation = 0;
+        ctx.impl->color_publication_discarded = false;
+        ctx.impl->half_pixel_strips = {};
         ctx.impl->color_clip_snapshot = nil;
         ctx.impl->color_clip_restore_pending = false;
         ctx.impl->color_clip_samplewise = false;
         ctx.impl->depth_scene_written = false;
+        ctx.impl->scene_depth_drawn = false;
+        ctx.impl->depth_is_sample_rate_copy = false;
         ctx.impl->direct_guest_memory_used = false;
         auto *target = static_cast<MetalRenderTarget *>(ctx.current_render_target);
         require(target != nullptr, "Metal: scene without render target");
@@ -1724,6 +2762,13 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                 float((target->multisample_locations>>(i*8+4))&15)/16};
         const uint32_t color_width=surface.data ? uint32_t(surface.width*res_multiplier) : target->width;
         const uint32_t color_height=surface.data ? uint32_t(surface.height*res_multiplier) : target->height;
+        // Plus scales guest viewport/scissor coordinates only when an explicit
+        // downscale surface is at most half the base target on both axes.
+        // Storage dimensions and native sample addressing retain their scale.
+        ctx.impl->surface_downscale=surface.data && surface.downscale && color_width && color_height
+                && uint64_t(target->width)>=uint64_t(color_width)*2
+                && uint64_t(target->height)>=uint64_t(color_height)*2
+            ? 0.5f : 1.f;
         require(!ctx.impl->expanded_color || (!(surface.width%(samples/2)) && !(surface.height%2)),"Metal: invalid expanded MSAA color extent");
         // Fractionally scaled expanded images may end inside a sample tile.
         // Keep the exact resolved extent and allocate one extra native pixel
@@ -1732,8 +2777,28 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
         const auto height=ctx.impl->expanded_color ? (color_height+1)/2 : color_height;
         require(width && height, "Metal: empty render target");
         ctx.impl->width = width; ctx.impl->height = height;
+        ctx.impl->raw_color = nil;
+        ctx.impl->raw_render_color = nil;
+        ctx.impl->raw_attachment = nil;
+        ctx.impl->raw_clip_snapshot = nil;
+        bool seed_raw_color = false;
+        bool seed_raw_samples = false;
         if (surface.data) {
             auto &entry = impl->surfaces[surface.data.address()];
+            const size_t watched_bytes = surface_memory_size(surface);
+            const uint64_t watched_end = uint64_t(surface.data.address()) + watched_bytes;
+            const auto pending_cpu_writes = watched_bytes && watched_end <= uint64_t(UINT32_MAX) - 4095
+                    && is_valid_addr_range(mem, surface.data.address(), Address(watched_end))
+                ? impl->surface_writes.capture(mem, surface.data.address(), watched_bytes) : SurfaceWriteStamp{};
+            entry.scene_writes = {};
+            entry.scene_render_area = {};
+            entry.scene_macroblock_bounds = {};
+            if (entry.guest.width != surface.width || entry.guest.height != surface.height
+                || entry.guest.strideInPixels != surface.strideInPixels
+                || entry.guest.colorFormat != surface.colorFormat || entry.guest.surfaceType != surface.surfaceType) {
+                entry.written_tiles = {};
+                entry.rendered_width = entry.rendered_height = 0;
+            }
             ++entry.revision;
             entry.rgba8_casts.clear(); entry.subrectangles.clear();
             auto format = color_format(surface.colorFormat);
@@ -1750,10 +2815,33 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                 entry.color = rgba8_gamma_view(entry.color, format == MTLPixelFormatRGBA8Unorm_sRGB);
             const bool new_color = !entry.color || entry.color.width != color_width || entry.color.height != color_height || entry.color.pixelFormat != format;
             if (new_color) {
+                entry.has_word_offset_view = false;
+                entry.written_tiles = {};
+                entry.rendered_width = entry.rendered_height = 0;
+                entry.raw_color = nil;
+                entry.raw_color_invalidated = false;
+                entry.raw_multisample_color = nil;
+                entry.raw_multisample_dirty = true;
                 entry.multisample_color = nil;
                 entry.color = make_texture(*impl->device, format, color_width, color_height, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView | MTLTextureUsageShaderWrite);
                 entry.cpu_snapshot.clear();
+                if (gxm::get_base_format(surface.colorFormat)==SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16) {
+                    std::vector<uint8_t> zero(size_t(color_width)*color_height*8);
+                    [entry.color replaceRegion:MTLRegionMake2D(0,0,color_width,color_height)
+                        mipmapLevel:0 withBytes:zero.data() bytesPerRow:size_t(color_width)*8];
+                }
             }
+            // Plus expands its target before recording the writeback extent.
+            // Native MSAA stores a 1x2 (2x) or 2x2 (4x) guest sample grid.
+            const uint32_t target_samples_x = ctx.impl->expanded_color ? samples / 2 : 1;
+            const uint32_t target_samples_y = ctx.impl->expanded_color ? 2 : 1;
+            entry.render_scale = res_multiplier;
+            entry.publication_samples_x = target_samples_x;
+            entry.publication_samples_y = target_samples_y;
+            entry.rendered_width = std::max(entry.rendered_width,
+                std::min<uint32_t>(surface.width, uint32_t(std::lround(target->width * target_samples_x / double(res_multiplier)))));
+            entry.rendered_height = std::max(entry.rendered_height,
+                std::min<uint32_t>(surface.height, uint32_t(std::lround(target->height * target_samples_y / double(res_multiplier)))));
             const bool rgb = gxm::get_base_format(surface.colorFormat) == SCE_GXM_COLOR_BASE_FORMAT_U8U8U8;
             const bool signed_rgb = gxm::get_base_format(surface.colorFormat) == SCE_GXM_COLOR_BASE_FORMAT_S5S5U6;
             if (rgb && (new_color || gxm::get_base_format(entry.guest.colorFormat) != SCE_GXM_COLOR_BASE_FORMAT_U8U8U8)) {
@@ -1770,7 +2858,7 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                     const uint64_t end=uint64_t(surface.data.address())+bytes;
                     if (bytes && end<=uint64_t(UINT32_MAX)-4095 && is_valid_addr_range(mem,surface.data.address(),Address(end))) {
                         const SurfaceMemoryRange all{0,bytes};
-                        require(write_surface_memory(entry.color,surface,
+                        require(write_surface_storage(entry,surface,
                             {static_cast<const uint8_t *>(surface.data.get(mem)),bytes},{&all,1}),"Metal: RGB initial surface upload failed");
                     }
                 }
@@ -1796,7 +2884,9 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                         && entry.guest.strideInPixels==surface.strideInPixels && entry.guest.colorFormat==surface.colorFormat
                         && entry.guest.surfaceType==surface.surfaceType;
                     std::vector<SurfaceMemoryRange> changes;
-                    if (!same_layout || entry.cpu_snapshot.size()!=bytes) changes.push_back({0,bytes});
+                    // A same-value store or write-restore still transfers
+                    // ownership to the CPU. Import its full surface once.
+                    if (entry.cpu_writes.changed() || !same_layout || entry.cpu_snapshot.size()!=bytes) changes.push_back({0,bytes});
                     else if (std::memcmp(cpu.data(), entry.cpu_snapshot.data(), bytes) != 0)
                         for (size_t at=0;at<bytes;) {
                             if (cpu[at]==entry.cpu_snapshot[at]) {++at;continue;}
@@ -1805,7 +2895,7 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                             changes.push_back({first,at-first});
                         }
                     if (!changes.empty()) {
-                        require(write_surface_memory(entry.color,surface,cpu,changes),"Metal: CPU surface import failed");
+                        require(write_surface_storage(entry,surface,cpu,changes),"Metal: CPU surface import failed");
                         // Patching only the edited bytes preserves every other
                         // sample. Reseeding from the resolved image would turn
                         // distinct edge samples into copies of their average.
@@ -1816,8 +2906,18 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                             require(impl->caster->patch_multisample(entry.multisample_color,surface,ctx.impl->sample_scale,cpu,changes),
                                 "Metal: CPU surface import could not preserve multisample storage");
                         }
+                        if (ctx.impl->expanded_color && !entry.raw_multisample_dirty && entry.raw_multisample_color
+                            && entry.raw_multisample_color.width==width && entry.raw_multisample_color.height==height
+                            && entry.raw_multisample_color.sampleCount==samples) {
+                            if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+                            require(impl->caster->patch_multisample(entry.raw_multisample_color,surface,ctx.impl->sample_scale,cpu,changes),
+                                "Metal: CPU surface import could not preserve raw multisample storage");
+                        }
                         entry.cpu_snapshot.assign(cpu.begin(),cpu.end());
                     }
+                    // Capture happened before the import: a later write stays
+                    // dirty instead of being acknowledged by this bind.
+                    entry.cpu_writes = pending_cpu_writes;
                     // With a single native sample, an unchanged scene cannot
                     // alter the imported color image. Avoid a readback unless
                     // a draw writes color or guest bytes change meanwhile.
@@ -1826,6 +2926,7 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                 }
             }
             if (new_color || samples==1) entry.multisample_dirty=true;
+            if (new_color || !ctx.impl->expanded_color) entry.raw_multisample_dirty=true;
             if (samples>1) {
                 entry.multisample_scale=ctx.impl->sample_scale;
                 if (entry.multisample_color && entry.multisample_color.width==width && entry.multisample_color.height==height
@@ -1847,7 +2948,39 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                 }
             }
             ctx.impl->render_color=samples>1 ? entry.multisample_color : entry.color;
+            if (gxm::get_base_format(surface.colorFormat)==SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16) {
+                if (samples==1 || ctx.impl->expanded_color) {
+                    if (!entry.raw_color) {
+                        entry.raw_color=make_texture(*impl->device,format,color_width,color_height,
+                            MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView|MTLTextureUsageShaderWrite);
+                        seed_raw_color=true;
+                    }
+                    ctx.impl->raw_color=entry.raw_color;
+                    ctx.impl->raw_render_color=entry.raw_color;
+                    if (samples>1) {
+                        if (!entry.raw_multisample_color || entry.raw_multisample_color.width!=width
+                            || entry.raw_multisample_color.height!=height || entry.raw_multisample_color.sampleCount!=samples) {
+                            entry.raw_multisample_color=make_texture(*impl->device,format,width,height,
+                                MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView,samples);
+                            entry.raw_multisample_dirty=true;
+                        }
+                        ctx.impl->raw_render_color=entry.raw_multisample_color;
+                        seed_raw_samples=entry.raw_multisample_dirty;
+                    }
+                    ctx.impl->raw_attachment=[ctx.impl->raw_render_color newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Uint];
+                    require(ctx.impl->raw_attachment!=nil,"Metal: raw F16 attachment view failed");
+                } else {
+                    // Downscaled color averages native samples. Raw register
+                    // words have no equivalent arithmetic resolve yet.
+                    entry.raw_color_invalidated=true;
+                }
+            }
             entry.guest = surface;
+            // Disabled surface synchronization does not acknowledge writes
+            // to an existing image. New images/ranges get their own baseline.
+            if (new_color || entry.cpu_writes.token != pending_cpu_writes.token)
+                entry.cpu_writes = pending_cpu_writes;
+            entry.last_frame_rendered = impl->frame_timestamp;
             const size_t guest_bytes = surface_memory_size(surface);
             const uint64_t guest_end = uint64_t(surface.data.address()) + guest_bytes;
             if (guest_bytes && guest_end <= uint64_t(UINT32_MAX) - 4095
@@ -1855,6 +2988,9 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                 entry.cpu_hash = XXH3_64bits(surface.data.get(mem), guest_bytes);
                 entry.cpu_hash_size = guest_bytes;
             } else entry.cpu_hash_size = 0;
+            require(impl->next_color_binding_generation != 0, "Metal: color binding generation exhausted");
+            entry.binding_generation = impl->next_color_binding_generation++;
+            ctx.impl->color_binding_generation = entry.binding_generation;
             ctx.impl->color = entry.color;
         } else {
             // Vulkan binds the render target's transient RGBA8 color image
@@ -1879,30 +3015,130 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
             : target->guest_height ? target->guest_height : uint32_t(std::lround(double(height)/res_multiplier));
         ctx.impl->depth_layout=res_multiplier>0
             ? depth_memory_layout(ds,guest_depth_width,guest_depth_height,target->multisample_mode):std::nullopt;
+        ctx.impl->depth_scene_width=ctx.impl->depth_layout ? ctx.impl->depth_layout->width : 0;
+        ctx.impl->depth_scene_height=ctx.impl->depth_layout ? ctx.impl->depth_layout->height : 0;
         if(!ctx.impl->depth_layout && !ds.disabled() && (ds.depth_data || ds.stencil_data) && (ds.force_load || ds.force_store))
             LOG_WARN_ONCE("Metal: guest depth memory encoding/scale is not implemented, format={:#x}",uint32_t(ds.get_format()));
-        const bool backed_depth = !ds.disabled() && (ds.depth_data || ds.stencil_data) && (ds.force_load || ds.force_store);
+        // Store flags control guest RAM publication, not GPU cache ownership.
+        const bool backed_depth = !ds.disabled() && (ds.depth_data || ds.stencil_data);
         ctx.impl->depth_key = backed_depth ? std::make_pair(ds.depth_data.address(), ds.stencil_data.address()) : std::pair<Address,Address>{};
         id<MTLTexture> selected = backed_depth ? impl->depth_surfaces[ctx.impl->depth_key].texture : ctx.impl->transient_depth;
         bool new_depth = !selected || selected.width != width || selected.height != height || selected.sampleCount != samples;
-        if (backed_depth && !new_depth) {
+        bool retained_larger_depth=false;
+        bool resample_depth=false;
+        if (backed_depth && selected) {
             const auto &entry = impl->depth_surfaces[ctx.impl->depth_key];
-            new_depth = entry.guest.get_format() != ds.get_format() || entry.guest.get_type() != ds.get_type()
-                || entry.guest.get_stride() != ds.get_stride() || entry.multisample != target->multisample_mode;
+            const bool compatible=entry.guest.get_format()==ds.get_format() && entry.guest.get_type()==ds.get_type()
+                && entry.guest.get_stride()==ds.get_stride() && entry.multisample==target->multisample_mode
+                && selected.sampleCount==samples && entry.scale==ctx.impl->sample_scale;
+            new_depth|=!compatible || entry.width!=guest_depth_width || entry.height!=guest_depth_height;
+            const auto storage=compatible ? depth_memory_layout(ds,entry.width,entry.height,entry.multisample) : std::nullopt;
+            const auto mapped=[&](auto pointer,size_t bytes) {
+                return !bytes || (pointer && uint64_t(pointer.address())+bytes<=uint64_t(UINT32_MAX)-4095
+                    && is_valid_addr_range(mem,pointer.address(),Address(uint64_t(pointer.address())+bytes)));
+            };
+            const bool storage_known=storage && entry.guest_snapshot_valid
+                && (!storage->tiled || storage->stride%32==0)
+                && entry.guest_depth_snapshot.size()==storage->depth_size
+                && entry.guest_stencil_snapshot.size()==storage->stencil_size
+                && mapped(ds.depth_data,storage->depth_size) && mapped(ds.stencil_data,storage->stencil_size);
+            const bool needs_mask=ds.get_format()==SCE_GXM_DEPTH_STENCIL_FORMAT_DF32M
+                || ds.get_format()==SCE_GXM_DEPTH_STENCIL_FORMAT_DF32M_S8;
+            const bool mask_known=!needs_mask || (entry.mask && entry.mask.width==selected.width
+                && entry.mask.height==selected.height && entry.mask.sampleCount==samples
+                && entry.mask.pixelFormat==MTLPixelFormatRGBA8Unorm);
+            const uint32_t target_divisor=ctx.impl->surface_downscale==0.5f ? 2 : 1;
+            // Plus returns a temporary scene view, leaving the full cached
+            // image intact. Only use a source grid whose target/guest mapping
+            // was recorded, and whose requested target matches this attachment.
+            resample_depth=storage_known && mask_known && samples>1 && surface.data
+                && surface.downscale && !ds.force_store && ctx.impl->depth_layout
+                && target->width/target_divisor==width && target->height/target_divisor==height
+                && ctx.impl->depth_layout->width==uint32_t(width/res_multiplier)*(samples/2)
+                && ctx.impl->depth_layout->height==uint32_t(height/res_multiplier)*2
+                && entry.sample_grid_width>=uint64_t(width)*(samples/2)
+                && entry.sample_grid_height>=uint64_t(height)*2;
+            if (resample_depth) {
+                new_depth=false;
+                retained_larger_depth=selected.width!=width || selected.height!=height
+                    || entry.width!=guest_depth_width || entry.height!=guest_depth_height;
+                ctx.impl->depth_layout=storage;
+            }
+            // Reuse a larger storage image only when its prefix has the same
+            // native/guest coordinate map. Sample-rate resampling is separate.
+            if (new_depth && compatible && ctx.impl->depth_layout && entry.guest_snapshot_valid
+                && selected.width>=width && selected.height>=height
+                && entry.width>=guest_depth_width && entry.height>=guest_depth_height
+                && uint64_t(selected.width)*guest_depth_width==uint64_t(width)*entry.width
+                && uint64_t(selected.height)*guest_depth_height==uint64_t(height)*entry.height
+                && !(samples>1 && surface.downscale && !ds.force_store)) {
+                // Absent-aspect background changes require a region history;
+                // retain the existing exact-size path until that is available.
+                if (storage_known
+                    && (storage->depth_size || entry.snapshot_background_depth==ds.background_depth)
+                    && (storage->stencil_size || (storage->packed && storage->depth_size)
+                        || entry.snapshot_background_stencil==ds.stencil)) {
+                    new_depth=false;retained_larger_depth=true;ctx.impl->depth_layout=storage;
+                }
+            }
         }
+        bool discard_cached_depth=false;
         if (new_depth)
             selected = make_texture(*impl->device, MTLPixelFormatDepth32Float_Stencil8, width, height, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView, samples);
         if (backed_depth) {
             auto &entry = impl->depth_surfaces[ctx.impl->depth_key];
-            if (new_depth) { entry.snapshots.clear(); entry.subrectangles.clear(); entry.published=false; }
+            if (new_depth) {
+                entry.snapshots.clear(); entry.subrectangles.clear(); entry.published=false;
+                entry.mask=nil;
+                entry.sample_rate_copy=nil;entry.sample_rate_mask=nil;
+                entry.sample_grid_width=entry.sample_grid_height=0;
+                // Preserve the existing native 2X layout. Plus doubles both
+                // target axes, so mismatched source grids need a separate port.
+                if (ctx.impl->expanded_color && ctx.impl->depth_layout
+                    && uint64_t(target->width)*2==color_width && uint64_t(target->height)*2==color_height
+                    && ctx.impl->depth_layout->width==uint32_t(color_width/res_multiplier)
+                    && ctx.impl->depth_layout->height==uint32_t(color_height/res_multiplier)) {
+                    entry.sample_grid_width=color_width;entry.sample_grid_height=color_height;
+                }
+                entry.guest_snapshot_valid=false;
+                entry.depth_content_stored=true;
+            }
+            // Plus keeps a no-store depth result only for a continuation with
+            // the same color target. Stencil validity is independent of this.
+            discard_cached_depth=!new_depth && ds.force_store && !entry.depth_content_stored
+                && entry.last_scene_color_addr!=surface.data.address();
+            entry.last_scene_color_addr=surface.data.address();
             entry.texture = selected;
             entry.guest = ds;
-            entry.width = guest_depth_width;
-            entry.height = guest_depth_height;
+            if (!retained_larger_depth) {
+                entry.width = guest_depth_width;
+                entry.height = guest_depth_height;
+            }
+            entry.scale = ctx.impl->sample_scale;
             entry.multisample = target->multisample_mode;
+            entry.last_attached_frame = impl->frame_timestamp;
         } else ctx.impl->transient_depth = selected;
         ctx.impl->depth = selected;
         ctx.impl->commands = scene_command_buffer(*impl->device);
+        if (seed_raw_color) {
+            // Follow prior submissions on the same queue. A CPU getBytes here
+            // could race the previous scene's deferred color producer.
+            auto blit=[ctx.impl->commands blitCommandEncoder];
+            require(blit!=nil,"Metal: cannot seed raw F16 attachment");
+            [blit copyFromTexture:ctx.impl->color sourceSlice:0 sourceLevel:0
+                sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(color_width,color_height,1)
+                toTexture:ctx.impl->raw_color destinationSlice:0 destinationLevel:0
+                destinationOrigin:MTLOriginMake(0,0,0)];
+            [blit endEncoding];
+        }
+        if (seed_raw_samples) {
+            // The initial normal-to-raw copy, seed and scene draws must stay
+            // ordered in this buffer; a separately submitted seed runs too soon.
+            if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+            impl->caster->seed_multisample(ctx.impl->raw_color,ctx.impl->raw_render_color,
+                ctx.impl->sample_scale,true,surface.width,surface.height,ctx.impl->commands);
+            impl->surfaces.at(surface.data.address()).raw_multisample_dirty=false;
+        }
         // Treat the descriptor's clip as a color-output boundary. Preserve
         // samples outside its inclusive rectangle before any scene draws;
         // restoring them leaves depth, stencil and visibility untouched.
@@ -1930,51 +3166,122 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                 sourceSize:MTLSizeMake(ctx.impl->render_color.width, ctx.impl->render_color.height, 1)
                 toTexture:ctx.impl->color_clip_snapshot destinationSlice:0 destinationLevel:0
                 destinationOrigin:MTLOriginMake(0, 0, 0)];
+            if (ctx.impl->raw_render_color) {
+                ctx.impl->raw_clip_snapshot=make_texture(*impl->device,ctx.impl->raw_render_color.pixelFormat,
+                    width,height,MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView,samples);
+                [blit copyFromTexture:ctx.impl->raw_render_color sourceSlice:0 sourceLevel:0
+                    sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width,height,1)
+                    toTexture:ctx.impl->raw_clip_snapshot destinationSlice:0 destinationLevel:0
+                    destinationOrigin:MTLOriginMake(0,0,0)];
+            }
             [blit endEncoding];
         }
-        bool loaded_depth=false;
-        if(backed_depth && ds.force_load && ctx.impl->depth_layout) {
+        const bool masked_depth=ds.get_format()==SCE_GXM_DEPTH_STENCIL_FORMAT_DF32M
+            || ds.get_format()==SCE_GXM_DEPTH_STENCIL_FORMAT_DF32M_S8;
+        auto &selected_mask=backed_depth && masked_depth
+            ? impl->depth_surfaces.at(ctx.impl->depth_key).mask : ctx.impl->transient_mask;
+        const uint32_t mask_width=backed_depth && masked_depth ? uint32_t(selected.width) : width;
+        const uint32_t mask_height=backed_depth && masked_depth ? uint32_t(selected.height) : height;
+        const bool new_mask=!selected_mask || selected_mask.width!=mask_width || selected_mask.height!=mask_height
+            || selected_mask.sampleCount!=samples || selected_mask.pixelFormat!=MTLPixelFormatRGBA8Unorm;
+        if (new_mask)
+            selected_mask=make_texture(*impl->device,MTLPixelFormatRGBA8Unorm,mask_width,mask_height,
+                MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead,samples);
+        if (ctx.impl->mask!=selected_mask) {
+            ctx.impl->mask=selected_mask;
+            ctx.impl->mask_constant_valid=false;
+        }
+        bool loaded_mask=false;
+        bool loaded_depth=false, retained_native_depth=false;
+        bool clear_background_depth=false, clear_background_stencil=false;
+        if(backed_depth && ctx.impl->depth_layout) {
             const auto &layout=*ctx.impl->depth_layout;
-            const auto [depth,stencil]=depth_memory_spans(mem,ds,layout);
-            if(!depth.empty() || !stencil.empty()) {
-                auto &entry=impl->depth_surfaces[ctx.impl->depth_key];
-                // A store quantizes D16/D24 and reduces scaled depth/stencil to
-                // the guest grid. Re-uploading our own unchanged bytes destroys
-                // the exact depth needed by a following EQUAL material pass.
-                // Retain the native attachment only while that published guest
-                // image is unchanged; CPU/transfer edits still force a reload.
+            auto &entry=impl->depth_surfaces[ctx.impl->depth_key];
+            const auto mapped=[&](auto pointer,size_t bytes) {
+                const uint64_t end=uint64_t(pointer.address())+bytes;
+                return !bytes || (pointer && end<=uint64_t(UINT32_MAX)-4095
+                    && is_valid_addr_range(mem,pointer.address(),Address(end)));
+            };
+            // No-load/no-store pointers need not be readable. Track a baseline
+            // only if available; an explicit load retains its strict validation.
+            if (ds.force_load || (mapped(ds.depth_data,layout.depth_size) && mapped(ds.stencil_data,layout.stencil_size))) {
+                const auto [depth,stencil]=depth_memory_spans(mem,ds,layout);
                 const auto unchanged=[](const std::vector<uint8_t> &saved,std::span<const uint8_t> current) {
                     return saved.size()==current.size() && std::equal(saved.begin(),saved.end(),current.begin());
                 };
-                const bool reuse=entry.published && !new_depth
-                    && entry.published_background_depth==ds.background_depth && entry.published_background_stencil==ds.stencil
-                    && unchanged(entry.published_depth,depth) && unchanged(entry.published_stencil,stencil);
-                if (!reuse) {
-                    if(!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
-                    require(impl->caster->load_depth_memory(selected,ds,layout,ctx.impl->sample_scale,depth,stencil,
-                        ctx.impl->commands),
-                        "Metal: cannot load guest depth/stencil storage");
-                    // A texture alias may request a separate snapshot before the
-                    // scene buffer is submitted. Publish this queued write first.
-                    ctx.impl->depth_written=true;
-                    entry.snapshots.clear();entry.subrectangles.clear();
+                // Unchanged RAM can describe either a published image or the
+                // baseline beneath newer, intentionally un-published GPU data.
+                const bool known_baseline=entry.guest_snapshot_valid && !new_depth
+                    && entry.guest_depth_snapshot.size()==depth.size() && entry.guest_stencil_snapshot.size()==stencil.size();
+                const bool reuse=known_baseline
+                    && unchanged(entry.guest_depth_snapshot,depth) && unchanged(entry.guest_stencil_snapshot,stencil);
+                if ((ds.force_load || retained_larger_depth || resample_depth) && (!depth.empty() || !stencil.empty())) {
+                    // Background values supply only aspects absent from guest
+                    // memory. Changing them must not reload another aspect's
+                    // unchanged RAM over a newer GPU result.
+                    clear_background_depth=known_baseline && !layout.depth_size
+                        && entry.snapshot_background_depth!=ds.background_depth;
+                    clear_background_stencil=known_baseline && !layout.stencil_size && !(layout.packed && layout.depth_size)
+                        && entry.snapshot_background_stencil!=ds.stencil;
+                    if (!reuse) {
+                        if(!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+                        if (known_baseline) {
+                            // A newly allocated mask has no retained pixels to
+                            // preserve. Initialize it before applying byte edits.
+                            if (masked_depth && new_mask && !depth.empty()) {
+                                const bool initialized_mask=impl->caster->load_mask_memory(selected_mask,ds,layout,
+                                    ctx.impl->sample_scale,depth,ctx.impl->commands);
+                                require(initialized_mask,"Metal: cannot initialize retained depth mask");
+                                loaded_mask=ds.force_load;
+                                ctx.impl->mask_constant_valid=false;
+                            }
+                            if (discard_cached_depth) {
+                                // Clear invalid no-store depth before patching
+                                // CPU bytes, not afterwards. Stencil survives.
+                                impl->caster->clear_depth_region(selected,{0,0,width,height},ds.background_depth,ds.stencil,
+                                    {true,false,false},ctx.impl->commands,ctx.impl->custom_samples ? ctx.impl->sample_positions.data() : nullptr);
+                                ctx.impl->depth_written=true;
+                                discard_cached_depth=false;clear_background_depth=false;
+                                entry.snapshots.clear();entry.subrectangles.clear();entry.published=false;
+                            }
+                            const auto depth_changes=changed_memory_ranges(depth,entry.guest_depth_snapshot);
+                            const auto stencil_changes=changed_memory_ranges(stencil,entry.guest_stencil_snapshot);
+                            DepthMemoryWrite written;
+                            require(impl->caster->patch_depth_memory(selected,ds,layout,ctx.impl->sample_scale,
+                                depth,stencil,depth_changes,stencil_changes,selected_mask,ctx.impl->commands,&written),
+                                "Metal: cannot patch retained guest depth/stencil storage");
+                            ctx.impl->depth_written|=written.depth || written.stencil || written.mask;
+                            depth_memory_changed(*this,entry,written);
+                        } else {
+                            require(impl->caster->load_depth_memory(selected,ds,layout,ctx.impl->sample_scale,depth,stencil,
+                                ctx.impl->commands),
+                                "Metal: cannot load guest depth/stencil storage");
+                            ctx.impl->depth_written=true;
+                            entry.snapshots.clear();entry.subrectangles.clear();
+                            entry.depth_content_stored=true;
+                            entry.published=false;
+                            // A complete import replaces the stale cache.
+                            discard_cached_depth=false;
+                        }
+                    }
+                    retained_native_depth=ds.force_load && known_baseline;
+                    loaded_depth=ds.force_load;
                 }
-                loaded_depth=true;
-            }
+                entry.guest_depth_snapshot.assign(depth.begin(),depth.end());
+                entry.guest_stencil_snapshot.assign(stencil.begin(),stencil.end());
+                if (!resample_depth) {
+                    entry.snapshot_background_depth=ds.background_depth;
+                    entry.snapshot_background_stencil=ds.stencil;
+                }
+                entry.guest_snapshot_valid=!depth.empty() || !stencil.empty();
+            } else entry.guest_snapshot_valid=false;
         }
         ctx.impl->scene_active=true;
         ctx.impl->macroblock_last_x = ctx.impl->macroblock_last_y = ~0u;
         ctx.impl->macroblock_visited = 0;
         ctx.impl->macroblock_ignore = false;
-        if (!ctx.impl->mask || ctx.impl->mask.width!=width || ctx.impl->mask.height!=height || ctx.impl->mask.sampleCount!=samples) {
-            ctx.impl->mask=make_texture(*impl->device,MTLPixelFormatRGBA8Unorm,width,height,
-                MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead,samples);
-            ctx.impl->mask_constant_valid=false;
-        }
-        const bool masked_depth=ds.get_format()==SCE_GXM_DEPTH_STENCIL_FORMAT_DF32M
-            || ds.get_format()==SCE_GXM_DEPTH_STENCIL_FORMAT_DF32M_S8;
-        bool loaded_mask=false;
-        if(masked_depth && ds.force_load && ctx.impl->depth_layout && ds.depth_data) {
+        loaded_mask|=masked_depth && ds.depth_data && retained_native_depth && !new_mask;
+        if(!loaded_mask && masked_depth && ds.force_load && ctx.impl->depth_layout && ds.depth_data) {
             const auto [depth,stencil]=depth_memory_spans(mem,ds,*ctx.impl->depth_layout);
             if(!depth.empty()) {
                 if(!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
@@ -1984,23 +3291,65 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                 ctx.impl->mask_constant_valid=false;
             }
         }
+        if (resample_depth) {
+            auto &entry=impl->depth_surfaces.at(ctx.impl->depth_key);
+            const auto allocate_view=[&](id<MTLTexture> __strong &texture,MTLPixelFormat format) {
+                if (!texture || texture.width!=width || texture.height!=height || texture.sampleCount!=samples)
+                    texture=make_texture(*impl->device,format,width,height,
+                        MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView,samples);
+            };
+            allocate_view(entry.sample_rate_copy,MTLPixelFormatDepth32Float_Stencil8);
+            if (masked_depth) allocate_view(entry.sample_rate_mask,MTLPixelFormatRGBA8Unorm);
+            if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+            require(impl->caster->resample_depth(selected,entry.sample_rate_copy,
+                entry.sample_grid_width,entry.sample_grid_height,ctx.impl->depth_layout->width,ctx.impl->depth_layout->height,
+                ctx.impl->commands,masked_depth ? selected_mask : nil,masked_depth ? entry.sample_rate_mask : nil,
+                ctx.impl->custom_samples ? ctx.impl->sample_positions.data() : nullptr),
+                "Metal: cannot reconstruct sample-rate depth view");
+            selected=entry.sample_rate_copy;
+            ctx.impl->depth=selected;
+            ctx.impl->depth_is_sample_rate_copy=true;
+            ctx.impl->depth_written=true;
+            if (masked_depth) {
+                ctx.impl->mask=entry.sample_rate_mask;
+                ctx.impl->mask_constant_valid=false;
+            }
+        }
         const bool clear_mask = ds.disabled() || ds.mask;
         if(!loaded_mask && (!ctx.impl->mask_constant_valid || ctx.impl->mask_constant_value != clear_mask)) {
-            auto mask_pass=[MTLRenderPassDescriptor renderPassDescriptor];
-            mask_pass.colorAttachments[0].texture=ctx.impl->mask;
-            mask_pass.colorAttachments[0].loadAction=MTLLoadActionClear;
-            // A null depth surface is recorded as a zeroed descriptor. GXM's
-            // explicit disabled-surface initializer still starts with mask=1.
-            mask_pass.colorAttachments[0].clearColor=clear_mask
-                ? MTLClearColorMake(1,1,1,1) : MTLClearColorMake(0,0,0,0);
-            mask_pass.colorAttachments[0].storeAction=MTLStoreActionStore;
-            auto mask_clear=[ctx.impl->commands renderCommandEncoderWithDescriptor:mask_pass];
-            require(mask_clear!=nil,"Metal: cannot initialize scene mask");
-            [mask_clear endEncoding];
-            ctx.impl->mask_constant_valid=true;
-            ctx.impl->mask_constant_value=clear_mask;
+            const bool partial_mask=ctx.impl->mask.width!=width || ctx.impl->mask.height!=height;
+            if (partial_mask) {
+                if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+                impl->caster->clear_depth_region(ctx.impl->mask,{0,0,width,height},float(clear_mask),0,
+                    {false,false,true},ctx.impl->commands,ctx.impl->custom_samples ? ctx.impl->sample_positions.data() : nullptr);
+                // The retained border need not have this constant value.
+                ctx.impl->mask_constant_valid=false;
+            } else {
+                auto mask_pass=[MTLRenderPassDescriptor renderPassDescriptor];
+                mask_pass.colorAttachments[0].texture=ctx.impl->mask;
+                mask_pass.colorAttachments[0].loadAction=MTLLoadActionClear;
+                // Disabled-surface initialization can request mask one.
+                mask_pass.colorAttachments[0].clearColor=clear_mask
+                    ? MTLClearColorMake(1,1,1,1) : MTLClearColorMake(0,0,0,0);
+                mask_pass.colorAttachments[0].storeAction=MTLStoreActionStore;
+                auto mask_clear=[ctx.impl->commands renderCommandEncoderWithDescriptor:mask_pass];
+                require(mask_clear!=nil,"Metal: cannot initialize scene mask");
+                [mask_clear endEncoding];
+                ctx.impl->mask_constant_valid=true;
+                ctx.impl->mask_constant_value=clear_mask;
+            }
         }
-        begin_pass(ctx, false, !loaded_depth && (new_depth || !ctx.record.depth_stencil_surface.force_load));
+        const bool clear_both=!loaded_depth && (new_depth || !ds.force_load);
+        bool clear_depth=clear_both || discard_cached_depth || clear_background_depth;
+        bool clear_stencil=clear_both || clear_background_stencil;
+        if (retained_larger_depth && (clear_depth || clear_stencil)) {
+            if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+            impl->caster->clear_depth_region(selected,{0,0,width,height},ds.background_depth,ds.stencil,
+                {clear_depth,clear_stencil,false},ctx.impl->commands,ctx.impl->custom_samples ? ctx.impl->sample_positions.data() : nullptr);
+            ctx.impl->depth_written=true;
+            clear_depth=false;clear_stencil=false;
+        }
+        begin_pass(ctx,false,clear_depth,clear_stencil);
     }
 }
 void set_uniform_buffer(MetalContext &ctx, const ShaderProgram &program, bool vertex, int block, uint32_t size, const uint8_t *data, Address address) {
@@ -2288,8 +3637,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         require(ctx.impl->mem == &mem && ctx.current_render_target && (indices || !count || !instances),
             "Metal: draw outside a scene or without indices");
         auto &record = ctx.record;
-        auto *vp = record.vertex_program.get(mem);
-        auto *fp = record.fragment_program.get(mem);
+        const auto *vp = ctx.vertex_program.get();
+        const auto *fp = ctx.fragment_program.get();
         require(vp && fp, "Metal: missing GXM shader program");
         const bool triangles = primitive == SCE_GXM_PRIMITIVE_TRIANGLES
             || primitive == SCE_GXM_PRIMITIVE_TRIANGLE_EDGES
@@ -2305,7 +3654,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             || record.front_polygon_mode == SCE_GXM_POLYGON_MODE_POINT_01UV
             || record.front_polygon_mode == SCE_GXM_POLYGON_MODE_TRIANGLE_POINT);
         const bool shader_point_size = point_polygon
-            && (gxp::get_vertex_outputs(*vp->program.get(mem)) & SCE_GXM_VERTEX_PROGRAM_OUTPUT_PSIZE);
+            && (gxp::get_vertex_outputs(*vp->program()) & SCE_GXM_VERTEX_PROGRAM_OUTPUT_PSIZE);
         const auto empty_visibility_draw = [&](bool preserve_front, bool preserve_back) {
             if (!ctx.impl->visibility_address) return;
             const uint32_t entries = ctx.impl->visibility_stride / sizeof(uint32_t);
@@ -2377,27 +3726,32 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         // disabled-program path when every remaining face disables it.
         const bool fragment_disabled = !record.is_maskupdate
             && (cull_front || front_fragment_disabled) && (cull_back || back_fragment_disabled);
+        // A depth-only program can still discard fragments or write guest
+        // memory. Execute it, but never publish its undefined color output.
+        // Mask updates write the separate mask attachment and are exempt.
+        const bool fragment_color_disabled = fragment_disabled || (!record.is_maskupdate
+            && (fp->program()->program_flags & SCE_GXM_PROGRAM_FLAG_OUTPUT_UNDEFINED));
         const bool fragment_resources = !record.is_maskupdate && !fragment_disabled;
         if (!impl->trace_pixel_armed && fragment_resources
-            && impl->trace_pixel_arm_shader == hex_string(fp->renderer_data->hash)
+            && impl->trace_pixel_arm_shader == hex_string(fp->fragment_program->hash)
             && (!impl->trace_pixel_target_width || ctx.impl->width == impl->trace_pixel_target_width))
             impl->trace_pixel_armed = true;
-        if (!impl->dump_armed && fragment_resources && impl->dump_arm_shader == hex_string(fp->renderer_data->hash)
+        if (!impl->dump_armed && fragment_resources && impl->dump_arm_shader == hex_string(fp->fragment_program->hash)
             && (!impl->dump_arm_target_width || ctx.impl->width == impl->dump_arm_target_width)
             && impl->dump_arm_shader_matches++ >= impl->dump_arm_shader_skip)
             impl->dump_armed = true;
         const bool capture_draw = !impl->dump_draw_dir.empty() && !impl->draw_dumped && impl->dump_armed
             && ((impl->dump_arm_pixel_shader.empty() && impl->dump_arm_pixel_rgb.empty()) || impl->dump_pixel_armed)
-            && (impl->dump_draw_shader.empty() || impl->dump_draw_shader == hex_string(fp->renderer_data->hash))
+            && (impl->dump_draw_shader.empty() || impl->dump_draw_shader == hex_string(fp->fragment_program->hash))
             && (!impl->dump_draw_target_address || ctx.impl->guest_color.data.address() == impl->dump_draw_target_address)
             && (!impl->dump_draw_target_width || ctx.impl->width == impl->dump_draw_target_width)
-            && (!impl->dump_draw_texture_address || (fp->renderer_data->textures_used[0]
+            && (!impl->dump_draw_texture_address || (fp->fragment_program->textures_used[0]
                 && (ctx.textures[0].data_addr << 2) == impl->dump_draw_texture_address))
-            && (!impl->dump_draw_texture_width || (fp->renderer_data->textures_used[0]
+            && (!impl->dump_draw_texture_width || (fp->fragment_program->textures_used[0]
                 && gxm::get_width(ctx.textures[0]) == impl->dump_draw_texture_width))
-            && (impl->dump_draw_texture_format.empty() || (fp->renderer_data->textures_used[0]
+            && (impl->dump_draw_texture_format.empty() || (fp->fragment_program->textures_used[0]
                 && uint32_t(gxm::get_format(ctx.textures[0])) == std::strtoul(impl->dump_draw_texture_format.c_str(), nullptr, 0)))
-            && (impl->dump_vertex_shader.empty() || impl->dump_vertex_shader == hex_string(vp->renderer_data->hash))
+            && (impl->dump_vertex_shader.empty() || impl->dump_vertex_shader == hex_string(vp->vertex_program->hash))
             && (!impl->dump_stream_stride || (!vp->streams.empty() && vp->streams[0].stride == impl->dump_stream_stride))
             && (impl->dump_trigger_file.empty() || std::filesystem::exists(impl->dump_trigger_file))
             && impl->dump_draw_matches++ >= impl->dump_draw_skip;
@@ -2433,6 +3787,16 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             dump_bytes(std::string(name)+".rgba32f",pixels.data(),pixels.size());
             metadata << name << ' ' << source.width << ' ' << source.height << ' ' << uint32_t(source.pixelFormat) << '\n';
             require(bool(metadata),"Metal: cannot write attachment metadata");
+        };
+        auto dump_raw_attachment = [&](const char *name) {
+            const auto source=ctx.impl->raw_color;
+            if (!capture_draw || !impl->dump_attachments || !source) return;
+            const size_t size=source.width*source.height*8;
+            if (size>64*1024*1024) return;
+            std::vector<uint8_t> bytes(size);
+            [source getBytes:bytes.data() bytesPerRow:source.width*8
+                fromRegion:MTLRegionMake2D(0,0,source.width,source.height) mipmapLevel:0];
+            dump_bytes(std::string(name)+".u16",bytes.data(),bytes.size());
         };
         auto dump_depth_attachment = [&](const char *name) {
             id<MTLTexture> source = ctx.impl->depth;
@@ -2482,7 +3846,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 << " samples " << source.sampleCount << '\n';
             require(bool(metadata),"Metal: cannot write stencil attachment metadata");
         };
-        auto clip = scissors(record, ctx.impl->width, ctx.impl->height, res_multiplier);
+        const float raster_scale = res_multiplier * ctx.impl->surface_downscale;
+        auto clip = scissors(record, ctx.impl->width, ctx.impl->height, raster_scale);
         // A zero-area scissor discards every fragment but still runs the
         // vertex stage. This preserves guest-memory stores in a GXP vertex
         // shader even when REGION_CLIP_ALL excludes the complete target.
@@ -2530,37 +3895,49 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         }
         if (capture_draw) finish(ctx); // Publish every producer before diagnostic texture reads.
         dump_attachment("color-before",ctx.impl->color);
+        dump_raw_attachment("raw-color-before");
         dump_attachment("mask-before",ctx.impl->mask);
         dump_depth_attachment("depth-before");
         dump_stencil_attachment("stencil-before");
         ctx.shader_hints.metal_samples = ctx.impl->samples;
+        ctx.shader_hints.metal_far_clip = draw_drops_fragments_beyond_far_plane(record);
         ctx.shader_hints.metal_missing_vertex_outputs = fragment_resources
-            ? (uint32_t(gxp::get_fragment_inputs(*fp->program.get(mem)))
-                  & ~uint32_t(gxp::get_vertex_outputs(*vp->program.get(mem))) & 0x3ffeu)
+            ? (uint32_t(gxp::get_fragment_inputs(*fp->program()))
+                  & ~uint32_t(gxp::get_vertex_outputs(*vp->program())) & 0x3ffeu)
             : 0;
         ctx.shader_hints.metal_mip_sampling = true;
         ctx.shader_hints.metal_float_cube_filter = !impl->device->native_device().supports32BitFloatFiltering;
+        ctx.shader_hints.metal_raw_color_attachment = !record.is_maskupdate && ctx.impl->raw_attachment;
+        ctx.shader_hints.metal_raw_color_fetch = false;
+        if (ctx.shader_hints.metal_raw_color_attachment) {
+            const auto surface=impl->surfaces.find(ctx.impl->guest_color.data.address());
+            const auto &blend=static_cast<const MetalFragmentProgram &>(*fp->fragment_program).blend;
+            ctx.shader_hints.metal_raw_color_fetch=surface!=impl->surfaces.end()
+                && !surface->second.raw_color_invalidated
+                && blend.colorFunc==SCE_GXM_BLEND_FUNC_NONE && blend.alphaFunc==SCE_GXM_BLEND_FUNC_NONE;
+        }
         ctx.shader_hints.attributes = &vp->attributes;
         ctx.shader_hints.color_format = record.color_surface.colorFormat;
         ctx.shader_hints.metal_red_alpha_shader_blend = false;
         ctx.shader_hints.metal_quantized_color_blend = false;
-        if (!fragment_disabled && !record.is_maskupdate
+        if (!fragment_color_disabled && !record.is_maskupdate
             && gxm::is_red_alpha_color_format(record.color_surface.colorFormat)) {
-            const auto blend = static_cast<MetalFragmentProgram &>(*fp->renderer_data).blend;
+            const auto blend = static_cast<const MetalFragmentProgram &>(*fp->fragment_program).blend;
             ctx.shader_hints.metal_red_alpha_shader_blend = blend.colorFunc != SCE_GXM_BLEND_FUNC_NONE
                 || blend.alphaFunc != SCE_GXM_BLEND_FUNC_NONE;
             ctx.shader_hints.metal_red_alpha_blend = blend;
         }
         const auto color_base = gxm::get_base_format(record.color_surface.colorFormat);
-        if (!fragment_disabled && !record.is_maskupdate
-            && static_cast<MetalFragmentProgram &>(*fp->renderer_data).blend.colorMask != SCE_GXM_COLOR_MASK_NONE
+        if (!fragment_color_disabled && !record.is_maskupdate
+            && static_cast<const MetalFragmentProgram &>(*fp->fragment_program).blend.colorMask != SCE_GXM_COLOR_MASK_NONE
             && (color_base == SCE_GXM_COLOR_BASE_FORMAT_U8U3U3U2
                 || color_base == SCE_GXM_COLOR_BASE_FORMAT_S5S5U6
                 || color_base == SCE_GXM_COLOR_BASE_FORMAT_U8S8S8U8)) {
             ctx.shader_hints.metal_quantized_color_blend = true;
-            ctx.shader_hints.metal_quantized_blend = static_cast<MetalFragmentProgram &>(*fp->renderer_data).blend;
+            ctx.shader_hints.metal_quantized_blend = static_cast<const MetalFragmentProgram &>(*fp->fragment_program).blend;
         }
         ctx.shader_hints.metal_output_register_size = record.color_surface.outputRegisterSize;
+        ctx.shader_hints.metal_output_register_format = fp->fragment_program->output_register_format;
         for (uint32_t slot = 0; slot < SCE_GXM_MAX_TEXTURE_UNITS; ++slot) {
             ctx.shader_hints.fragment_textures[slot] = gxm::get_format(ctx.textures[slot]);
             ctx.shader_hints.vertex_textures[slot] = gxm::get_format(ctx.textures[slot + SCE_GXM_MAX_TEXTURE_UNITS]);
@@ -2573,16 +3950,21 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 append(key, ctx.impl->samples);
                 return key;
             }
-            std::string key = hex_string(vertex ? vp->renderer_data->hash : fp->renderer_data->hash);
+            std::string key = hex_string(vertex ? vp->vertex_program->hash : fp->fragment_program->hash);
             key.reserve(key.size() + 4 * (16 + 3 * vp->attributes.size()
                 + 2 * SCE_GXM_MAX_TEXTURE_UNITS));
             append(key, vertex);
-            if (vertex) append(key, ctx.shader_hints.metal_missing_vertex_outputs);
+            if (vertex) {
+                append(key, ctx.shader_hints.metal_missing_vertex_outputs);
+                append(key, ctx.shader_hints.metal_far_clip);
+            }
             append(key, ctx.shader_hints.metal_mip_sampling);
             append(key, ctx.shader_hints.metal_float_cube_filter);
             append(key, get_features_mask());
             append(key, ctx.shader_hints.color_format);
             if (!vertex) {
+                append(key, ctx.shader_hints.metal_raw_color_attachment);
+                append(key, ctx.shader_hints.metal_raw_color_fetch);
                 append(key, ctx.shader_hints.metal_red_alpha_shader_blend);
                 if (ctx.shader_hints.metal_red_alpha_shader_blend) {
                     const auto &blend = ctx.shader_hints.metal_red_alpha_blend;
@@ -2600,6 +3982,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 }
             }
             append(key, ctx.shader_hints.metal_output_register_size);
+            if (!vertex) append(key, ctx.shader_hints.metal_output_register_format);
             append(key, vertex ? 1u : ctx.impl->samples);
             append(key, !vertex && record.is_maskupdate);
             append(key, !vertex && !record.is_maskupdate && record.is_gamma_corrected);
@@ -2616,34 +3999,72 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         const std::string vertex_key = shader_key(true);
         const std::string fragment_key = shader_key(false);
         std::string error;
-        auto compile = [&](bool vertex) -> CompiledProgram & {
-            const auto &key = vertex ? vertex_key : fragment_key;
+        const auto remember_failure = [](std::set<std::string> &failures, const std::string &key,
+                                          const char *kind, const std::string &message) {
+            if (failures.insert(key).second)
+                LOG_ERROR("Metal {} variant {:016x} rejected; skipping this variant until the next game: {}",
+                    kind, XXH3_64bits(key.data(), key.size()), message.empty() ? "compiler returned no result" : message);
+        };
+        const auto compile_shader_once = [&](const std::string &key, auto &&build) -> CompiledProgram * {
+            if (impl->failed_shaders.contains(key)) return nullptr;
             auto &cached = impl->shaders[key];
             if (!cached) {
-                const auto *gxp = vertex ? vp->program.get(mem) : fp->program.get(mem);
-                // The generic memory-mapping feature also changes GXM vertex upload
-                // and visibility handling. Keep those paths independent while Metal
-                // gives shaders native addresses for their original uniform buffers.
+                try {
+                    cached = build();
+                    require(bool(cached), error);
+                } catch (const std::exception &failure) {
+                    remember_failure(impl->failed_shaders, key, "shader", failure.what());
+                    return nullptr;
+                }
+            }
+            return cached.get();
+        };
+        const auto compile = [&](bool vertex) -> CompiledProgram * {
+            const auto &key = vertex ? vertex_key : fragment_key;
+            return compile_shader_once(key, [&]() {
+                std::unique_ptr<CompiledProgram> compiled;
+                const auto *gxp = vertex ? vp->program() : fp->program();
+                // Keep GXM's vertex upload mode independent of the shader's
+                // native uniform addresses.
                 auto shader_features = features;
                 shader_features.enable_memory_mapping = true;
                 const bool gamma = !vertex && !record.is_maskupdate && record.is_gamma_corrected;
-                if (auto msl = impl->device->load_cached_program(key)) {
-                    cached = impl->device->compile(*msl, gamma, error);
-                    if (!cached) LOG_WARN("Metal: cached shader failed to compile; rebuilding: {}", error);
+                if (!impl->warmup_failed_shaders.contains(key)) {
+                    try {
+                        if (auto msl = impl->device->load_cached_program(key)) {
+                            const auto expected_stage = vertex ? shader::metal::Stage::Vertex : shader::metal::Stage::Fragment;
+                            if (msl->stage == expected_stage)
+                                compiled = impl->device->compile(*msl, gamma, error);
+                            else
+                                error = "cached shader stage does not match the draw";
+                            if (!compiled) LOG_WARN("Metal: cached shader failed to compile; rebuilding: {}", error);
+                        }
+                    } catch (const std::exception &failure) {
+                        LOG_WARN("Metal: cached shader could not be loaded; rebuilding: {}", failure.what());
+                    }
                 }
-                if (!cached) {
+                if (!compiled) {
                     auto msl = !vertex && fragment_disabled ? depth_only_program(ctx.impl->samples)
-                        : shader::metal::convert_gxp(*gxp, hex_string(vertex ? vp->renderer_data->hash : fp->renderer_data->hash), shader_features, ctx.shader_hints, !vertex && record.is_maskupdate);
-                    cached = impl->device->compile(msl, gamma, error);
-                    require(bool(cached), error);
-                    impl->device->store_cached_program(key, msl,
-                        hex_string(vertex ? vp->renderer_data->hash : fp->renderer_data->hash), gamma);
+                        : shader::metal::convert_gxp(*gxp, hex_string(vertex ? vp->vertex_program->hash : fp->fragment_program->hash), shader_features, ctx.shader_hints, !vertex && record.is_maskupdate);
+                    compiled = impl->device->compile(msl, gamma, error);
+                    require(bool(compiled), error);
+                    try {
+                        impl->device->store_cached_program(key, msl,
+                            hex_string(vertex ? vp->vertex_program->hash : fp->fragment_program->hash), gamma);
+                    } catch (const std::exception &failure) {
+                        LOG_WARN("Metal: compiled shader could not be cached: {}", failure.what());
+                    }
                 }
                 ++shaders_count_compiled;
-            }
-            return *cached;
+                return compiled;
+            });
         };
-        auto &vs = compile(true); auto &fs = compile(false);
+        auto *vertex_shader = compile(true);
+        if (!vertex_shader) return;
+        auto *fragment_shader = compile(false);
+        if (!fragment_shader) return;
+        auto &vs = *vertex_shader;
+        auto &fs = *fragment_shader;
         // An indexed shader with external stores can execute for every source
         // occurrence. The regular capture deduplicates indices and would drop
         // those stores; use one compact draw per source occurrence instead.
@@ -2668,45 +4089,75 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             query_capacity = std::max<uint64_t>(4096, uint64_t(count) * bytes_per_index + 8);
         }
         ctx.impl->visibility_buffer_capacity = size_t(query_capacity);
-        if (impl->cache_enabled && impl->known_shader_pairs.emplace(fp->renderer_data->hash, vp->renderer_data->hash).second) {
-            shaders_cache_hashs.push_back({fp->renderer_data->hash, vp->renderer_data->hash});
+        if (impl->cache_enabled && impl->known_shader_pairs.emplace(fp->fragment_program->hash, vp->vertex_program->hash).second) {
+            shaders_cache_hashs.push_back({fp->fragment_program->hash, vp->vertex_program->hash});
             renderer::save_shaders_cache_hashs(*this, shaders_cache_hashs);
         }
         const bool synchronous = impl->sync_draws || vs.writes_guest_memory || fs.writes_guest_memory;
-        size_t captured_texture_bytes = 0;
-        // A game may reuse former render-target storage for CPU-loaded assets.
-        // Never publish an obsolete GPU image over those new guest bytes.
-        // Check before any alias lookup, including overlapping mip/cube views.
-        for (uint32_t index = 0; index < SCE_GXM_MAX_TEXTURE_UNITS * 2; ++index) {
-            const bool vertex = index >= SCE_GXM_MAX_TEXTURE_UNITS;
-            if (!vertex && !fragment_resources) continue;
-            const auto &program = vertex ? static_cast<const ShaderProgram &>(*vp->renderer_data)
-                                         : static_cast<const ShaderProgram &>(*fp->renderer_data);
-            if (!program.textures_used[index % SCE_GXM_MAX_TEXTURE_UNITS]) continue;
-            const auto &texture = ctx.textures[index];
-            const uint64_t begin = uint32_t(texture.data_addr) << 2;
-            const uint64_t end = begin + texture_storage_size(texture);
-            for (auto it = impl->surfaces.begin(); it != impl->surfaces.end();) {
-                auto &surface = it->second;
-                const size_t bytes = surface.cpu_hash_size;
-                const uint64_t surface_end = uint64_t(it->first) + bytes;
-                if (surface.color != ctx.impl->color && bytes && it->first < end && surface_end > begin
-                    && surface_end <= uint64_t(UINT32_MAX) - 4095
-                    && is_valid_addr_range(mem, it->first, Address(surface_end))
-                    && XXH3_64bits(surface.guest.data.get(mem), bytes) != surface.cpu_hash) {
-                    LOG_INFO("Metal: retiring CPU-overwritten color surface at {:#x} before texture {:#x}", it->first, begin);
-                    it = impl->surfaces.erase(it);
-                } else ++it;
+        if (vs.writes_guest_memory || fs.writes_guest_memory)
+            disable_vertex_stream_snapshots();
+        if (!disable_surface_sync && ctx.impl->guest_color.data
+            && (ctx.impl->pending_color_writes || ctx.impl->color_guest_dirty)) {
+            // Plus sync_surface_for_gpu_read makes a recent color producer
+            // visible before binding an aliased uniform. Metal's uniform GPU
+            // addresses point at guest RAM, so the active producer must finish
+            // and publish before this draw reads it. Other scenes have already
+            // published at EndScene when surface synchronization is enabled.
+            const uint64_t color_begin = ctx.impl->guest_color.data.address();
+            const uint64_t color_end = color_begin + surface_memory_size(ctx.impl->guest_color);
+            const ShaderProgram *uniform_programs[] = {vp->vertex_program.get(), fp->fragment_program.get()};
+            bool reads_color = false;
+            for (uint32_t stage = 0; stage < 2 && !reads_color; ++stage) {
+                if (stage == 1 && !fragment_resources) continue;
+                const auto &program = *uniform_programs[stage];
+                for (uint32_t block = 0; block < program.buffer_count; ++block) {
+                    if (!program.uniform_buffer_sizes.at(block)) continue;
+                    const auto &binding = ctx.uniforms[stage].at(block);
+                    if (!binding.data || !binding.size) continue;
+                    // Preserve Plus's interior-alias threshold. Small uniforms
+                    // inside a former surface allocation are often unrelated.
+                    const uint64_t begin = binding.address;
+                    reads_color = begin == color_begin
+                        || (binding.size >= 16 * 1024 && begin >= color_begin
+                            && begin + binding.size <= color_end);
+                    if (reads_color) break;
+                }
             }
+            if (reads_color)
+                require(finish(ctx), "Metal: cannot publish color surface for a uniform reader");
         }
-        const auto find_subrectangle = [&](const SceGxmTexture &texture) {
-            auto result=impl->surfaces.end();
-            for (auto it=impl->surfaces.begin();it!=impl->surfaces.end();++it) {
-                if (!surface_subrectangle(it->second.guest,texture)) continue;
-                require(result==impl->surfaces.end(),"Metal: ambiguous color subrectangle aliases");
-                result=it;
+        size_t captured_texture_bytes = 0;
+        // Plus keeps CPU-dirty render images eligible for texture reads during
+        // the first two frames. Older images are rejected by the reader, not
+        // destroyed: an active attachment and a later rebind still own them.
+        // Freeze each decision within this draw so all alias paths agree.
+        std::map<Address, bool> texture_surface_eligibility;
+        const auto texture_surface_usable = [&](const Surface &surface) {
+            const Address address = surface.guest.data.address();
+            if (const auto known = texture_surface_eligibility.find(address);
+                known != texture_surface_eligibility.end()) return known->second;
+            bool usable = true;
+            const bool recent = impl->frame_timestamp >= surface.last_frame_rendered
+                && impl->frame_timestamp - surface.last_frame_rendered < 2;
+            if (!recent) {
+                usable = !surface.cpu_writes.changed();
+                const size_t bytes = surface_memory_size(surface.guest);
+                const uint64_t end = uint64_t(address) + bytes;
+                if (usable && bytes && end <= uint64_t(UINT32_MAX) - 4095
+                    && is_valid_addr_range(mem, address, Address(end)))
+                    usable = !surface_cpu_bytes_changed(surface,
+                        {static_cast<const uint8_t *>(surface.guest.data.get(mem)), bytes});
             }
-            return result;
+            texture_surface_eligibility.emplace(address, usable);
+            return usable;
+        };
+        const auto find_texture_surface = [&](Address address) {
+            const auto found = impl->surfaces.find(address);
+            return found != impl->surfaces.end() && texture_surface_usable(found->second)
+                ? found : impl->surfaces.end();
+        };
+        const auto find_subrectangle = [&](const SceGxmTexture &texture) {
+            return find_color_subrectangle(impl->surfaces, texture, texture_surface_usable);
         };
         const auto rg32_linear_alias = [&](const Surface &surface, const SceGxmTexture &texture,
             Address texture_address) {
@@ -2725,20 +4176,145 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 && gxm::get_height(texture)==guest.height
                 && pitch==uint64_t(guest.strideInPixels)*8 && res_multiplier>0;
         };
+        // Discover separate word views before creating any cast for this draw.
+        // Once a high-word view has been used, Plus duplicates each view's word
+        // across both columns instead of interleaving different words. Persist
+        // that choice until the backing color texture is recreated.
+        for (uint32_t index = 0; index < SCE_GXM_MAX_TEXTURE_UNITS * 2; ++index) {
+            const bool vertex = index >= SCE_GXM_MAX_TEXTURE_UNITS;
+            if (!vertex && !fragment_resources) continue;
+            const auto &program = vertex ? static_cast<const ShaderProgram &>(*vp->vertex_program)
+                                         : static_cast<const ShaderProgram &>(*fp->fragment_program);
+            if (!program.textures_used[index % SCE_GXM_MAX_TEXTURE_UNITS]) continue;
+            if ((vertex ? vs.cube_texture_mask : fs.cube_texture_mask)
+                & (1u << (index % SCE_GXM_MAX_TEXTURE_UNITS))) continue;
+            const auto &texture = ctx.textures[index];
+            if (texture.texture_type() != SCE_GXM_TEXTURE_LINEAR_STRIDED
+                && texture::get_upload_mip(texture.true_mip_count(), gxm::get_width(texture),
+                    gxm::get_height(texture)) > 1) continue;
+            const auto base = gxm::get_base_format(gxm::get_format(texture));
+            const Address address = texture.data_addr << 2;
+            if (address < 4 || (base != SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
+                    && base != SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)) continue;
+            const auto source = find_texture_surface(address - 4);
+            if (source != impl->surfaces.end() && rg32_linear_alias(source->second, texture, address)
+                && !source->second.has_word_offset_view) {
+                source->second.has_word_offset_view = true;
+                source->second.rgba8_casts.clear();
+            }
+        }
         // A mip chain or cube can span several independently rendered surfaces.
         // Publish incompatible aliases and preserve native pixels for matching levels.
         std::array<id<MTLTexture>, SCE_GXM_MAX_TEXTURE_UNITS*2> prepared_images{};
         std::array<std::optional<std::pair<float,float>>, SCE_GXM_MAX_TEXTURE_UNITS*2> surface_viewports{};
         std::array<shader::metal::TextureMipInfo,SCE_GXM_MAX_TEXTURE_UNITS*2> texture_mip_info{};
+        const auto rendered_cube=[&](const SceGxmTexture &texture,bool &raw)->id<MTLTexture> {
+            const auto type=texture.texture_type();
+            // Retain the existing full mip-chain assembler. This direct path
+            // handles six complete base faces without reading padding/mips.
+            if ((type!=SCE_GXM_TEXTURE_CUBE && type!=SCE_GXM_TEXTURE_CUBE_ARBITRARY)
+                || texture.true_mip_count()>1) return nil;
+            const uint32_t width=gxm::get_width(texture),height=gxm::get_height(texture);
+            const auto format=gxm::get_format(texture);
+            const auto base=gxm::get_base_format(format);
+            SceGxmColorBaseFormat color_base;
+            if (!texture.data_addr || !width || width!=height
+                || !renderer::texture::convert_base_texture_format_to_base_color_format(base,color_base)) return nil;
+            const uint32_t bits=gxm::bits_per_pixel(base);
+            if (!bits || bits%8) return nil;
+            const uint64_t layout_width=std::bit_ceil(width),layout_height=std::bit_ceil(height);
+            uint64_t chain=0;
+            for (uint64_t w=layout_width,h=layout_height;w && h;w>>=1,h>>=1) chain+=w*h*bits/8;
+            const uint64_t alignment=((width>=32 && height>=32 && bits<=8)
+                || (width>=16 && height>=16 && (bits==16 || bits==32))
+                || (width>=8 && height>=8 && bits==64)) ? 2048 : 4;
+            const std::array<uint64_t,2> steps{(layout_width*layout_height*bits/8+3)&~uint64_t(3),
+                (chain+alignment-1)&~(alignment-1)};
+            const uint64_t address=uint64_t(texture.data_addr)<<2;
+            const auto selection = find_color_cube_faces(impl->surfaces, address, steps,
+                [&](const Surface &surface) {
+                    return surface.guest.width == width && surface.guest.height == height
+                        && gxm::get_base_format(surface.guest.colorFormat) == color_base && surface.color;
+                }, texture_surface_usable);
+            if (!selection) return nil;
+            const auto &[selected_step, faces] = *selection;
+            const auto &first=*faces[0];
+            for (const auto *face:faces)
+                if (face->guest.colorFormat!=first.guest.colorFormat
+                    || face->color.pixelFormat!=first.color.pixelFormat
+                    || face->color.width!=first.color.width || face->color.height!=first.color.height
+                    || face->color.textureType!=MTLTextureType2D || face->color.sampleCount!=1
+                    || face->color.width!=face->color.height) return nil;
+            const bool raw_cast=surface_raw_cast_required(first.guest.colorFormat,base);
+            const bool cast=raw_cast || !surface_texture_format_matches(first.guest.colorFormat,format);
+            if (cast && !surface_format_cast_enqueueable(first.guest.colorFormat,base,texture.swizzle_format)) return nil;
+            const bool rgba8=first.color.pixelFormat==MTLPixelFormatRGBA8Unorm
+                || first.color.pixelFormat==MTLPixelFormatRGBA8Unorm_sRGB;
+            if (!raw_cast && texture.gamma_mode && !rgba8) return nil;
+            raw=raw_cast;
+            const auto descriptor=texture_image_descriptor(texture);
+            std::string key(reinterpret_cast<const char *>(&descriptor),sizeof(descriptor));
+            const auto append_wide=[&](uint64_t value) { append(key,uint32_t(value));append(key,uint32_t(value>>32)); };
+            append_wide(selected_step);append(key,raw_cast);append(key,uint32_t(first.guest.colorFormat));
+            for (const auto *face:faces) {
+                append_wide(reinterpret_cast<uintptr_t>((__bridge void *)face->color));
+                append_wide(reinterpret_cast<uintptr_t>((__bridge void *)raw_surface_color(*face)));
+                append_wide(face->revision);
+            }
+            if (const auto cached=impl->rendered_cubes.find(key);cached!=impl->rendered_cubes.end()) {
+                if (capture_draw || impl->sync_draws) finish(ctx);
+                return cached->second.texture;
+            }
+            const bool queued=!capture_draw && !impl->sync_draws;
+            if (queued) mid_scene_flush(ctx,false);
+            else finish(ctx);
+            if (queued && !ctx.impl->commands) ctx.impl->commands=scene_command_buffer(*impl->device);
+            auto commands=queued ? ctx.impl->commands : scene_command_buffer(*impl->device);
+            if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+            if (queued && ctx.impl->expanded_color && std::any_of(faces.begin(),faces.end(),[&](const Surface *face) {
+                return face->color==ctx.impl->color;
+            })) expand_color_samples(ctx,*impl->caster,commands);
+            std::array<id<MTLTexture>,6> images;
+            const SceGxmColorFormat *rendered_format=&first.guest.colorFormat;
+            const auto repacked_color=cast ? repacked_u2_color(format) : std::nullopt;
+            if (cast) rendered_format=repacked_color ? &*repacked_color : nullptr;
+            const bool gamma=!raw_cast && (texture.gamma_mode || first.color.pixelFormat==MTLPixelFormatRGBA8Unorm_sRGB);
+            for (uint32_t face=0;face<6;++face) {
+                images[face]=cast ? impl->caster->surface_format_cast(raw_surface_color(*faces[face]),
+                    faces[face]->guest.colorFormat,base,texture.swizzle_format,commands,raw_cast) : faces[face]->color;
+                require(images[face]!=nil,"Metal: rendered cube face cast failed");
+                if (gamma) images[face]=impl->caster->rgba8_surface_sampling(images[face],
+                    rendered_format ? *rendered_format : SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR,texture.gamma_mode,commands);
+            }
+            auto image=impl->caster->rendered_cube(images,commands);
+            if (!raw_cast) image=sampling_view(image,format,gamma ? nullptr : rendered_format);
+            if (!queued) {
+                std::string error;
+                require(impl->device->submit_and_wait(commands,error),error);
+            }
+            if (impl->rendered_cubes.size()>=4) impl->rendered_cubes.erase(impl->rendered_cubes.begin());
+            auto &cached=impl->rendered_cubes[key];
+            cached.texture=image;
+            for (const auto *face:faces) {
+                cached.sources.push_back(face->color);
+                cached.sources.push_back(raw_surface_color(*face));
+            }
+            return image;
+        };
         for (uint32_t index=0;index<SCE_GXM_MAX_TEXTURE_UNITS*2;++index) {
             const bool vertex=index>=SCE_GXM_MAX_TEXTURE_UNITS;
             const uint32_t slot=index%SCE_GXM_MAX_TEXTURE_UNITS;
             if (!vertex && !fragment_resources) continue;
-            const auto &program=vertex?static_cast<const ShaderProgram &>(*vp->renderer_data):static_cast<const ShaderProgram &>(*fp->renderer_data);
+            const auto &program=vertex?static_cast<const ShaderProgram &>(*vp->vertex_program):static_cast<const ShaderProgram &>(*fp->fragment_program);
             if (!program.textures_used[slot]) continue;
             const auto &texture=ctx.textures[index];
             const bool cube=((vertex ? vs.cube_texture_mask : fs.cube_texture_mask)&(1u<<slot))!=0;
             const auto texture_type=texture.texture_type();
+            if (cube) {
+                bool raw=false;
+                prepared_images[index]=rendered_cube(texture,raw);
+                if (prepared_images[index]) { texture_mip_info[index].control[3]=raw;continue; }
+            }
             const bool cube_storage=texture_type==SCE_GXM_TEXTURE_SWIZZLED
                 || texture_type==SCE_GXM_TEXTURE_SWIZZLED_ARBITRARY
                 || texture_type==SCE_GXM_TEXTURE_CUBE
@@ -2753,10 +4329,14 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 require(address && end<=uint64_t(UINT32_MAX)-4095
                     && is_valid_addr_range(mem,address,Address(end)),
                     "Metal: cube fallback texture extends beyond mapped guest memory");
+                bool raw_cast_requested=false;
                 for (auto &[base,surface]:impl->surfaces) {
                     const size_t size=surface_memory_size(surface.guest);
-                    if (size && uint64_t(base)<end && uint64_t(base)+size>address)
+                    if (size && uint64_t(base)<end && uint64_t(base)+size>address && texture_surface_usable(surface)) {
+                        raw_cast_requested|=surface_raw_cast_required(surface.guest.colorFormat,
+                            gxm::get_base_format(gxm::get_format(texture)));
                         require(sync_surface(mem,surface.guest),"Metal: cannot publish cube fallback alias");
+                    }
                 }
                 texture_cache.cache_and_bind_image(texture,mem);
                 id<MTLTexture> source=current_texture(texture_cache);
@@ -2791,13 +4371,18 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     found=impl->cube_aliases.emplace(key,Impl::CubeAlias{source,replica}).first;
                     LOG_INFO("Metal: repeated 2D fallback texture over six cube faces at {:#x}",address);
                 }
-                prepared_images[index]=sampling_view(found->second.cube,gxm::get_format(texture),nullptr);
+                if (raw_cast_requested && raw_texture_snapshot_supported(found->second.cube)) {
+                    if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+                    prepared_images[index]=impl->caster->raw_texture_snapshot(found->second.cube);
+                    require(prepared_images[index]!=nil,"Metal: repeated cube raw surface carrier failed");
+                    texture_mip_info[index].control[3]=1;
+                } else prepared_images[index]=sampling_view(found->second.cube,gxm::get_format(texture),nullptr);
                 continue;
             }
             const Address texture_address=texture.data_addr<<2;
             const auto texture_base=gxm::get_base_format(gxm::get_format(texture));
             bool incompatible_alias=false;
-            auto source=impl->surfaces.find(texture_address);
+            auto source=find_texture_surface(texture_address);
             // Persona 4 describes a 1024x1024 texture over a 960x544 target.
             // Sample its rendered prefix directly, preserving guest texel
             // coordinates without reading the unallocated trailing rows.
@@ -2817,7 +4402,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             if (texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
                 || texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8) {
                 if (source==impl->surfaces.end() && texture_address>=4)
-                    source=impl->surfaces.find(texture_address-4);
+                    source=find_texture_surface(texture_address-4);
                 incompatible_alias|=source!=impl->surfaces.end()
                     && source->second.color.pixelFormat==MTLPixelFormatRG32Float
                     && !rg32_linear_alias(source->second,texture,texture_address);
@@ -2825,18 +4410,20 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             const bool single_mip = texture.texture_type()==SCE_GXM_TEXTURE_LINEAR_STRIDED
                 || texture::get_upload_mip(texture.true_mip_count(),gxm::get_width(texture),gxm::get_height(texture))<=1;
             bool direct_precise_surface = false;
-            if (!features.use_texture_viewport && single_mip && source!=impl->surfaces.end()
-                && texture_address==source->first
-                && texture_address!=ctx.impl->guest_color.data.address()
-                && source->second.color!=ctx.impl->color) {
-                const auto rect=surface_subrectangle(source->second.guest,texture);
-                direct_precise_surface=rect && !rect->x && !rect->y
-                    && rect->width==source->second.guest.width
-                    && rect->height==source->second.guest.height
-                    && surface_texture_format_matches(source->second.guest.colorFormat,gxm::get_format(texture));
+            if (!features.use_texture_viewport && !cube && single_mip) {
+                // Plus crops a compatible GPU owner even without texture
+                // viewports. Keep the same age/layout selection here: a RAM
+                // upload would instead observe a recent CPU-dirty surface's
+                // older guest bytes. The queued crop/feedback passes below
+                // handle both inactive producers and the current attachment.
+                const auto owner = find_subrectangle(texture);
+                direct_precise_surface = owner != impl->surfaces.end()
+                    && (surface_texture_format_matches(owner->second.guest.colorFormat, gxm::get_format(texture))
+                        || surface_format_cast_enqueueable(owner->second.guest.colorFormat,
+                            texture_base, texture.swizzle_format));
             }
-            if (!cube && single_mip && !incompatible_alias
-                && (features.use_texture_viewport || direct_precise_surface)) continue;
+            if (!cube && single_mip
+                && ((!incompatible_alias && features.use_texture_viewport) || direct_precise_surface)) continue;
             const auto upload=cube?cube_texture_descriptor(texture):texture;
             const Address address=texture.data_addr<<2;
             const size_t storage=texture_storage_size(upload), face_stride=cube?storage/6:storage;
@@ -2855,7 +4442,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             std::vector<Surface *> overlaps;
             for (auto &[base,surface]:impl->surfaces) {
                 const size_t bytes=surface_memory_size(surface.guest);
-                if (bytes && uint64_t(base)<end && uint64_t(base)+bytes>address) overlaps.push_back(&surface);
+                if (bytes && uint64_t(base)<end && uint64_t(base)+bytes>address && texture_surface_usable(surface)) overlaps.push_back(&surface);
             }
             // Without a color producer, retain the ordinary 2D path, including
             // its depth-surface aliases. Cubes still need their six-face upload.
@@ -2865,6 +4452,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 prepared_images[index]=current_texture_view(texture_cache,gxm::get_format(texture));
                 continue;
             }
+            const bool raw_cast_requested=std::any_of(overlaps.begin(),overlaps.end(),[&](const Surface *surface) {
+                return surface_raw_cast_required(surface->guest.colorFormat,texture_base);
+            });
             if (!features.use_texture_viewport) {
                 // Precise mode samples the guest texture grid. Publish each
                 // overlapping GPU producer before decoding its guest layout.
@@ -2872,6 +4462,12 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     require(sync_surface(mem, surface->guest), "Metal: cannot publish precise texture alias");
                 texture_cache.cache_and_bind_image(upload, mem);
                 prepared_images[index] = current_texture_view(texture_cache, gxm::get_format(texture));
+                if (raw_cast_requested && raw_texture_snapshot_supported(current_texture(texture_cache))) {
+                    if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+                    prepared_images[index]=impl->caster->raw_texture_snapshot(current_texture(texture_cache));
+                    require(prepared_images[index]!=nil,"Metal: precise raw surface carrier failed");
+                    texture_mip_info[index].control[3]=1;
+                }
                 continue;
             }
             const uint32_t width=gxm::get_width(upload), height=gxm::get_height(upload);
@@ -2924,7 +4520,18 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             texture_cache.cache_and_bind_image(upload,mem);
             auto base_image=current_texture(texture_cache);
             auto uploaded=current_texture_view(texture_cache,gxm::get_format(texture));
-            if (rendered.empty()) { prepared_images[index]=uploaded;continue; }
+            // A replacement image can use a different byte width. It has no
+            // guest word representation; retain its existing sampled path.
+            const bool raw_cast=raw_cast_requested && raw_texture_snapshot_supported(base_image);
+            mip_info.control[3]=raw_cast;
+            if (rendered.empty()) {
+                if (raw_cast) {
+                    if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+                    uploaded=impl->caster->raw_texture_snapshot(base_image);
+                    require(uploaded!=nil,"Metal: uploaded raw surface carrier failed");
+                }
+                prepared_images[index]=uploaded;continue;
+            }
             if (!cube) for (uint32_t mip=0;mip<mips;++mip)
                 mip_info.control[0]|=mip_info.sizes[mip]!=std::array<uint32_t,2>{
                     std::max(1u,uint32_t(double(uploaded.width)*scale)>>mip),
@@ -2935,8 +4542,10 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             const auto append_wide=[&](uint64_t value) { append(image_key,uint32_t(value));append(image_key,uint32_t(value>>32)); };
             append_wide(reinterpret_cast<uintptr_t>((__bridge void *)base_image));
             append(image_key,std::bit_cast<uint32_t>(scale));
+            append(image_key,raw_cast);
             for (const auto &face:rendered) {
                 append_wide(reinterpret_cast<uintptr_t>((__bridge void *)face.surface->color));
+                append_wide(reinterpret_cast<uintptr_t>((__bridge void *)raw_surface_color(*face.surface)));
                 append_wide(face.surface->revision);append(image_key,face.face);append(image_key,face.mip);
             }
             if (auto found=impl->rendered_images.find(image_key);found!=impl->rendered_images.end()) {
@@ -2944,7 +4553,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             }
             const bool queued_snapshot=!capture_draw && !impl->sync_draws
                 && std::all_of(rendered.begin(),rendered.end(),[&](const RenderedFace &face) {
-                    return !face.cast || surface_format_cast_enqueueable(face.surface->guest.colorFormat,
+                    return (!face.cast && !raw_cast) || surface_format_cast_enqueueable(face.surface->guest.colorFormat,
                         base_format,upload.swizzle_format);
                 });
             id<MTLCommandBuffer> snapshot_commands=nil;
@@ -2956,30 +4565,32 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     return face.surface->color==ctx.impl->color;
                 })) {
                     if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
-                    impl->caster->expand_multisample(ctx.impl->render_color,ctx.impl->color,
-                        ctx.impl->sample_scale,ctx.impl->guest_color.width,ctx.impl->guest_color.height,
-                        snapshot_commands);
+                    expand_color_samples(ctx,*impl->caster,snapshot_commands);
                 }
             } else finish(ctx);
             if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+            if (raw_cast) {
+                uploaded=impl->caster->raw_texture_snapshot(base_image,snapshot_commands);
+                require(uploaded!=nil,"Metal: mip/cube raw surface carrier failed");
+            }
             std::vector<CubeSurface> sources;
             for (const auto &face:rendered) {
-                auto native=face.surface->color;
+                auto native=face.cast || raw_cast ? raw_surface_color(*face.surface) : face.surface->color;
                 const SceGxmColorFormat *format=&face.surface->guest.colorFormat;
                 std::optional<SceGxmColorFormat> repacked_color;
-                if (face.cast) {
+                if (face.cast || raw_cast) {
                     native=impl->caster->surface_format_cast(native,*format,base_format,upload.swizzle_format,
-                        snapshot_commands);
+                        snapshot_commands,raw_cast);
                     require(native!=nil,"Metal: incompatible rendered texture format cast");
                     repacked_color=repacked_u2_color(gxm::get_format(texture));
                     format=repacked_color ? &*repacked_color : nullptr;
                 }
-                if (native.pixelFormat==MTLPixelFormatRGBA8Unorm_sRGB || texture.gamma_mode) {
+                if (!raw_cast && (native.pixelFormat==MTLPixelFormatRGBA8Unorm_sRGB || texture.gamma_mode)) {
                     native=impl->caster->rgba8_surface_sampling(native,
                         format?*format:SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR,texture.gamma_mode,
                         snapshot_commands);format=nullptr;
                 }
-                sources.push_back({sampling_view(native,gxm::get_format(texture),format),face.face,face.mip});
+                sources.push_back({raw_cast ? native : sampling_view(native,gxm::get_format(texture),format),face.face,face.mip});
             }
             prepared_images[index]=impl->caster->texture_snapshot(uploaded,sources,scale,snapshot_commands);
             if (impl->rendered_images.size()>=4) impl->rendered_images.erase(impl->rendered_images.begin());
@@ -3002,9 +4613,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             prepare_inline_commands();
             if (ctx.impl->expanded_color && !inline_color_expanded) {
                 if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
-                impl->caster->expand_multisample(ctx.impl->render_color,ctx.impl->color,
-                    ctx.impl->sample_scale,ctx.impl->guest_color.width,ctx.impl->guest_color.height,
-                    ctx.impl->commands);
+                expand_color_samples(ctx,*impl->caster,ctx.impl->commands);
                 inline_color_expanded=true;
             }
         };
@@ -3013,7 +4622,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         for (uint32_t index=0;index<SCE_GXM_MAX_TEXTURE_UNITS*2;++index) {
             const bool vertex=index>=SCE_GXM_MAX_TEXTURE_UNITS;
             if (!vertex && !fragment_resources) continue;
-            const auto &program=vertex?static_cast<const ShaderProgram &>(*vp->renderer_data):static_cast<const ShaderProgram &>(*fp->renderer_data);
+            const auto &program=vertex?static_cast<const ShaderProgram &>(*vp->vertex_program):static_cast<const ShaderProgram &>(*fp->fragment_program);
             if (!program.textures_used[index%SCE_GXM_MAX_TEXTURE_UNITS]) continue;
             if (prepared_images[index]) continue;
             const auto &texture=ctx.textures[index]; auto found=find_subrectangle(texture);
@@ -3024,11 +4633,49 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             const auto texture_base=gxm::get_base_format(gxm::get_format(texture));
             const bool gpu_cast=!same_format && !texture.gamma_mode
                 && surface_format_cast_enqueueable(entry.guest.colorFormat,texture_base,texture.swizzle_format);
+            const bool raw_cast=surface_raw_cast_required(entry.guest.colorFormat,texture_base);
+            if (surface_texture_needs_native_resolution(entry.guest.colorFormat, texture,
+                    res_multiplier, features.use_texture_viewport)
+                && (same_format || surface_format_cast_enqueueable(entry.guest.colorFormat,
+                    texture_base, texture.swizzle_format))) {
+                // Restore the guest texel grid for small point-filtered data
+                // textures at fractional resolution, as in Plus' cast path.
+                // Do not publish through RAM: recent GPU owners can coexist
+                // with newer CPU bytes that this texture reader must preserve.
+                if (capture_draw) {
+                    finish(ctx, false, true);
+                    inline_color_expanded = false;
+                } else if (entry.color == ctx.impl->color) prepare_inline_color();
+                else prepare_inline_commands();
+                if (!impl->caster) impl->caster = std::make_unique<SurfaceCaster>(*impl->device);
+                auto source = same_format ? entry.color : raw_surface_color(entry);
+                const uint32_t x = std::min<uint32_t>(uint32_t(rect.x * double(res_multiplier)), source.width - 1);
+                const uint32_t y = std::min<uint32_t>(uint32_t(rect.y * double(res_multiplier)), source.height - 1);
+                const uint32_t w = std::min<uint32_t>(std::max(1u, uint32_t(rect.width * double(res_multiplier))), source.width - x);
+                const uint32_t h = std::min<uint32_t>(std::max(1u, uint32_t(rect.height * double(res_multiplier))), source.height - y);
+                const auto commands = capture_draw ? nil : ctx.impl->commands;
+                auto native = impl->caster->resample_publication(source, rect.width, rect.height,
+                    {x, y, w, h}, {0, 0, rect.width, rect.height}, !same_format, commands);
+                std::optional<SceGxmColorFormat> format = entry.guest.colorFormat;
+                if (!same_format) {
+                    native = impl->caster->surface_format_cast(native, entry.guest.colorFormat,
+                        texture_base, texture.swizzle_format, commands);
+                    require(native != nil, "Metal: native-resolution texture reinterpretation failed");
+                    format = repacked_u2_color(gxm::get_format(texture));
+                }
+                if (native.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB || texture.gamma_mode) {
+                    native = impl->caster->rgba8_surface_sampling(native,
+                        format ? *format : SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR, texture.gamma_mode, commands);
+                    format.reset();
+                }
+                prepared_images[index] = sampling_view(native, gxm::get_format(texture), format ? &*format : nullptr);
+                continue;
+            }
             if (!cropped) {
-                if (gpu_cast && entry.color!=ctx.impl->color && !capture_draw) {
+                if (gpu_cast && !raw_cast && entry.color!=ctx.impl->color && !capture_draw) {
                     prepare_inline_commands();
                     if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
-                    inline_cast_images[index]=impl->caster->surface_format_cast(entry.color,
+                    inline_cast_images[index]=impl->caster->surface_format_cast(raw_surface_color(entry),
                         entry.guest.colorFormat,texture_base,texture.swizzle_format,ctx.impl->commands);
                     require(inline_cast_images[index]!=nil,"Metal: queued inactive color format cast failed");
                 }
@@ -3043,22 +4690,22 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 if (inline_crops[index]) {
                     if (entry.color==ctx.impl->color) prepare_inline_color();
                     else prepare_inline_commands();
-                    image=impl->caster->enqueue_subrectangle(entry.color,entry.guest.width,entry.guest.height,
+                    image=impl->caster->enqueue_subrectangle(raw_surface_color(entry),entry.guest.width,entry.guest.height,
                         rect,ctx.impl->commands);
                 } else {
                     finish(ctx);
                     inline_color_expanded=false;
-                    image=impl->caster->color_subrectangle(entry.color,entry.guest,rect);
+                    image=impl->caster->color_subrectangle(raw_surface_color(entry),entry.guest,rect);
                 }
             }
-            if (inline_crops[index] && gpu_cast) {
+            if (inline_crops[index] && gpu_cast && !raw_cast) {
                 if (entry.color==ctx.impl->color) prepare_inline_color();
                 else prepare_inline_commands();
                 inline_cast_images[index]=impl->caster->surface_format_cast(image,
                     entry.guest.colorFormat,texture_base,texture.swizzle_format,ctx.impl->commands);
                 require(inline_cast_images[index]!=nil,"Metal: inline color crop format cast failed");
             }
-            if (inline_crops[index] && same_format
+            if (inline_crops[index] && same_format && !raw_cast
                 && (image.pixelFormat==MTLPixelFormatRGBA8Unorm_sRGB || texture.gamma_mode)) {
                 prepare_inline_color();
                 inline_gamma_images[index]=impl->caster->rgba8_surface_sampling(image,
@@ -3066,14 +4713,16 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             }
         }
         id<MTLTexture> color_feedback = nil;
+        id<MTLTexture> raw_color_feedback = nil;
         bool inline_feedback=false;
-        if (ctx.impl->color && !record.is_maskupdate) {
+        if (ctx.impl->color && !record.is_maskupdate
+            && find_texture_surface(ctx.impl->guest_color.data.address()) != impl->surfaces.end()) {
             bool needs_feedback=false;
             inline_feedback=!capture_draw;
             for (uint32_t index=0;index<SCE_GXM_MAX_TEXTURE_UNITS*2;++index) {
                 const bool vertex=index>=SCE_GXM_MAX_TEXTURE_UNITS;
                 if (!vertex && !fragment_resources) continue;
-                const auto &program=vertex?static_cast<const ShaderProgram &>(*vp->renderer_data):static_cast<const ShaderProgram &>(*fp->renderer_data);
+                const auto &program=vertex?static_cast<const ShaderProgram &>(*vp->vertex_program):static_cast<const ShaderProgram &>(*fp->fragment_program);
                 if (!program.textures_used[index%SCE_GXM_MAX_TEXTURE_UNITS]) continue;
                 if (prepared_images[index]) continue;
                 const auto &texture=ctx.textures[index];
@@ -3105,10 +4754,14 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
                 color_feedback=impl->caster->color_snapshot(ctx.impl->color,
                     inline_feedback ? ctx.impl->commands : nil);
+                if (const auto active=impl->surfaces.find(ctx.impl->guest_color.data.address());
+                    active!=impl->surfaces.end() && active->second.raw_color && !active->second.raw_color_invalidated)
+                    raw_color_feedback=impl->caster->color_snapshot(active->second.raw_color,
+                        inline_feedback ? ctx.impl->commands : nil);
                 if (inline_feedback) for (uint32_t index=0;index<SCE_GXM_MAX_TEXTURE_UNITS*2;++index) {
                     const bool vertex=index>=SCE_GXM_MAX_TEXTURE_UNITS;
                     if (!vertex && !fragment_resources) continue;
-                    const auto &program=vertex?static_cast<const ShaderProgram &>(*vp->renderer_data):static_cast<const ShaderProgram &>(*fp->renderer_data);
+                    const auto &program=vertex?static_cast<const ShaderProgram &>(*vp->vertex_program):static_cast<const ShaderProgram &>(*fp->fragment_program);
                     if (!program.textures_used[index%SCE_GXM_MAX_TEXTURE_UNITS] || prepared_images[index]) continue;
                     const auto &texture=ctx.textures[index];
                     const Address address=texture.data_addr<<2;
@@ -3121,28 +4774,69 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                         require(active!=impl->surfaces.end() && rg32_linear_alias(active->second,texture,address),
                             "Metal: active RG32 alias lost its validated row layout");
                         const bool signed_normalized=base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8;
+                        const bool separate_word = res_multiplier != 1 && active->second.has_word_offset_view;
                         inline_rg32_images[index]=impl->caster->rgba8_from_rg32(color_feedback,
                             (active->second.guest.colorFormat & SCE_GXM_COLOR_SWIZZLE_MASK)==SCE_GXM_COLOR_SWIZZLE2_RG,
                             (address-ctx.impl->guest_color.data.address())/4,signed_normalized,
-                            res_multiplier<1 ? active->second.guest.width : 0,
-                            res_multiplier<1 ? active->second.guest.height : 0,ctx.impl->commands);
+                            res_multiplier<1 && !separate_word && vertex ? active->second.guest.width : 0,
+                            res_multiplier<1 && !separate_word && vertex ? active->second.guest.height : 0,
+                            ctx.impl->commands, separate_word);
                         continue;
                     }
                     const bool same_format=surface_texture_format_matches(
                         ctx.impl->guest_color.colorFormat,gxm::get_format(texture));
                     if (address==ctx.impl->guest_color.data.address() && !same_format
+                        && !surface_raw_cast_required(ctx.impl->guest_color.colorFormat,base)
                         && surface_format_cast_enqueueable(ctx.impl->guest_color.colorFormat,base,texture.swizzle_format)) {
-                        inline_cast_images[index]=impl->caster->surface_format_cast(color_feedback,
+                        inline_cast_images[index]=impl->caster->surface_format_cast(raw_color_feedback ? raw_color_feedback : color_feedback,
                             ctx.impl->guest_color.colorFormat,base,texture.swizzle_format,ctx.impl->commands);
                         require(inline_cast_images[index]!=nil,"Metal: inline color feedback format cast failed");
                         continue;
                     }
                     if ((texture.data_addr<<2)!=ctx.impl->guest_color.data.address()
+                        || surface_raw_cast_required(ctx.impl->guest_color.colorFormat,base)
                         || (color_feedback.pixelFormat!=MTLPixelFormatRGBA8Unorm_sRGB && !texture.gamma_mode)) continue;
                     inline_gamma_images[index]=impl->caster->rgba8_surface_sampling(color_feedback,
                         ctx.impl->guest_color.colorFormat,texture.gamma_mode,ctx.impl->commands);
                 }
             }
+        }
+        // Carry direct 64-bit float aliases through normalized halfwords. A
+        // bit-exact copy alone is insufficient: sampling an RG32Float view
+        // can canonicalize NaN payloads before the guest sees its two words.
+        for (uint32_t index=0;index<SCE_GXM_MAX_TEXTURE_UNITS*2;++index) {
+            const bool vertex=index>=SCE_GXM_MAX_TEXTURE_UNITS;
+            if ((!vertex && !fragment_resources) || prepared_images[index]) continue;
+            const auto &program=vertex?static_cast<const ShaderProgram &>(*vp->vertex_program):static_cast<const ShaderProgram &>(*fp->fragment_program);
+            if (!program.textures_used[index%SCE_GXM_MAX_TEXTURE_UNITS]) continue;
+            const auto &texture=ctx.textures[index];
+            auto found=find_subrectangle(texture);
+            if (found==impl->surfaces.end() && surface_viewports[index])
+                found=find_texture_surface(texture.data_addr<<2);
+            if (found==impl->surfaces.end()) continue;
+            auto &entry=found->second;
+            const auto base=gxm::get_base_format(gxm::get_format(texture));
+            if (!surface_raw_cast_required(entry.guest.colorFormat,base)
+                || !surface_format_cast_enqueueable(entry.guest.colorFormat,base,texture.swizzle_format)) continue;
+            const auto rect=surface_subrectangle(entry.guest,texture);
+            const bool cropped=rect && (rect->x || rect->y || rect->width!=entry.guest.width || rect->height!=entry.guest.height);
+            auto source=raw_surface_color(entry);
+            if (cropped) {
+                const auto crop=entry.subrectangles.find({rect->x,rect->y,rect->width,rect->height});
+                require(crop!=entry.subrectangles.end() && crop->second!=nil,"Metal: raw surface crop was not prepared");
+                source=crop->second;
+            } else if (entry.color==ctx.impl->color) {
+                require(color_feedback!=nil,"Metal: raw surface feedback was not prepared");
+                source=raw_color_feedback ? raw_color_feedback : color_feedback;
+            }
+            if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+            if (!capture_draw) prepare_inline_commands();
+            else finish(ctx);
+            inline_cast_images[index]=impl->caster->surface_format_cast(source,entry.guest.colorFormat,
+                base,texture.swizzle_format,capture_draw ? nil : ctx.impl->commands,true);
+            require(inline_cast_images[index]!=nil,"Metal: raw surface carrier creation failed");
+            inline_gamma_images[index]=nil;
+            texture_mip_info[index].control[3]=1;
         }
         // Publish an active depth producer before a draw samples it. A
         // depth alias and its crops can follow the render pass in the same
@@ -3154,13 +4848,16 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             for (uint32_t index=0;index<SCE_GXM_MAX_TEXTURE_UNITS*2;++index) {
                 const bool vertex=index>=SCE_GXM_MAX_TEXTURE_UNITS;
                 if(!vertex && !fragment_resources) continue;
-                const auto &program=vertex?static_cast<const ShaderProgram &>(*vp->renderer_data):static_cast<const ShaderProgram &>(*fp->renderer_data);
+                const auto &program=vertex?static_cast<const ShaderProgram &>(*vp->vertex_program):static_cast<const ShaderProgram &>(*fp->fragment_program);
                 if(prepared_images[index] || !program.textures_used[index%SCE_GXM_MAX_TEXTURE_UNITS]
-                    || found==impl->depth_surfaces.end()) continue;
+                    || found==impl->depth_surfaces.end() || found->second.texture!=ctx.impl->depth) continue;
                 const auto base=gxm::get_base_format(gxm::get_format(ctx.textures[index]));
                 if (base!=SCE_GXM_TEXTURE_BASE_FORMAT_U8 && base!=SCE_GXM_TEXTURE_BASE_FORMAT_S8
                     && base!=SCE_GXM_TEXTURE_BASE_FORMAT_X8U24 && base!=SCE_GXM_TEXTURE_BASE_FORMAT_F32
-                    && base!=SCE_GXM_TEXTURE_BASE_FORMAT_F32M && base!=SCE_GXM_TEXTURE_BASE_FORMAT_U16) continue;
+                    && base!=SCE_GXM_TEXTURE_BASE_FORMAT_F32M && base!=SCE_GXM_TEXTURE_BASE_FORMAT_U16
+                    && base!=SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8) continue;
+                if (base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
+                    && impl->frame_timestamp-found->second.last_attached_frame>2) continue;
                 const auto rect=depth_subrectangle(found->second.guest,found->second.width,found->second.height,
                     found->second.multisample,ctx.textures[index]);
                 if (!rect) continue;
@@ -3190,7 +4887,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     const uint32_t guest_height=found->second.height
                         *(found->second.multisample==SCE_GXM_MULTISAMPLE_NONE ? 1 : 2);
                     for (const auto base:sampled_bases) {
-                        found->second.snapshots[base] = base==SCE_GXM_TEXTURE_BASE_FORMAT_U8
+                        found->second.snapshots[base] = base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
+                            ? impl->caster->packed_depth_snapshot(found->second.texture,false,ctx.impl->commands)
+                            : base==SCE_GXM_TEXTURE_BASE_FORMAT_U8
                             || base==SCE_GXM_TEXTURE_BASE_FORMAT_S8
                             ? impl->caster->stencil_snapshot(found->second.texture,
                                 base==SCE_GXM_TEXTURE_BASE_FORMAT_S8,res_multiplier,
@@ -3222,17 +4921,22 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             for (uint32_t index=0;index<SCE_GXM_MAX_TEXTURE_UNITS*2;++index) {
                 const bool vertex=index>=SCE_GXM_MAX_TEXTURE_UNITS;
                 if (!vertex && !fragment_resources) continue;
-                const auto &program=vertex?static_cast<const ShaderProgram &>(*vp->renderer_data)
-                    : static_cast<const ShaderProgram &>(*fp->renderer_data);
+                const auto &program=vertex?static_cast<const ShaderProgram &>(*vp->vertex_program)
+                    : static_cast<const ShaderProgram &>(*fp->fragment_program);
                 if (prepared_images[index] || !program.textures_used[index%SCE_GXM_MAX_TEXTURE_UNITS]) continue;
                 const auto &texture=ctx.textures[index];
                 const auto base=gxm::get_base_format(gxm::get_format(texture));
                 if (base!=SCE_GXM_TEXTURE_BASE_FORMAT_U8 && base!=SCE_GXM_TEXTURE_BASE_FORMAT_S8
                     && base!=SCE_GXM_TEXTURE_BASE_FORMAT_X8U24 && base!=SCE_GXM_TEXTURE_BASE_FORMAT_F32
-                    && base!=SCE_GXM_TEXTURE_BASE_FORMAT_F32M && base!=SCE_GXM_TEXTURE_BASE_FORMAT_U16) continue;
-                if (impl->surfaces.contains(texture.data_addr<<2)
+                    && base!=SCE_GXM_TEXTURE_BASE_FORMAT_F32M && base!=SCE_GXM_TEXTURE_BASE_FORMAT_U16
+                    && base!=SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8) continue;
+                if (find_texture_surface(texture.data_addr<<2)!=impl->surfaces.end()
                     || find_subrectangle(texture)!=impl->surfaces.end()) continue;
                 for (auto &[key,entry]:impl->depth_surfaces) {
+                    // Color textures frequently reuse old depth allocations.
+                    // Match Plus's two-frame window only for packed color aliases.
+                    if (base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
+                        && impl->frame_timestamp-entry.last_attached_frame>2) continue;
                     const auto rect=depth_subrectangle(entry.guest,entry.width,entry.height,
                         entry.multisample,texture);
                     if (!rect) continue;
@@ -3253,7 +4957,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                         ctx.impl->commands=scene_command_buffer(*impl->device);
                     if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
                     if (!snapshot) {
-                        snapshot=base==SCE_GXM_TEXTURE_BASE_FORMAT_U8
+                        snapshot=base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
+                            ? impl->caster->packed_depth_snapshot(entry.texture,false,ctx.impl->commands)
+                            : base==SCE_GXM_TEXTURE_BASE_FORMAT_U8
                             || base==SCE_GXM_TEXTURE_BASE_FORMAT_S8
                             ? impl->caster->stencil_snapshot(entry.texture,
                                 base==SCE_GXM_TEXTURE_BASE_FORMAT_S8,res_multiplier,
@@ -3282,6 +4988,13 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     ctx.impl->expanded_color ? surface.guest.height : 0);
                 surface.multisample_dirty=false;
             }
+            if (ctx.impl->raw_render_color && surface.raw_multisample_dirty) {
+                if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+                if (!ctx.impl->commands) ctx.impl->commands=scene_command_buffer(*impl->device);
+                impl->caster->seed_multisample(surface.raw_color,ctx.impl->raw_render_color,
+                    ctx.impl->sample_scale,true,surface.guest.width,surface.guest.height,ctx.impl->commands);
+                surface.raw_multisample_dirty=false;
+            }
         }
         if (!ctx.impl->encoder) {
             if (!ctx.impl->commands)
@@ -3300,12 +5013,14 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             std::filesystem::create_directories(draw_capture_dir);
             draw_metadata.open(draw_capture_dir/"draw.txt");
             texture_metadata.open(draw_capture_dir/"textures.txt");
-            texture_metadata << "version 2\n";
+            texture_metadata << "version 3\n";
             draw_metadata.precision(17);
-            draw_metadata << "version 1\nscale " << res_multiplier << "\nsize " << ctx.impl->width << ' ' << ctx.impl->height
-                          << "\nfragment " << hex_string(fp->renderer_data->hash)
-                          << "\nvertex " << hex_string(vp->renderer_data->hash)
+            draw_metadata << "version 2\nscale " << res_multiplier << "\nsize " << ctx.impl->width << ' ' << ctx.impl->height
+                          << "\nfragment " << hex_string(fp->fragment_program->hash)
+                          << "\nvertex " << hex_string(vp->vertex_program->hash)
                           << "\noutput_register_size " << record.color_surface.outputRegisterSize << '\n';
+            if (ctx.shader_hints.metal_raw_color_attachment)
+                draw_metadata << "raw_color_attachment 1\n";
             std::ofstream attachment_info(draw_capture_dir/"attachments.txt",std::ios::app);
             attachment_info << "target " << ctx.impl->guest_color.data.address() << " recorded " << record.color_surface.data.address()
                 << " same_native " << (ctx.impl->color == ctx.impl->render_color) << '\n';
@@ -3316,23 +5031,25 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 << " writing " << record.writing_mask << '\n';
             auto shader_features = features;
             shader_features.enable_memory_mapping = true;
-            auto msl = shader::metal::convert_gxp(*vp->program.get(mem), hex_string(vp->renderer_data->hash), shader_features, ctx.shader_hints, false);
+            auto msl = shader::metal::convert_gxp(*vp->program(), hex_string(vp->vertex_program->hash), shader_features, ctx.shader_hints, false);
             dump_bytes("vertex.metal", msl.source.data(), msl.source.size());
-            const auto *vertex_gxp = vp->program.get(mem), *fragment_gxp = fp->program.get(mem);
+            const auto *vertex_gxp = vp->program(), *fragment_gxp = fp->program();
             dump_bytes("vertex.gxp", vertex_gxp, vertex_gxp->size);
             dump_bytes("fragment.gxp", fragment_gxp, fragment_gxp->size);
             auto fragment_msl = fragment_disabled ? depth_only_program(ctx.impl->samples)
-                : shader::metal::convert_gxp(*fragment_gxp, hex_string(fp->renderer_data->hash),
+                : shader::metal::convert_gxp(*fragment_gxp, hex_string(fp->fragment_program->hash),
                     shader_features, ctx.shader_hints, record.is_maskupdate);
             dump_bytes("fragment.metal", fragment_msl.source.data(), fragment_msl.source.size());
             draw_metadata << "entry " << msl.entry_point << '\n';
             for (uint32_t slot=0;slot<SCE_GXM_MAX_TEXTURE_UNITS;++slot)
-                if (vp->renderer_data->textures_used[slot]) draw_metadata << "vertex_texture " << slot << '\n';
+                if (vp->vertex_program->textures_used[slot]) draw_metadata << "vertex_texture " << slot << '\n';
         }
         struct VertexAttributeLayout {
             MTLVertexFormat format = MTLVertexFormatInvalid;
             NSUInteger offset = 0;
             NSUInteger buffer_index = 0;
+            size_t source_offset = 0;
+            size_t byte_size = 0;
         };
         struct VertexStreamLayout {
             NSUInteger stride = 0;
@@ -3346,24 +5063,16 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             + 2 * vp->streams.size() + 12));
         uint32_t streams_used = 0;
         std::array<uint32_t, SCE_GXM_MAX_VERTEX_STREAMS> stream_extents{};
+        std::array<bool, SCE_GXM_MAX_VERTEX_STREAMS> repack_stream{};
         for (const auto &a : vp->attributes) {
-            auto it = vp->renderer_data->attribute_infos.find(a.regIndex);
-            if (it == vp->renderer_data->attribute_infos.end()) continue;
+            auto it = vp->vertex_program->attribute_infos.find(a.regIndex);
+            if (it == vp->vertex_program->attribute_infos.end()) continue;
             const auto &info = it->second;
-            uint32_t components = a.componentCount;
-            auto f = a.format;
-            if (info.regformat) {
-                // Match the packed array of uint4 inputs emitted by the shader
-                // recompiler for matrices and other register-format arrays.
-                components = info.component_count * info.array_size;
-                switch (info.gxm_type) {
-                case SCE_GXM_PARAMETER_TYPE_U8: case SCE_GXM_PARAMETER_TYPE_S8: f = SCE_GXM_ATTRIBUTE_FORMAT_U8; break;
-                case SCE_GXM_PARAMETER_TYPE_C10: f = SCE_GXM_ATTRIBUTE_FORMAT_U8; components = (components * 10 + 7) / 8; break;
-                case SCE_GXM_PARAMETER_TYPE_U16: case SCE_GXM_PARAMETER_TYPE_S16: case SCE_GXM_PARAMETER_TYPE_F16: f = SCE_GXM_ATTRIBUTE_FORMAT_U16; break;
-                default: f = SCE_GXM_ATTRIBUTE_FORMAT_UNTYPED; break;
-                }
-            }
-            const uint32_t element_size = gxm::attribute_format_size(f);
+            const auto shape = vertex_attribute_shape(a, info);
+            require(shape.has_value(), "Metal: invalid vertex attribute shape");
+            const auto components = shape->components;
+            const auto f = shape->format;
+            const auto element_size = shape->component_size;
             require(a.streamIndex < vp->streams.size() && a.streamIndex < SCE_GXM_MAX_VERTEX_STREAMS, "Metal: invalid vertex stream");
             stream_extents[a.streamIndex] = std::max(stream_extents[a.streamIndex], uint32_t(a.offset + components * element_size));
             for (uint32_t element = 0; element < (components + 3) / 4; ++element) {
@@ -3374,10 +5083,17 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 attribute.format = attribute_format(f, n, !info.regformat && info.is_signed);
                 attribute.offset = a.offset + 4 * element * element_size;
                 attribute.buffer_index = shader::metal::VERTEX_STREAM_BUFFER_BASE + a.streamIndex;
+                attribute.source_offset = attribute.offset;
+                attribute.byte_size = n * element_size;
+                const size_t stride = vp->streams[a.streamIndex].stride;
+                // Whole-stride padding cannot preserve attributes that cross
+                // a record boundary. Metal also needs each fetched attribute
+                // to fit the native record and its offset to be aligned.
+                repack_stream[a.streamIndex] = repack_stream[a.streamIndex]
+                    || attribute.offset % 4 != 0
+                    || (stride && attribute.offset + attribute.byte_size > stride);
                 append(key, location); append(key, attribute.format);
                 append(key, attribute.offset); append(key, a.streamIndex);
-                if (capture_draw) draw_metadata << "attribute " << location << ' ' << attribute.format
-                    << ' ' << attribute.offset << ' ' << attribute.buffer_index << '\n';
             }
             streams_used |= 1u << a.streamIndex;
         }
@@ -3390,14 +5106,47 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 : gxm::is_stream_instancing(static_cast<SceGxmIndexSource>(vp->streams[stream].indexSource))
                     ? MTLVertexStepFunctionPerInstance : MTLVertexStepFunctionPerVertex;
             binding.step_rate = stride ? 1 : 0;
+            if (repack_stream[stream]) {
+                size_t offset = 0;
+                for (auto &attribute : vertex_attributes) {
+                    if (attribute.format == MTLVertexFormatInvalid
+                        || attribute.buffer_index != shader::metal::VERTEX_STREAM_BUFFER_BASE + stream)
+                        continue;
+                    attribute.offset = offset;
+                    offset = (offset + attribute.byte_size + 3) & ~size_t(3);
+                }
+                binding.stride = offset;
+            }
+            // Include the layout policy so old cached descriptors cannot be
+            // reused when a relocated attribute happens to keep the same stride.
+            append(key, repack_stream[stream] ? 1 : 0);
             append(key, binding.stride); append(key, binding.step_function);
             if (capture_draw) draw_metadata << "layout " << shader::metal::VERTEX_STREAM_BUFFER_BASE+stream << ' '
                 << binding.stride << ' ' << binding.step_function << ' ' << binding.step_rate << '\n';
         }
+        if (capture_draw) {
+            for (uint32_t location = 0; location < vertex_attributes.size(); ++location) {
+                const auto &attribute = vertex_attributes[location];
+                if (attribute.format != MTLVertexFormatInvalid)
+                    draw_metadata << "attribute " << location << ' ' << attribute.format
+                        << ' ' << attribute.offset << ' ' << attribute.buffer_index << '\n';
+            }
+        }
         SceGxmBlendInfo mask_blend{};
         mask_blend.colorMask = SCE_GXM_COLOR_MASK_ALL;
-        const auto blend = fragment_disabled ? SceGxmBlendInfo{}
-            : record.is_maskupdate ? mask_blend : static_cast<MetalFragmentProgram &>(*fp->renderer_data).blend;
+        auto blend = fragment_color_disabled ? SceGxmBlendInfo{}
+            : record.is_maskupdate ? mask_blend : static_cast<const MetalFragmentProgram &>(*fp->fragment_program).blend;
+        // Metal enables blending for the whole attachment. An independently
+        // disabled channel group must still replace its destination. Normalize
+        // before constructing either pipeline key so cached descriptors agree.
+        if (blend.colorFunc == SCE_GXM_BLEND_FUNC_NONE) {
+            blend.colorSrc = SCE_GXM_BLEND_FACTOR_ONE;
+            blend.colorDst = SCE_GXM_BLEND_FACTOR_ZERO;
+        }
+        if (blend.alphaFunc == SCE_GXM_BLEND_FUNC_NONE) {
+            blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
+            blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
+        }
         id<MTLTexture> attachment = record.is_maskupdate ? ctx.impl->mask : ctx.impl->render_color;
         const auto target_base=gxm::get_base_format(record.color_surface.colorFormat);
         const bool rgb_target=!record.is_maskupdate && (target_base==SCE_GXM_COLOR_BASE_FORMAT_U8U8U8
@@ -3414,6 +5163,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 || target_base == SCE_GXM_COLOR_BASE_FORMAT_S5S5U6
                 || target_base == SCE_GXM_COLOR_BASE_FORMAT_U8S8S8U8);
         append(key, attachment ? attachment.pixelFormat : MTLPixelFormatInvalid);
+        append(key, !record.is_maskupdate && bool(ctx.impl->raw_attachment));
         append(key, rgb_target);
         append(key, alpha_target);
         append(key, green_target);
@@ -3438,15 +5188,38 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             }
             return layout;
         };
+        const auto compile_pipeline_once = [&](const std::string &pipeline_key, MTLRenderPipelineDescriptor *descriptor) -> id<MTLRenderPipelineState> {
+            if (impl->failed_pipelines.contains(pipeline_key)) return nil;
+            try {
+                auto result = impl->device->create_pipeline(descriptor, error);
+                if (result) return result;
+            } catch (const std::exception &failure) {
+                error = failure.what();
+            }
+            remember_failure(impl->failed_pipelines, pipeline_key, "pipeline", error);
+            return nil;
+        };
+        if (impl->failed_pipelines.contains(key)) return;
         auto &pipeline = impl->pipelines[key];
         if (!pipeline) {
             if (auto pending = impl->compiling_pipelines.find(key); pending != impl->compiling_pipelines.end()) {
                 if (impl->async_compilation.load(std::memory_order_relaxed)
                     && pending->second.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
                     return;
-                auto result = pending->second.get();
+                // Remove the future before get(): an exception must not leave
+                // an invalid future that is polled again on every draw.
+                auto future = std::move(pending->second);
                 impl->compiling_pipelines.erase(pending);
-                require(result.pipeline != nil, result.error);
+                Impl::PipelineResult result;
+                try {
+                    result = future.get();
+                } catch (const std::exception &failure) {
+                    result.error = failure.what();
+                }
+                if (!result.pipeline) {
+                    remember_failure(impl->failed_pipelines, key, "pipeline", result.error);
+                    return;
+                }
                 pipeline = result.pipeline;
             }
         }
@@ -3498,6 +5271,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 color.blendingEnabled = NO;
                 color.writeMask = MTLColorWriteMaskAll;
             }
+            configure_raw_attachment(desc,record.is_maskupdate ? nil : ctx.impl->raw_attachment,color.writeMask);
             if (!impl->dump_pipeline_dir.empty() && impl->dumped_pipelines < 4096) {
                 // Metal can abort inside descriptor validation before returning
                 // NSError. Close every diagnostic file BEFORE calling it.
@@ -3509,9 +5283,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                         file.write(reinterpret_cast<const char *>(gxp),gxp->size);
                         if (!file) throw std::runtime_error("Cannot save pipeline GXP");
                     };
-                    write_gxp("vertex.gxp",vp->program.get(mem)); write_gxp("fragment.gxp",fp->program.get(mem));
+                    write_gxp("vertex.gxp",vp->program()); write_gxp("fragment.gxp",fp->program());
                     std::ofstream meta(dir/"pipeline.txt");
-                    meta<<"vertex "<<hex_string(vp->renderer_data->hash)<<"\nfragment "<<hex_string(fp->renderer_data->hash)
+                    meta<<"vertex "<<hex_string(vp->vertex_program->hash)<<"\nfragment "<<hex_string(fp->fragment_program->hash)
                         <<"\ncolor "<<uint32_t(record.color_surface.colorFormat)<<"\nsamples "<<desc.rasterSampleCount
                         <<"\nnative_color "<<color.pixelFormat<<"\nnative_depth "<<desc.depthAttachmentPixelFormat
                         <<"\nnative_stencil "<<desc.stencilAttachmentPixelFormat<<'\n';
@@ -3536,23 +5310,34 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 && !routed_geometry && (count > 6 || instances > 1) && impl->compiling_pipelines.size() < 2) {
                 MTLRenderPipelineDescriptor *owned_descriptor = [desc copy];
                 Device *device = impl->device.get();
-                const std::string fragment_hash=hex_string(fp->renderer_data->hash);
-                const std::string vertex_hash=hex_string(vp->renderer_data->hash);
+                const std::string fragment_hash=hex_string(fp->fragment_program->hash);
+                const std::string vertex_hash=hex_string(vp->vertex_program->hash);
                 impl->compiling_pipelines.emplace(key, std::async(std::launch::async,
                     [device, owned_descriptor, fragment_hash, vertex_hash, key, vertex_key, fragment_key]() -> Impl::PipelineResult {
                         @autoreleasepool {
                             Impl::PipelineResult result;
                             result.pipeline = device->create_pipeline(owned_descriptor, result.error);
-                            if (result.pipeline) device->store_cached_pipeline_template(fragment_hash,vertex_hash,
-                                key,vertex_key,fragment_key,owned_descriptor);
+                            if (result.pipeline) {
+                                try {
+                                    device->store_cached_pipeline_template(fragment_hash,vertex_hash,
+                                        key,vertex_key,fragment_key,owned_descriptor);
+                                } catch (const std::exception &failure) {
+                                    LOG_WARN("Metal: compiled pipeline could not be cached: {}", failure.what());
+                                }
+                            }
                             return result;
                         }
                     }));
                 return;
             }
-            pipeline = impl->device->create_pipeline(desc, error); require(pipeline != nil, error);
-            impl->device->store_cached_pipeline_template(hex_string(fp->renderer_data->hash),
-                hex_string(vp->renderer_data->hash),key,vertex_key,fragment_key,desc);
+            pipeline = compile_pipeline_once(key, desc);
+            if (!pipeline) return;
+            try {
+                impl->device->store_cached_pipeline_template(hex_string(fp->fragment_program->hash),
+                    hex_string(vp->vertex_program->hash),key,vertex_key,fragment_key,desc);
+            } catch (const std::exception &failure) {
+                LOG_WARN("Metal: compiled pipeline could not be cached: {}", failure.what());
+            }
         }
         id<MTLRenderCommandEncoder> encoder = ctx.impl->encoder;
         [encoder setRenderPipelineState:pipeline];
@@ -3568,7 +5353,102 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         // The two face draws must not execute a memory-writing GXP vertex
         // shader twice. Capture its outputs once, then split only the replay.
         const bool capture_split_faces = split_face_draw && vs.writes_guest_memory && !routed_geometry;
+        // Reject unavailable capture/replay variants before retaining upload slices.
+        id<MTLRenderPipelineState> point_capture_pipeline = nil;
+        id<MTLRenderPipelineState> point_replay_pipeline = nil;
+        if (routed_geometry || capture_split_faces) {
+            const bool compact_capture = compact_point_capture || capture_split_faces;
+            const std::string capture_suffix = compact_capture ? "-polygon-capture-compact" : "-polygon-capture";
+            const std::string capture_key = vertex_key + capture_suffix;
+            auto *capture_shader = compile_shader_once(capture_key, [&]() {
+                auto hints = ctx.shader_hints;
+                hints.metal_capture_vertex_outputs = true;
+                hints.metal_capture_vertex_outputs_compact = compact_capture;
+                auto shader_features = features;
+                shader_features.enable_memory_mapping = true;
+                auto source = shader::metal::convert_gxp(*vp->program(),
+                    hex_string(vp->vertex_program->hash), shader_features, hints);
+                return impl->device->compile(source, false, error);
+            });
+            if (!capture_shader) return;
+            const std::string replay_shader_key = "metal-point-replay-vertex";
+            auto *replay_shader = compile_shader_once(replay_shader_key, [&]() {
+                return impl->device->compile(shader::metal::point_replay_vertex_program(), false, error);
+            });
+            if (!replay_shader) return;
+            auto &cached_capture = impl->pipelines[key + capture_suffix];
+            if (!cached_capture) {
+                auto desc = [MTLRenderPipelineDescriptor new];
+                desc.vertexFunction = capture_shader->function;
+                desc.vertexDescriptor = make_vertex_layout();
+                desc.rasterSampleCount = ctx.impl->samples;
+                desc.depthAttachmentPixelFormat = desc.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+                desc.colorAttachments[0].pixelFormat = attachment.pixelFormat;
+                desc.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
+                configure_raw_attachment(desc,record.is_maskupdate ? nil : ctx.impl->raw_attachment,MTLColorWriteMaskNone);
+                cached_capture = compile_pipeline_once(key + capture_suffix, desc);
+                if (!cached_capture) return;
+            }
+            point_capture_pipeline = cached_capture;
+            auto &cached_replay = impl->pipelines[key + "-polygon-replay"];
+            if (!cached_replay) {
+                auto desc = [MTLRenderPipelineDescriptor new];
+                desc.vertexFunction = replay_shader->function;
+                desc.fragmentFunction = fs.function;
+                desc.rasterSampleCount = ctx.impl->samples;
+                desc.depthAttachmentPixelFormat = desc.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+                auto *color = desc.colorAttachments[0];
+                color.pixelFormat = attachment.pixelFormat;
+                color.writeMask = MTLColorWriteMaskNone;
+                if (blend.colorMask & SCE_GXM_COLOR_MASK_R) color.writeMask |= MTLColorWriteMaskRed;
+                if (blend.colorMask & SCE_GXM_COLOR_MASK_G) color.writeMask |= MTLColorWriteMaskGreen;
+                if (blend.colorMask & SCE_GXM_COLOR_MASK_B) color.writeMask |= MTLColorWriteMaskBlue;
+                if (!rgb_target && (blend.colorMask & SCE_GXM_COLOR_MASK_A)) color.writeMask |= MTLColorWriteMaskAlpha;
+                color.blendingEnabled = blend.colorFunc != SCE_GXM_BLEND_FUNC_NONE || blend.alphaFunc != SCE_GXM_BLEND_FUNC_NONE;
+                color.rgbBlendOperation = blend_op(blend.colorFunc); color.alphaBlendOperation = blend_op(blend.alphaFunc);
+                color.sourceRGBBlendFactor = blend_factor(blend.colorSrc); color.destinationRGBBlendFactor = blend_factor(blend.colorDst);
+                color.sourceAlphaBlendFactor = blend_factor(blend.alphaSrc); color.destinationAlphaBlendFactor = blend_factor(blend.alphaDst);
+                if (alpha_target) {
+                    color.writeMask = (blend.colorMask & SCE_GXM_COLOR_MASK_A) ? MTLColorWriteMaskRed : MTLColorWriteMaskNone;
+                    color.blendingEnabled = blend.alphaFunc != SCE_GXM_BLEND_FUNC_NONE;
+                    color.rgbBlendOperation = blend_op(blend.alphaFunc);
+                    const auto alpha_factor = [](SceGxmBlendFactor factor) {
+                        switch (factor) {
+                        case SCE_GXM_BLEND_FACTOR_DST_ALPHA: return MTLBlendFactorDestinationColor;
+                        case SCE_GXM_BLEND_FACTOR_ONE_MINUS_DST_ALPHA: return MTLBlendFactorOneMinusDestinationColor;
+                        case SCE_GXM_BLEND_FACTOR_DST_ALPHA_SATURATE: return MTLBlendFactorDestinationColor;
+                        case SCE_GXM_BLEND_FACTOR_SRC_ALPHA_SATURATE: return MTLBlendFactorOne;
+                        default: return blend_factor(factor);
+                        }
+                    };
+                    color.sourceRGBBlendFactor = alpha_factor(blend.alphaSrc);
+                    color.destinationRGBBlendFactor = alpha_factor(blend.alphaDst);
+                }
+                if (green_target)
+                    color.writeMask = (blend.colorMask & SCE_GXM_COLOR_MASK_G) ? MTLColorWriteMaskRed : MTLColorWriteMaskNone;
+                if (red_alpha_target) {
+                    if (ctx.shader_hints.metal_red_alpha_shader_blend) color.blendingEnabled = NO;
+                    color.writeMask = MTLColorWriteMaskNone;
+                    if (blend.colorMask & SCE_GXM_COLOR_MASK_R)
+                        color.writeMask |= MTLColorWriteMaskRed;
+                    if (blend.colorMask & SCE_GXM_COLOR_MASK_A)
+                        color.writeMask |= MTLColorWriteMaskGreen;
+                }
+                if (quantized_color_target) {
+                    color.blendingEnabled = NO;
+                    color.writeMask = MTLColorWriteMaskAll;
+                }
+                configure_raw_attachment(desc,record.is_maskupdate ? nil : ctx.impl->raw_attachment,color.writeMask);
+                cached_replay = compile_pipeline_once(key + "-polygon-replay", desc);
+                if (!cached_replay) return;
+            }
+            point_replay_pipeline = cached_replay;
+        }
         const bool back_depth = two_sided && cull_front;
+        // Raster depth derivatives shrink with internal upscaling. Keep the
+        // guest's slope bias constant in guest pixels, including replay draws.
+        const float front_depth_slope = float(record.depth_bias_slope) * res_multiplier;
+        const float back_depth_slope = float(record.back_depth_bias_slope) * res_multiplier;
         const auto depth_func = back_depth ? record.back_depth_func : record.front_depth_func;
         const auto depth_write_mode = back_depth ? record.back_depth_write_mode : record.front_depth_write_mode;
         using DepthKey = std::array<uint32_t, 16>;
@@ -3658,7 +5538,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         [encoder setDepthStencilState:front_depth_state];
         [encoder setStencilFrontReferenceValue:record.front_stencil_state_values.ref backReferenceValue:record.two_sided == SCE_GXM_TWO_SIDED_DISABLED ? record.front_stencil_state_values.ref : record.back_stencil_state_values.ref];
         [encoder setDepthBias:back_depth ? record.back_depth_bias_unit : record.depth_bias_unit
-            slopeScale:back_depth ? record.back_depth_bias_slope : record.depth_bias_slope clamp:0];
+            slopeScale:back_depth ? back_depth_slope : front_depth_slope clamp:0];
         // Use the same transformed front face as GL/Vulkan. Swapping both
         // winding and cull mode preserves which triangles disappear, but
         // reverses front_facing and the per-face fragment/stencil state.
@@ -3670,15 +5550,15 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         if (triangles && record.front_polygon_mode != SCE_GXM_POLYGON_MODE_TRIANGLE_FILL && !wireframe && !point_polygon)
             throw std::runtime_error(fmt::format("Metal: triangle polygon mode {:#x} requires conversion (primitive={:#x}, vertex={}, fragment={})",
                 uint32_t(record.front_polygon_mode), uint32_t(primitive),
-                hex_string(vp->renderer_data->hash), hex_string(fp->renderer_data->hash)));
+                hex_string(vp->vertex_program->hash), hex_string(fp->fragment_program->hash)));
         [encoder setTriangleFillMode:wireframe && !routed_wide_line ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
         const auto &v = ctx.viewport;
         MTLViewport viewport = record.viewport_flat ? MTLViewport{0, 0, double(ctx.impl->width), double(ctx.impl->height), 0, 1}
-            : MTLViewport{v[0] * res_multiplier, v[1] * res_multiplier, v[2] * res_multiplier, v[3] * res_multiplier, 0, 1};
+            : MTLViewport{v[0] * raster_scale, v[1] * raster_scale, v[2] * raster_scale, v[3] * raster_scale, 0, 1};
         [encoder setViewport:viewport];
         if (impl->trace_draws && impl->traced_draws.size() < 4096) {
             const auto detail = fmt::format("vertex={} fragment={} color={:#x} fmt={:#x} size={}x{} primitive={:#x} count={} instances={} mask={} viewport={},{},{},{} clips={} cull={} depth_enabled={} depth_func={} depth_write={} blend={},{},{},{},{},{} color_mask={:#x}",
-                hex_string(vp->renderer_data->hash), hex_string(fp->renderer_data->hash),
+                hex_string(vp->vertex_program->hash), hex_string(fp->fragment_program->hash),
                 uint32_t(record.color_surface.data.address()), uint32_t(record.color_surface.colorFormat),
                 ctx.impl->width, ctx.impl->height, uint32_t(primitive), count, instances, record.is_maskupdate,
                 viewport.originX, viewport.originY, viewport.width, viewport.height, clip.size(),
@@ -3689,7 +5569,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         }
         if (impl->trace_target_width == ctx.impl->width && impl->traced_target_draws < 10000) {
             const uint32_t sequence = impl->traced_target_draws++;
-            const bool has_source = fragment_resources && fp->renderer_data->textures_used[0];
+            const bool has_source = fragment_resources && fp->fragment_program->textures_used[0];
             const Address source = has_source ? ctx.textures[0].data_addr << 2 : 0;
             uint64_t source_hash = 0;
             bool source_hash_valid = false;
@@ -3704,10 +5584,11 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             }
             LOG_INFO("Metal target-width draw: seq={} target={:#x} size={}x{} fs={} source0={:#x} source_hash_valid={} source_hash={:#x}",
                 sequence, ctx.impl->guest_color.data.address(), ctx.impl->width, ctx.impl->height,
-                hex_string(fp->renderer_data->hash), source, source_hash_valid, source_hash);
+                hex_string(fp->fragment_program->hash), source, source_hash_valid, source_hash);
         }
         if (capture_draw) draw_metadata << "viewport " << viewport.originX << ' ' << viewport.originY << ' '
-            << viewport.width << ' ' << viewport.height << ' ' << viewport.znear << ' ' << viewport.zfar << '\n';
+            << viewport.width << ' ' << viewport.height << ' ' << viewport.znear << ' ' << viewport.zfar << '\n'
+            << "depth_clamp 1\nfar_clip " << ctx.shader_hints.metal_far_clip << '\n';
         // MSL constant structures round their size to the largest member alignment.
         // Keep padding local to Metal so shared GL/Vulkan uniform layouts are untouched.
         shader::RenderVertUniformBlockExtended vertex_info{};
@@ -3722,14 +5603,19 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         vert.z_offset = record.z_offset; vert.z_scale = record.z_scale;
         vert.point_size = float(std::max(1u, record.line_width)) * res_multiplier;
         auto &frag = fragment_info.base_block;
-        frag.res_multiplier = res_multiplier; frag.res_multiplier_y = res_multiplier;
+        // Match Plus' fragment coordinate contract for downscale without
+        // MSAA. Expanded MSAA still uses Metal's per-sample coordinate mapping.
+        const float fragment_scale = ctx.impl->samples==1 && ctx.impl->guest_color.data
+                && ctx.impl->guest_color.downscale ? res_multiplier*0.5f : res_multiplier;
+        frag.res_multiplier = fragment_scale; frag.res_multiplier_y = fragment_scale;
         frag.frag_coord_samples = ctx.impl->expanded_color ? ctx.impl->samples : 1;
         frag.writing_mask = record.writing_mask;
         frag.front_disabled = record.front_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED;
         frag.back_disabled = record.two_sided == SCE_GXM_TWO_SIDED_DISABLED ? frag.front_disabled : record.back_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED;
         std::vector<GuestBufferRange> guest_ranges;
-        const ShaderProgram *programs[] = {vp->renderer_data.get(), fp->renderer_data.get()};
-        const SceGxmProgram *gxps[] = {vp->program.get(mem), fp->program.get(mem)};
+        std::array<std::array<GuestBufferRange, SCE_GXM_REAL_MAX_UNIFORM_BUFFER>, 2> uniform_ranges{};
+        const ShaderProgram *programs[] = {vp->vertex_program.get(), fp->fragment_program.get()};
+        const SceGxmProgram *gxps[] = {vp->program(), fp->program()};
         for (uint32_t stage = 0; stage < 2; ++stage) {
             if (stage == 1 && !fragment_resources) continue;
             const auto &program = *programs[stage];
@@ -3737,16 +5623,19 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 if (!program.uniform_buffer_sizes.at(block)) continue;
                 const auto &binding = ctx.uniforms[stage].at(block);
                 require(binding.data && binding.size, "Metal: shader uses an unbound uniform buffer");
-                size_t extent = binding.size;
-                // GXP LDR/STR can address past the declared uniform register span.
-                // Vulkan binds the whole sceGxmMapMemory region; give the same
-                // range to Metal only for slots marked as memory-backed by GXP.
-                if (memory_backed_uniform_slot(gxps[stage]->buffer_flags, block))
-                    extent = impl->mapped_memory.extent(binding.address, binding.size);
+                auto &range = uniform_ranges[stage][block];
+                range = {binding.data, binding.size, false};
+                // GXP LDR/STR can address before or after its declared uniform
+                // registers. Retain the complete containing GXM mapping, while
+                // the shader's base still points at the bound guest address.
+                if (memory_backed_uniform_slot(gxps[stage]->buffer_flags, block)) {
+                    const auto mapped = impl->mapped_memory.range(binding.address, binding.size);
+                    range = {binding.data - (binding.address - mapped.address), mapped.size, mapped.mapped};
+                }
                 // GXM-mapped memory is live GPU-visible memory, as in Vulkan.
                 // Snapshotting its full extent on every draw copies entire
                 // mappings even if LDR touches only a few words.
-                guest_ranges.push_back({binding.data, extent, extent > binding.size});
+                guest_ranges.push_back(range);
             }
         }
         ctx.impl->direct_guest_memory_used |= std::any_of(guest_ranges.begin(), guest_ranges.end(),
@@ -3760,15 +5649,29 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             }
             impl->timed_mapped_draws += mapped_draw;
         }
+        const bool shader_guest_stores = vs.writes_guest_memory || fs.writes_guest_memory;
+        if (shader_guest_stores) {
+            ctx.impl->guest_write_watches_pending = true;
+            const uintptr_t arena = reinterpret_cast<uintptr_t>(mem.memory.get());
+            for (const auto &range : guest_ranges) {
+                const uintptr_t begin = reinterpret_cast<uintptr_t>(range.data);
+                if (begin >= arena && begin - arena <= UINT32_MAX
+                    && range.size <= uint64_t(UINT32_MAX) - (begin - arena))
+                    impl->surface_writes.prepare_gpu_writes(mem, Address(begin - arena), range.size);
+            }
+            // Discard resources previously created while their CPU pages were
+            // ReadOnly. Commands already using them retain their own references.
+            impl->direct_guest_buffers.clear();
+        }
         GuestBufferBindings native_buffers(*impl->device, guest_ranges, mem.host_page_size, !synchronous,
             &ctx.impl->uploads, &impl->direct_guest_buffers);
         const size_t uniform_upload_bytes=native_buffers.allocated_bytes();
         size_t draw_upload_bytes=uniform_upload_bytes;
         native_buffers.make_resident(encoder);
-        vertex_info.set_buffer_count(vp->renderer_data->buffer_count);
-        fragment_info.set_buffer_count(fragment_resources ? fp->renderer_data->buffer_count : 0);
-        vertex_info.set_texture_count(vp->renderer_data->texture_count);
-        fragment_info.set_texture_count(fragment_resources ? fp->renderer_data->texture_count : 0);
+        vertex_info.set_buffer_count(vp->vertex_program->buffer_count);
+        fragment_info.set_buffer_count(fragment_resources ? fp->fragment_program->buffer_count : 0);
+        vertex_info.set_texture_count(vp->vertex_program->texture_count);
+        fragment_info.set_texture_count(fragment_resources ? fp->fragment_program->texture_count : 0);
         for (uint32_t slot=0;slot<SCE_GXM_MAX_TEXTURE_UNITS;++slot) {
             vertex_info.set_viewport_ratio(slot,{1,1});
             fragment_info.set_viewport_ratio(slot,{1,1});
@@ -3782,16 +5685,18 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 const uint64_t address = native_buffers.address({binding.data, binding.size});
                 if (stage == 0) vertex_info.set_buffer_address(block, address);
                 else fragment_info.set_buffer_address(block, address);
-                // A replay needs the same LDR/STR-visible span as the live draw,
-                // including bone palettes beyond the declared register block.
-                const size_t capture_size = capture_draw && memory_backed_uniform_slot(gxps[stage]->buffer_flags, block)
-                    ? impl->mapped_memory.extent(binding.address, binding.size) : binding.size;
-                if (capture_draw && stage == 0) {
-                    dump_bytes(fmt::format("uniform-{}.bin",block),binding.data,capture_size);
-                    draw_metadata << "uniform " << block << ' ' << capture_size << '\n';
-                } else if (capture_draw) {
-                    dump_bytes(fmt::format("fragment-uniform-{}.bin",block),binding.data,capture_size);
-                    texture_metadata << "fragment_uniform " << block << ' ' << capture_size << '\n';
+                if (capture_draw) {
+                    // Record the prefix as well as the suffix. The base offset
+                    // lets a replay preserve both negative and positive LDRs.
+                    const auto &range = uniform_ranges[stage][block];
+                    const size_t base_offset = binding.data - range.data;
+                    if (stage == 0) {
+                        dump_bytes(fmt::format("uniform-{}.bin",block),range.data,range.size);
+                        draw_metadata << "uniform " << block << ' ' << range.size << ' ' << base_offset << '\n';
+                    } else {
+                        dump_bytes(fmt::format("fragment-uniform-{}.bin",block),range.data,range.size);
+                        texture_metadata << "fragment_uniform " << block << ' ' << range.size << ' ' << base_offset << '\n';
+                    }
                 }
             }
         }
@@ -3802,17 +5707,56 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         [encoder setFragmentTexture:record.is_maskupdate ? nil : ctx.impl->mask atIndex:shader::metal::MASK_TEXTURE];
         std::array<id<MTLTexture>, SCE_GXM_MAX_TEXTURE_UNITS> replay_fragment_textures{};
         std::array<id<MTLSamplerState>, SCE_GXM_MAX_TEXTURE_UNITS> replay_fragment_samplers{};
+        size_t vertex_elements = 0;
         for (uint32_t stream = 0; stream < vp->streams.size(); ++stream) if (streams_used & (1u << stream)) {
             const auto &data = record.vertex_streams[stream];
             require(data.data && data.size, "Metal: empty vertex stream");
             const auto stride = vp->streams[stream].stride;
             const auto aligned = align(stride, 4);
-            const uint8_t *bytes = data.data.get(mem);
-            const size_t elements = stride && stride != aligned ? (data.size + stride - 1) / stride : 0;
-            const size_t length = elements ? elements * aligned : data.size;
+            const auto snapshot = vertex_stream_snapshot(ctx.vertex_stream_snapshots[stream], data.size);
+            const uint8_t *bytes = snapshot.empty() ? data.data.get(mem) : snapshot.data();
+            size_t elements = stride && stride != aligned ? (data.size + stride - 1) / stride : 0;
+            const auto &layout = vertex_stream_layouts[stream];
+            if (repack_stream[stream]) {
+                if (layout.step_function == MTLVertexStepFunctionConstant) {
+                    elements = 1;
+                } else if (layout.step_function == MTLVertexStepFunctionPerInstance) {
+                    elements = instances;
+                } else {
+                    if (!vertex_elements) {
+                        for (uint32_t i = 0; i < count; ++i) {
+                            const uint32_t index = index_format == SCE_GXM_INDEX_FORMAT_U16
+                                ? static_cast<const uint16_t *>(indices)[i] : static_cast<const uint32_t *>(indices)[i];
+                            vertex_elements = std::max(vertex_elements, size_t(index) + 1);
+                        }
+                    }
+                    elements = vertex_elements;
+                }
+                require(elements && layout.stride && elements <= std::numeric_limits<size_t>::max() / layout.stride,
+                    "Metal: invalid repacked vertex stream extent");
+                const uint64_t last_record = uint64_t(elements - 1) * stride;
+                for (const auto &attribute : vertex_attributes) {
+                    if (attribute.format != MTLVertexFormatInvalid
+                        && attribute.buffer_index == shader::metal::VERTEX_STREAM_BUFFER_BASE + stream)
+                        require(last_record + attribute.source_offset + attribute.byte_size <= data.size,
+                            "Metal: vertex stream does not cover the shader attribute");
+                }
+            }
+            const size_t length = repack_stream[stream] ? elements * layout.stride
+                : elements ? elements * aligned : data.size;
             const auto buffer = ctx.impl->uploads.allocate(*impl->device, length);
             auto *upload = static_cast<uint8_t *>(buffer.buffer.contents) + buffer.offset;
-            if (elements) {
+            if (repack_stream[stream]) {
+                std::memset(upload, 0, length);
+                for (const auto &attribute : vertex_attributes) {
+                    if (attribute.format == MTLVertexFormatInvalid
+                        || attribute.buffer_index != shader::metal::VERTEX_STREAM_BUFFER_BASE + stream)
+                        continue;
+                    for (size_t i = 0; i < elements; ++i)
+                        std::memcpy(upload + i * layout.stride + attribute.offset,
+                            bytes + i * stride + attribute.source_offset, attribute.byte_size);
+                }
+            } else if (elements) {
                 // The old temporary vector zero-filled padding before copying
                 // to the upload arena. Preserve those bytes while packing
                 // directly into the arena's retained GPU-visible slice.
@@ -3832,13 +5776,13 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             const bool vertex = index >= SCE_GXM_MAX_TEXTURE_UNITS;
             if (!fragment_resources && !vertex) continue;
             const uint32_t slot = index % SCE_GXM_MAX_TEXTURE_UNITS;
-            const auto &program = vertex ? static_cast<ShaderProgram &>(*vp->renderer_data) : static_cast<ShaderProgram &>(*fp->renderer_data);
+            const auto &program = vertex ? static_cast<const ShaderProgram &>(*vp->vertex_program) : static_cast<const ShaderProgram &>(*fp->fragment_program);
             if (!program.textures_used[slot]) continue;
             const auto &texture = ctx.textures[index];
             const Address texture_address = texture.data_addr << 2;
             const auto texture_base = gxm::get_base_format(gxm::get_format(texture));
             const bool prepared = prepared_images[index] != nil;
-            auto surface = prepared ? impl->surfaces.end() : impl->surfaces.find(texture_address);
+            auto surface = prepared ? impl->surfaces.end() : find_texture_surface(texture_address);
             const auto subrectangle_surface=prepared ? impl->surfaces.end() : find_subrectangle(texture);
             if (subrectangle_surface!=impl->surfaces.end()) surface=subrectangle_surface;
             // Uncharted's signed normal/gloss alias starts at the second word
@@ -3846,7 +5790,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             if (!prepared && surface == impl->surfaces.end() && texture_address >= 4
                 && (texture_base == SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
                     || texture_base == SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)) {
-                auto previous = impl->surfaces.find(texture_address - 4);
+                auto previous = find_texture_surface(texture_address - 4);
                 if (previous != impl->surfaces.end() && previous->second.color.pixelFormat == MTLPixelFormatRG32Float)
                     surface = previous;
             }
@@ -3875,8 +5819,11 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 if (base == SCE_GXM_TEXTURE_BASE_FORMAT_U8 || base == SCE_GXM_TEXTURE_BASE_FORMAT_S8
                     || base == SCE_GXM_TEXTURE_BASE_FORMAT_X8U24 || base == SCE_GXM_TEXTURE_BASE_FORMAT_F32
                     || base == SCE_GXM_TEXTURE_BASE_FORMAT_F32M
-                    || base == SCE_GXM_TEXTURE_BASE_FORMAT_U16) {
+                    || base == SCE_GXM_TEXTURE_BASE_FORMAT_U16
+                    || base == SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8) {
                     for (auto &[key, entry] : impl->depth_surfaces) {
+                        if (base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
+                            && impl->frame_timestamp-entry.last_attached_frame>2) continue;
                         const auto rect=depth_subrectangle(entry.guest,entry.width,entry.height,entry.multisample,texture);
                         if (!rect) continue;
                         auto &snapshot=entry.snapshots[base];
@@ -3892,7 +5839,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                             if (!impl->caster) impl->caster = std::make_unique<SurfaceCaster>(*impl->device);
                             const uint32_t guest_width=entry.width*(entry.multisample==SCE_GXM_MULTISAMPLE_4X ? 2 : 1);
                             const uint32_t guest_height=entry.height*(entry.multisample==SCE_GXM_MULTISAMPLE_NONE ? 1 : 2);
-                            snapshot = base == SCE_GXM_TEXTURE_BASE_FORMAT_U8 || base == SCE_GXM_TEXTURE_BASE_FORMAT_S8
+                            snapshot = base == SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
+                                ? impl->caster->packed_depth_snapshot(entry.texture,false,snapshot_commands)
+                                : base == SCE_GXM_TEXTURE_BASE_FORMAT_U8 || base == SCE_GXM_TEXTURE_BASE_FORMAT_S8
                                 ? impl->caster->stencil_snapshot(entry.texture, base == SCE_GXM_TEXTURE_BASE_FORMAT_S8,
                                     res_multiplier,guest_width,guest_height,false,snapshot_commands)
                                 : impl->caster->depth_snapshot(entry.texture, base == SCE_GXM_TEXTURE_BASE_FORMAT_U16,
@@ -3911,6 +5860,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                             std::string error;
                             require(impl->device->submit_and_wait(snapshot_commands,error),error);
                         }
+                        if (base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8)
+                            native=rgba8_gamma_view(native,texture.gamma_mode);
                         if (impl->trace_textures && impl->traced_textures.size() < 4096) {
                             const auto detail = fmt::format("tex={:#x} fmt={:#x} guest={}x{} native={}x{} multisample={}",
                                 texture_address, uint32_t(gxm::get_format(texture)), gxm::get_width(texture), gxm::get_height(texture),
@@ -3959,23 +5910,31 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 auto &entry = surface->second;
                 const uint32_t word_offset = (texture_address - surface->first)/4;
                 const bool signed_normalized = texture_base == SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8;
+                const bool separate_word = res_multiplier != 1 && entry.has_word_offset_view;
                 require(rg32_linear_alias(entry,texture,texture_address),
                     "Metal: RG32/RGBA8 alias requires equal guest row size and positive resolution scale");
-                auto &cast = entry.rgba8_casts[{word_offset, signed_normalized}];
+                const bool guest_grid = vertex && res_multiplier < 1 && !separate_word;
+                auto &cast = entry.rgba8_casts[{word_offset, uint32_t(signed_normalized), uint32_t(guest_grid)}];
                 if (inline_rg32_images[index]) cast=inline_rg32_images[index];
                 else if (!cast) {
                     if (!impl->caster) impl->caster = std::make_unique<SurfaceCaster>(*impl->device);
                     cast = impl->caster->rgba8_from_rg32(native,
                         (entry.guest.colorFormat & SCE_GXM_COLOR_SWIZZLE_MASK) == SCE_GXM_COLOR_SWIZZLE2_RG,
                         word_offset, signed_normalized,
-                        res_multiplier<1 ? entry.guest.width : 0,
-                        res_multiplier<1 ? entry.guest.height : 0);
+                        res_multiplier<1 && !separate_word && vertex ? entry.guest.width : 0,
+                        res_multiplier<1 && !separate_word && vertex ? entry.guest.height : 0, nil, separate_word);
                 }
                 native = cast;
-                // A packed two-word target has a half-texel bias in the guest
-                // sampling grid. Preserve that word selection at native scale
-                // while retaining each native pixel's independent data.
-                const std::pair<float,float> offset{packed_alias_x_offset(res_multiplier,uint32_t(native.width)),0};
+                // Fragment casts use Plus' screen-relative correction before
+                // viewport mapping. Separate views already select their word.
+                if (!vertex && !entry.has_word_offset_view && res_multiplier != 1) {
+                    const auto &target = static_cast<const MetalRenderTarget &>(*ctx.current_render_target);
+                    texture_mip_info[index].cast_coords = {fragment_scale,
+                        1.f / target.width, 1.f / target.height,
+                        float(word_offset)};
+                }
+                const std::pair<float,float> offset{separate_word || !vertex ? 0.f
+                    : packed_alias_x_offset(res_multiplier,uint32_t(native.width)),0};
                 if (vertex) vertex_info.set_viewport_offset(slot,offset);
                 else fragment_info.set_viewport_offset(slot,offset);
                 if (!impl->dump_surface_dir.empty() && impl->dumped_surfaces.size() < 32) {
@@ -4007,6 +5966,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                             uint32_t(entry.guest.data.address()),uint32_t(entry.guest.colorFormat),entry.guest.width,entry.guest.height,entry.guest.strideInPixels,uint32_t(entry.guest.surfaceType),
                             texture_address,uint32_t(gxm::get_format(texture)),gxm::get_width(texture),gxm::get_height(texture),texture.texture_type()==SCE_GXM_TEXTURE_LINEAR_STRIDED?gxm::get_stride_in_bytes(texture):0,uint32_t(texture.texture_type())));
                     if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+                    if (native==entry.color) native=raw_surface_color(entry);
+                    else if (native==color_feedback && raw_color_feedback) native=raw_color_feedback;
                     native=impl->caster->surface_format_cast(native,*rendered_format,texture_base,texture.swizzle_format);
                     require(native!=nil,"Metal: cannot reinterpret sampled surface format");
                     repacked_color=repacked_u2_color(gxm::get_format(texture));
@@ -4023,11 +5984,11 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     texture.gamma_mode);
                 rendered_format = nullptr;
             }
-            if (!prepared && !uploaded_view) native = sampling_view(native, gxm::get_format(texture),
+            if (!prepared && !uploaded_view && !texture_mip_info[index].control[3]) native = sampling_view(native, gxm::get_format(texture),
                 rendered_format);
             if (capture_draw) {
                 const char *stage=vertex ? "vertex" : "fragment";
-                if (const auto producer=impl->surfaces.find(texture_address);producer!=impl->surfaces.end()) {
+                if (const auto producer=find_texture_surface(texture_address);producer!=impl->surfaces.end()) {
                     const auto &guest=producer->second.guest;
                     texture_metadata << "producer " << stage << ' ' << slot << ' ' << guest.data.address() << ' '
                         << guest.width << ' ' << guest.height << ' ' << guest.strideInPixels << ' '
@@ -4104,6 +6065,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             // surface through the reconstructed guest grid.
             mip_info.control[1]=sampler_metadata_flags(texture);
             mip_info.control[2]=effective_sampler_anisotropy(texture,texture_cache.anisotropic_filtering);
+            const bool raw_word_carrier = mip_info.control[3] != 0;
             const bool software_float_filter = !impl->device->native_device().supports32BitFloatFiltering
                 && (native.textureType == MTLTextureType2D || native.textureType == MTLTextureTypeCube)
                 && (native.pixelFormat == MTLPixelFormatR32Float
@@ -4126,8 +6088,19 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     sampling_texture.min_filter = SCE_GXM_TEXTURE_FILTER_POINT;
                 sampling_texture.mip_filter = 0;
             }
+            if (raw_word_carrier) {
+                // The UNORM16 channels hold integer word halves. Interpolating
+                // them before bit reconstruction invents unrelated bit patterns.
+                // Plus forces nearest sampling for this raw cast as well.
+                sampling_texture.mag_filter = SCE_GXM_TEXTURE_FILTER_POINT;
+                if (texture.texture_type() != SCE_GXM_TEXTURE_LINEAR_STRIDED)
+                    sampling_texture.min_filter = SCE_GXM_TEXTURE_FILTER_POINT;
+                sampling_texture.mip_filter = 0;
+                mip_info.control[1] = sampler_metadata_flags(sampling_texture);
+                mip_info.control[2] = 1;
+            }
             auto sampling = make_sampler(*impl->device, sampling_texture,
-                software_float_filter ? 1 : texture_cache.anisotropic_filtering);
+                software_float_filter || raw_word_carrier ? 1 : texture_cache.anisotropic_filtering);
             if (vertex) { [encoder setVertexTexture:native atIndex:slot]; [encoder setVertexSamplerState:sampling atIndex:slot]; }
             else {
                 [encoder setFragmentTexture:native atIndex:slot];
@@ -4152,96 +6125,6 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         }
         [encoder setVertexBytes:vertex_bytes.data() length:vertex_bytes.size() atIndex:shader::metal::RENDER_INFO_BUFFER];
         [encoder setFragmentBytes:fragment_bytes.data() length:fragment_bytes.size() atIndex:shader::metal::RENDER_INFO_BUFFER];
-        id<MTLRenderPipelineState> point_capture_pipeline = nil;
-        id<MTLRenderPipelineState> point_replay_pipeline = nil;
-        if (routed_geometry || capture_split_faces) {
-            const bool compact_capture = compact_point_capture || capture_split_faces;
-            const std::string capture_suffix = compact_capture ? "-polygon-capture-compact" : "-polygon-capture";
-            const std::string capture_key = vertex_key + capture_suffix;
-            auto &capture_shader = impl->shaders[capture_key];
-            if (!capture_shader) {
-                auto hints = ctx.shader_hints;
-                hints.metal_capture_vertex_outputs = true;
-                hints.metal_capture_vertex_outputs_compact = compact_capture;
-                auto shader_features = features;
-                shader_features.enable_memory_mapping = true;
-                auto source = shader::metal::convert_gxp(*vp->program.get(mem),
-                    hex_string(vp->renderer_data->hash), shader_features, hints);
-                capture_shader = impl->device->compile(source, false, error);
-                require(bool(capture_shader), "Metal point capture shader: " + error);
-            }
-            const std::string replay_shader_key = "metal-point-replay-vertex";
-            auto &replay_shader = impl->shaders[replay_shader_key];
-            if (!replay_shader) {
-                replay_shader = impl->device->compile(shader::metal::point_replay_vertex_program(), false, error);
-                require(bool(replay_shader), "Metal point replay shader: " + error);
-            }
-            auto &cached_capture = impl->pipelines[key + capture_suffix];
-            if (!cached_capture) {
-                auto desc = [MTLRenderPipelineDescriptor new];
-                desc.vertexFunction = capture_shader->function;
-                desc.vertexDescriptor = make_vertex_layout();
-                desc.rasterSampleCount = ctx.impl->samples;
-                desc.depthAttachmentPixelFormat = desc.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
-                desc.colorAttachments[0].pixelFormat = attachment.pixelFormat;
-                desc.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
-                cached_capture = impl->device->create_pipeline(desc, error);
-                require(cached_capture != nil, "Metal point capture pipeline: " + error);
-            }
-            point_capture_pipeline = cached_capture;
-            auto &cached_replay = impl->pipelines[key + "-polygon-replay"];
-            if (!cached_replay) {
-                auto desc = [MTLRenderPipelineDescriptor new];
-                desc.vertexFunction = replay_shader->function;
-                desc.fragmentFunction = fs.function;
-                desc.rasterSampleCount = ctx.impl->samples;
-                desc.depthAttachmentPixelFormat = desc.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
-                auto *color = desc.colorAttachments[0];
-                color.pixelFormat = attachment.pixelFormat;
-                color.writeMask = MTLColorWriteMaskNone;
-                if (blend.colorMask & SCE_GXM_COLOR_MASK_R) color.writeMask |= MTLColorWriteMaskRed;
-                if (blend.colorMask & SCE_GXM_COLOR_MASK_G) color.writeMask |= MTLColorWriteMaskGreen;
-                if (blend.colorMask & SCE_GXM_COLOR_MASK_B) color.writeMask |= MTLColorWriteMaskBlue;
-                if (!rgb_target && (blend.colorMask & SCE_GXM_COLOR_MASK_A)) color.writeMask |= MTLColorWriteMaskAlpha;
-                color.blendingEnabled = blend.colorFunc != SCE_GXM_BLEND_FUNC_NONE || blend.alphaFunc != SCE_GXM_BLEND_FUNC_NONE;
-                color.rgbBlendOperation = blend_op(blend.colorFunc); color.alphaBlendOperation = blend_op(blend.alphaFunc);
-                color.sourceRGBBlendFactor = blend_factor(blend.colorSrc); color.destinationRGBBlendFactor = blend_factor(blend.colorDst);
-                color.sourceAlphaBlendFactor = blend_factor(blend.alphaSrc); color.destinationAlphaBlendFactor = blend_factor(blend.alphaDst);
-                if (alpha_target) {
-                    color.writeMask = (blend.colorMask & SCE_GXM_COLOR_MASK_A) ? MTLColorWriteMaskRed : MTLColorWriteMaskNone;
-                    color.blendingEnabled = blend.alphaFunc != SCE_GXM_BLEND_FUNC_NONE;
-                    color.rgbBlendOperation = blend_op(blend.alphaFunc);
-                    const auto alpha_factor = [](SceGxmBlendFactor factor) {
-                        switch (factor) {
-                        case SCE_GXM_BLEND_FACTOR_DST_ALPHA: return MTLBlendFactorDestinationColor;
-                        case SCE_GXM_BLEND_FACTOR_ONE_MINUS_DST_ALPHA: return MTLBlendFactorOneMinusDestinationColor;
-                        case SCE_GXM_BLEND_FACTOR_DST_ALPHA_SATURATE: return MTLBlendFactorDestinationColor;
-                        case SCE_GXM_BLEND_FACTOR_SRC_ALPHA_SATURATE: return MTLBlendFactorOne;
-                        default: return blend_factor(factor);
-                        }
-                    };
-                    color.sourceRGBBlendFactor = alpha_factor(blend.alphaSrc);
-                    color.destinationRGBBlendFactor = alpha_factor(blend.alphaDst);
-                }
-                if (green_target)
-                    color.writeMask = (blend.colorMask & SCE_GXM_COLOR_MASK_G) ? MTLColorWriteMaskRed : MTLColorWriteMaskNone;
-                if (red_alpha_target) {
-                    if (ctx.shader_hints.metal_red_alpha_shader_blend) color.blendingEnabled = NO;
-                    color.writeMask = MTLColorWriteMaskNone;
-                    if (blend.colorMask & SCE_GXM_COLOR_MASK_R)
-                        color.writeMask |= MTLColorWriteMaskRed;
-                    if (blend.colorMask & SCE_GXM_COLOR_MASK_A)
-                        color.writeMask |= MTLColorWriteMaskGreen;
-                }
-                if (quantized_color_target) {
-                    color.blendingEnabled = NO;
-                    color.writeMask = MTLColorWriteMaskAll;
-                }
-                cached_replay = impl->device->create_pipeline(desc, error);
-                require(cached_replay != nil, "Metal point replay pipeline: " + error);
-            }
-            point_replay_pipeline = cached_replay;
-        }
         MTLPrimitiveType type;
         std::vector<uint32_t> converted_indices;
         std::vector<uint32_t> converted_ordinals;
@@ -4492,7 +6375,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             [encoder setStencilFrontReferenceValue:record.front_stencil_state_values.ref
                 backReferenceValue:record.front_stencil_state_values.ref];
             [encoder setDepthBias:back_depth ? record.back_depth_bias_unit : record.depth_bias_unit
-                slopeScale:back_depth ? record.back_depth_bias_slope : record.depth_bias_slope clamp:0];
+                slopeScale:back_depth ? back_depth_slope : front_depth_slope clamp:0];
             [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
             [encoder setCullMode:MTLCullModeNone];
             [encoder setTriangleFillMode:MTLTriangleFillModeFill];
@@ -4565,7 +6448,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             [encoder setStencilFrontReferenceValue:record.front_stencil_state_values.ref
                 backReferenceValue:record.back_stencil_state_values.ref];
             [encoder setDepthBias:back_depth ? record.back_depth_bias_unit : record.depth_bias_unit
-                slopeScale:back_depth ? record.back_depth_bias_slope : record.depth_bias_slope clamp:0];
+                slopeScale:back_depth ? back_depth_slope : front_depth_slope clamp:0];
             [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
             [encoder setTriangleFillMode:wireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
             [encoder setViewport:viewport];
@@ -4636,7 +6519,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     const bool front = polygon.face == PolygonFace::Front;
                     select_visibility(front);
                     [encoder setDepthBias:(front || !two_sided) ? record.depth_bias_unit : record.back_depth_bias_unit
-                        slopeScale:(front || !two_sided) ? record.depth_bias_slope : record.back_depth_bias_slope clamp:0];
+                        slopeScale:(front || !two_sided) ? front_depth_slope : back_depth_slope clamp:0];
                     // The capture shader supplies the front GXM width only when
                     // the guest vertex shader did not write its own point size.
                     if (two_sided && !front && !shader_point_size) {
@@ -4668,7 +6551,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     const bool front = line.face != PolygonFace::Back;
                     select_visibility(front);
                     [encoder setDepthBias:(front || !two_sided) ? record.depth_bias_unit : record.back_depth_bias_unit
-                        slopeScale:(front || !two_sided) ? record.depth_bias_slope : record.back_depth_bias_slope clamp:0];
+                        slopeScale:(front || !two_sided) ? front_depth_slope : back_depth_slope clamp:0];
                     fragment_info.base_block.point_replay_face = front ? 1.0f : -1.0f;
                     fragment_info.copy_to(fragment_bytes.data());
                     [encoder setFragmentBytes:fragment_bytes.data() length:fragment_bytes.size()
@@ -4695,14 +6578,14 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                         const auto draw_index_type = capture_split_faces ? MTLIndexTypeUInt32 : metal_index_type;
                         select_visibility(true);
                         [encoder setDepthStencilState:front_depth_state];
-                        [encoder setDepthBias:record.depth_bias_unit slopeScale:record.depth_bias_slope clamp:0];
+                        [encoder setDepthBias:record.depth_bias_unit slopeScale:front_depth_slope clamp:0];
                         [encoder setCullMode:MTLCullModeBack];
                         [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:3 indexType:draw_index_type
                             indexBuffer:draw_indices indexBufferOffset:offset instanceCount:1 baseVertex:0
                             baseInstance:capture_split_faces ? 0 : instance];
                         select_visibility(false);
                         [encoder setDepthStencilState:back_depth_state];
-                        [encoder setDepthBias:record.back_depth_bias_unit slopeScale:record.back_depth_bias_slope clamp:0];
+                        [encoder setDepthBias:record.back_depth_bias_unit slopeScale:back_depth_slope clamp:0];
                         [encoder setCullMode:MTLCullModeFront];
                         [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:3 indexType:draw_index_type
                             indexBuffer:draw_indices indexBufferOffset:offset instanceCount:1 baseVertex:0
@@ -4717,6 +6600,54 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         // memory writers still finish before CPU processing can observe/reuse it.
         // Limit retained resources even when a guest emits an unusually long scene.
         ++ctx.impl->pending_draws;
+        // Plus retains the union of logical render-pass areas across internal
+        // submissions. Native Metal opens a full attachment pass eagerly for
+        // depth loads, so record the macroblock area only after a guest draw
+        // was encoded, when its tile selection is known. Mask/depth-only draws
+        // also open a logical pass; actual color ownership is intersected later.
+        if (auto *target = static_cast<MetalRenderTarget *>(ctx.current_render_target);
+            target && target->has_macroblock_sync && res_multiplier != 1.f && ctx.impl->guest_color.data) {
+            const auto found = impl->surfaces.find(ctx.impl->guest_color.data.address());
+            if (found != impl->surfaces.end() && found->second.color == ctx.impl->color) {
+                uint32_t left = 0, top = 0;
+                uint32_t right = std::min(target->width, ctx.impl->width);
+                uint32_t bottom = std::min(target->height, ctx.impl->height);
+                const bool known_tile = ctx.impl->macroblock_last_x != uint16_t(~0u)
+                    && ctx.impl->macroblock_last_y != uint16_t(~0u);
+                if (!ctx.impl->macroblock_ignore && known_tile) {
+                    left = uint32_t(ctx.impl->macroblock_last_x) * target->macroblock_width;
+                    top = uint32_t(ctx.impl->macroblock_last_y) * target->macroblock_height;
+                    right = std::min<uint32_t>(left + target->macroblock_width, ctx.impl->width);
+                    bottom = std::min<uint32_t>(top + target->macroblock_height, ctx.impl->height);
+                }
+                // Before a first nonempty tile selection there is no guest
+                // macroblock area. An empty-scissor draw must not mark it full.
+                if (ctx.impl->macroblock_ignore || known_tile) {
+                    auto &surface = found->second;
+                    surface.scene_render_area.include(left, top, right, bottom);
+                    const auto &area = surface.scene_render_area;
+                    if (!area.empty()) {
+                        const double sx = (ctx.impl->expanded_color ? ctx.impl->samples / 2 : 1) / double(res_multiplier);
+                        const double sy = (ctx.impl->expanded_color ? 2 : 1) / double(res_multiplier);
+                        // Plus truncates both edges of positive rendered areas;
+                        // draw ownership instead rounds its upper edge outward.
+                        const auto edge = [](uint32_t value, double scale, uint32_t limit) {
+                            return uint32_t(std::min(double(limit), std::floor(value * scale)));
+                        };
+                        surface.scene_macroblock_bounds = {
+                            edge(area.x0, sx, surface.guest.width), edge(area.y0, sy, surface.guest.height),
+                            edge(area.x1, sx, surface.guest.width), edge(area.y1, sy, surface.guest.height)};
+                    }
+                }
+            }
+        }
+        // Track only submitted, potentially depth-writing guest draws for
+        // Plus' no-store validity rule. Imports, clears, stencil and mask writes
+        // still use depth_scene_written for publication/snapshot ordering.
+        ctx.impl->scene_depth_drawn |= depth_enabled
+            && ((record.front_depth_write_mode==SCE_GXM_DEPTH_WRITE_ENABLED && (!two_sided || !cull_front))
+                || (two_sided && !cull_back && record.back_depth_write_mode==SCE_GXM_DEPTH_WRITE_ENABLED))
+            && std::any_of(clip.begin(),clip.end(),[](const MTLScissorRect &rect) { return rect.width && rect.height; });
         if (record.is_maskupdate) ctx.impl->mask_constant_valid=false;
         ctx.impl->depth_scene_written |= record.is_maskupdate;
         const auto writable_color = alpha_target ? SCE_GXM_COLOR_MASK_A
@@ -4727,6 +6658,35 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         const bool wrote_color = !record.is_maskupdate && !fragment_disabled
             && (blend.colorMask & writable_color);
         ctx.impl->pending_color_writes |= wrote_color;
+        if (wrote_color && ctx.impl->guest_color.data) {
+            if (const auto found = impl->surfaces.find(ctx.impl->guest_color.data.address()); found != impl->surfaces.end()) {
+                auto &surface = found->second;
+                if (blend.colorFunc!=SCE_GXM_BLEND_FUNC_NONE || blend.alphaFunc!=SCE_GXM_BLEND_FUNC_NONE)
+                    surface.raw_color_invalidated=true;
+                // Resolved expanded MSAA stores samples in a 1x2/2x2 grid.
+                const double scale_x = (ctx.impl->expanded_color ? ctx.impl->samples / 2 : 1) / double(res_multiplier);
+                const double scale_y = (ctx.impl->expanded_color ? 2 : 1) / double(res_multiplier);
+                const auto edge = [](double value, uint32_t limit, bool upper) {
+                    return uint32_t(std::clamp(upper ? std::ceil(value) : std::floor(value), 0.0, double(limit)));
+                };
+                for (const auto &rect : clip) {
+                    const double left = std::max(double(rect.x), std::floor(std::min(viewport.originX, viewport.originX + viewport.width)));
+                    const double top = std::max(double(rect.y), std::floor(std::min(viewport.originY, viewport.originY + viewport.height)));
+                    const double right = std::min(double(rect.x + rect.width), std::ceil(std::max(viewport.originX, viewport.originX + viewport.width)));
+                    const double bottom = std::min(double(rect.y + rect.height), std::ceil(std::max(viewport.originY, viewport.originY + viewport.height)));
+                    if (right <= left || bottom <= top) continue;
+                    note_half_pixel_origin(ctx, viewport, rect, uint32_t(left), uint32_t(top), uint32_t(right), uint32_t(bottom));
+                    const auto x0 = edge(left * scale_x, surface.guest.width, false);
+                    const auto y0 = edge(top * scale_y, surface.guest.height, false);
+                    const auto x1 = edge(right * scale_x, surface.guest.width, true);
+                    const auto y1 = edge(bottom * scale_y, surface.guest.height, true);
+                    surface.scene_writes.include(x0, y0, x1, y1);
+                    surface.written_tiles.include(x0 & ~31u, y0 & ~31u,
+                        std::min<uint32_t>((x1 + 31) & ~31u, surface.guest.width),
+                        std::min<uint32_t>((y1 + 31) & ~31u, surface.guest.height));
+                }
+            }
+        }
         ctx.impl->color_clip_restore_pending |= wrote_color && bool(ctx.impl->color_clip_snapshot);
         const size_t index_upload_bytes=native_count*index_size;
         ctx.impl->pending_upload_bytes+=draw_upload_bytes+index_upload_bytes;
@@ -4748,11 +6708,12 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 LOG_INFO("Metal draw flush: synchronous={} vertex_store={} fragment_store={} draws={} input_bytes={}",
                     synchronous, vs.writes_guest_memory, fs.writes_guest_memory,
                     ctx.impl->pending_draws, ctx.impl->pending_upload_bytes);
-            finish(ctx, synchronous);
+            finish(ctx, synchronous, shader_guest_stores);
         }
         if (capture_draw && impl->dump_attachments) {
             finish(ctx);
             dump_attachment("color-after",ctx.impl->color);
+            dump_raw_attachment("raw-color-after");
             dump_attachment("mask-after",ctx.impl->mask);
             dump_depth_attachment("depth-after");
             dump_stencil_attachment("stencil-after");
@@ -4778,9 +6739,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     if (changed) {
                         LOG_INFO("Metal pixel trace draw={} target={:x} fs={} xy={},{} rgba={},{},{},{}",
                             impl->traced_pixel_draws, ctx.impl->guest_color.data.address(),
-                            hex_string(fp->renderer_data->hash), x, y, pixel[0], pixel[1], pixel[2], pixel[3]);
+                            hex_string(fp->fragment_program->hash), x, y, pixel[0], pixel[1], pixel[2], pixel[3]);
                         if (!impl->dump_arm_pixel_shader.empty()
-                            && impl->dump_arm_pixel_shader == hex_string(fp->renderer_data->hash)
+                            && impl->dump_arm_pixel_shader == hex_string(fp->fragment_program->hash)
                             && std::max({pixel[0], pixel[1], pixel[2]}) > impl->dump_arm_pixel_min_rgb)
                             impl->dump_pixel_armed = true;
                         if (!impl->dump_pixel_armed && !impl->dump_arm_pixel_rgb.empty()) {
@@ -4790,7 +6751,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                                 && tolerance >= 0 && std::abs(pixel[0] - target_r) <= tolerance
                                 && std::abs(pixel[1] - target_g) <= tolerance
                                 && std::abs(pixel[2] - target_b) <= tolerance) {
-                                impl->dump_draw_shader = hex_string(fp->renderer_data->hash);
+                                impl->dump_draw_shader = hex_string(fp->fragment_program->hash);
                                 impl->dump_pixel_armed = true;
                                 LOG_INFO("Metal pixel-color draw capture armed: fs={} xy={},{}",
                                     impl->dump_draw_shader, x, y);

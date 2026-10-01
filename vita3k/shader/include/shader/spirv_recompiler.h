@@ -71,9 +71,11 @@ struct Hints {
     SceGxmTextureFormat fragment_textures[SCE_GXM_MAX_TEXTURE_UNITS];
     // Native Metal mask attachment sample count; ignored by other targets.
     uint32_t metal_samples = 1;
-    // Missing varyings requested by the paired fragment program. Choose zero
+    // Missing varyings requested by the paired fragment program. Use (0,0,0,1)
     // for unwritten values; declared outputs retain their register layout.
     uint32_t metal_missing_vertex_outputs = 0;
+    // Plus's far-plane policy, specialized per draw without changing shared uniforms.
+    bool metal_far_clip = false;
     // Emit final clip-space position and varyings to a separate Metal buffer
     // for post-vertex polygon routing. Ordinary shader variants leave this off.
     bool metal_capture_vertex_outputs = false;
@@ -83,9 +85,12 @@ struct Hints {
     bool metal_mip_sampling = false;
     // Generate software Cube filtering only on devices that lack F32 filtering.
     bool metal_float_cube_filter = false;
+    bool metal_raw_color_attachment = false;
+    bool metal_raw_color_fetch = false;
     // Tile register width is independent of the stored surface format. Keep
     // the declared shader type when no native draw descriptor is available.
     uint32_t metal_output_register_size = SCE_GXM_OUTPUT_REGISTER_SIZE_64BIT;
+    SceGxmOutputRegisterFormat metal_output_register_format = SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED;
     // Metal samplers have no descriptor LOD-bias field. Native translation
     // applies these values to sampling operations; other targets ignore them.
     float metal_vertex_lod_bias[SCE_GXM_MAX_TEXTURE_UNITS] = {};

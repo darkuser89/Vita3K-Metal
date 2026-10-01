@@ -28,12 +28,15 @@
 
 #include <config/state.h>
 #include <display/state.h>
+#include <gxm/functions.h>
+#include <gxm/state.h>
 #include <functional>
 #include <overlay/display_manager.h>
 #include <overlay/shader_precompile_progress.h>
 #include <util/log.h>
 
 #include <memory>
+#include <exception>
 #include <thread>
 
 #ifdef TRACY_ENABLE
@@ -43,11 +46,29 @@
 struct FeatureState;
 
 namespace renderer {
+void discard_metal_commands(Context *context, Command *first, Command *last) {
+    for (Command *cmd = first; cmd;) {
+        Command *next = cmd == last ? nullptr : cmd->next;
+        release_metal_command_status(*cmd);
+        destroy_metal_command_payload(*cmd);
+        // A rejected producer can run ahead of an active consumer. Returning
+        // its ring slot via free_func would advance the FIFO allocator past
+        // still-live earlier slots. Ring storage stays owned by its context;
+        // only independent host nodes can be deleted here.
+        if (!(cmd->flags & Command::FLAG_NO_FREE)
+            && (!context || (cmd->flags & Command::FLAG_FROM_HOST)))
+            generic_command_free(cmd);
+        cmd = next;
+    }
+}
+
 Command *generic_command_allocate() {
     return new Command;
 }
 
 void generic_command_free(Command *cmd) {
+    release_metal_command_status(*cmd);
+    destroy_metal_command_payload(*cmd);
     delete cmd;
 }
 
@@ -81,6 +102,18 @@ static renderer::SyncWaitResult wait_cmd(MemState &mem, CommandList &command_lis
 static void process_batch(renderer::State &state, const FeatureState &features, MemState &mem, Config &config, CommandList &command_list) {
     using CommandHandlerFunc = decltype(cmd_handle_set_context);
 
+    Command *cmd = command_list.first;
+    struct MetalBatchOwners {
+        State &state;
+        Command *&remaining;
+        Command *last;
+        Context *context;
+        ~MetalBatchOwners() {
+            if (state.current_backend == Backend::Metal)
+                discard_metal_commands(context, remaining, last);
+        }
+    } owners{state, cmd, command_list.last, command_list.context};
+
     const static std::map<CommandOpcode, CommandHandlerFunc *> handlers = {
         { CommandOpcode::SetContext, cmd_handle_set_context },
         { CommandOpcode::SyncSurfaceData, cmd_handle_sync_surface_data },
@@ -93,6 +126,7 @@ static void process_batch(renderer::State &state, const FeatureState &features, 
         { CommandOpcode::TransferCopy, cmd_handle_transfer_copy },
         { CommandOpcode::TransferDownscale, cmd_handle_transfer_downscale },
         { CommandOpcode::TransferFill, cmd_handle_transfer_fill },
+        { CommandOpcode::SyncGuestRange, cmd_handle_sync_guest_range },
         { CommandOpcode::Nop, cmd_handle_nop },
         { CommandOpcode::SetState, cmd_handle_set_state },
         { CommandOpcode::SignalSyncObject, cmd_handle_signal_sync_object },
@@ -107,13 +141,13 @@ static void process_batch(renderer::State &state, const FeatureState &features, 
     if (command_list.context)
         state.context = command_list.context;
 
-    Command *cmd = command_list.first;
-
     // Take a batch, and execute it. Hope it's not too large
     do {
         if (cmd == nullptr) {
             break;
         }
+        if (state.current_backend == Backend::Metal && !begin_metal_command(state, *cmd))
+            return;
 
         auto handler = handlers.find(cmd->opcode);
         if (handler == handlers.end()) {
@@ -137,6 +171,7 @@ static void process_batch(renderer::State &state, const FeatureState &features, 
         Command *last_cmd = cmd;
         cmd = cmd->next;
 
+        auto status_owner = detach_metal_command_status(*last_cmd);
         if (command_list.context) {
             command_list.context->free_func(last_cmd);
         } else {
@@ -188,8 +223,17 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
             }
         }
 
-        state.command_buffer_queue.pop();
-        process_batch(state, features, mem, config, *cmd_list);
+        if (state.current_backend == Backend::Metal) {
+            // top() is only a peek. Abort can win before pop(), in which case
+            // the queue still owns the nodes and shutdown must discard them.
+            CommandList owned_list{};
+            if (!state.command_buffer_queue.try_pop(owned_list))
+                return;
+            process_batch(state, features, mem, config, owned_list);
+        } else {
+            state.command_buffer_queue.pop();
+            process_batch(state, features, mem, config, *cmd_list);
+        }
     }
 }
 
@@ -198,7 +242,7 @@ void reset_command_list(CommandList &command_list) {
     command_list.last = nullptr;
 }
 
-static void render_loop(renderer::State &state, DisplayState &display, GxmState &gxm, MemState &mem, Config &config) {
+static void render_loop_body(renderer::State &state, DisplayState &display, GxmState &gxm, MemState &mem, Config &config) {
     if (state.precompile_requested) {
         auto progress_overlay = state.overlay_manager
             ? state.overlay_manager->create<overlay::shader_precompile_progress>()
@@ -297,17 +341,58 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState 
     state.done_current();
 }
 
+static void render_loop(renderer::State &state, DisplayState &display, GxmState &gxm, MemState &mem, Config &config) {
+    if (state.current_backend != Backend::Metal) {
+        render_loop_body(state, display, gxm, mem, config);
+        return;
+    }
+    try {
+        // Include precompilation and loading overlays in the Metal boundary.
+        render_loop_body(state, display, gxm, mem, config);
+    } catch (const std::exception &error) {
+        request_metal_render_abort(state);
+        // Invalidating sync objects can stop the display consumer with queued
+        // entries still present. Wake producers and GXM termination as well.
+        gxm.display_queue.abort_synchronized();
+        gxm::invalidate_sync_objects(gxm);
+        auto pending = state.command_buffer_queue.take_pending();
+        while (!pending.empty()) {
+            const auto &list = pending.front();
+            discard_metal_commands(list.context, list.first, list.last);
+            pending.pop();
+        }
+        LOG_CRITICAL("Metal render thread stopped: {}", error.what());
+        // Metal's current-context hooks are no-ops. Keep the normal teardown
+        // contract; device resources are released by the app shutdown path.
+        state.done_current();
+    }
+}
+
 void start_render_thread(State &state, DisplayState &display, GxmState &gxm, MemState &mem, Config &config) {
     state.render_abort = false;
     state.render_thread = std::make_unique<std::thread>(render_loop, std::ref(state), std::ref(display), std::ref(gxm), std::ref(mem), std::ref(config));
 }
 
 void stop_render_thread(State &state) {
-    state.render_abort = true;
-    state.command_buffer_queue.abort();
+    if (state.current_backend == Backend::Metal)
+        request_metal_render_abort(state);
+    else {
+        state.render_abort = true;
+        state.command_buffer_queue.abort();
+    }
     if (state.render_thread && state.render_thread->joinable())
         state.render_thread->join();
     state.render_thread.reset();
+#ifdef __APPLE__
+    if (state.current_backend == Backend::Metal) {
+        auto pending = state.command_buffer_queue.take_pending();
+        while (!pending.empty()) {
+            const auto &list = pending.front();
+            discard_metal_commands(list.context, list.first, list.last);
+            pending.pop();
+        }
+    }
+#endif
     state.command_buffer_queue.reset();
 }
 

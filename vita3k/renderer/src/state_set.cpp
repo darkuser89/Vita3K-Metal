@@ -18,6 +18,7 @@
 #include <gxm/types.h>
 #include <renderer/commands.h>
 #include <renderer/driver_functions.h>
+#include <renderer/functions.h>
 #include <renderer/state.h>
 #include <renderer/types.h>
 
@@ -89,6 +90,29 @@ COMMAND_SET_STATE(program) {
     const Ptr<void> program = helper.pop<Ptr<void>>();
     const bool is_fragment = helper.pop<bool>();
 
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal) {
+        auto *payload = helper.pop<std::shared_ptr<const metal::ProgramBinding> *>();
+        const auto binding = payload ? *payload : nullptr;
+        if (!(helper.cmd->flags & Command::FLAG_NO_FREE)) destroy_command_payload(*helper.cmd);
+        if (!binding || (is_fragment ? !binding->fragment_program : !binding->vertex_program)) {
+            LOG_ERROR("Metal: queued program has no matching owned binding");
+            return;
+        }
+        auto &ctx = static_cast<metal::MetalContext &>(*render_context);
+        if (is_fragment) {
+            ctx.fragment_program = binding;
+            ctx.record.fragment_program = program.cast<SceGxmFragmentProgram>();
+            ctx.record.fragment_program_hash = binding->fragment_program->hash;
+            ctx.record.is_maskupdate = binding->is_maskupdate;
+        } else {
+            ctx.vertex_program = binding;
+            ctx.record.vertex_program = program.cast<SceGxmVertexProgram>();
+            ctx.record.vertex_program_hash = binding->vertex_program->hash;
+        }
+        return;
+    }
+#endif
     if (is_fragment) {
         render_context->record.fragment_program = program.cast<SceGxmFragmentProgram>();
         const SceGxmFragmentProgram *gxm_program = render_context->record.fragment_program.get(mem);
@@ -130,8 +154,20 @@ COMMAND_SET_STATE(uniform_buffer) {
     const int block_num = helper.pop<int>();
     const std::uint32_t size = helper.pop<std::uint32_t>();
 
-    renderer::ShaderProgram *program = is_vertex ? reinterpret_cast<ShaderProgram *>(render_context->record.vertex_program.get(mem)->renderer_data.get())
-                                                 : reinterpret_cast<ShaderProgram *>(render_context->record.fragment_program.get(mem)->renderer_data.get());
+    const renderer::ShaderProgram *program = nullptr;
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal) {
+        const auto &ctx = static_cast<metal::MetalContext &>(*render_context);
+        program = is_vertex ? static_cast<const ShaderProgram *>(ctx.vertex_program ? ctx.vertex_program->vertex_program.get() : nullptr)
+                            : static_cast<const ShaderProgram *>(ctx.fragment_program ? ctx.fragment_program->fragment_program.get() : nullptr);
+        if (!program) {
+            LOG_ERROR("Metal: uniform buffer without an owned program binding");
+            return;
+        }
+    } else
+#endif
+        program = is_vertex ? static_cast<ShaderProgram *>(render_context->record.vertex_program.get(mem)->renderer_data.get())
+                            : static_cast<ShaderProgram *>(render_context->record.fragment_program.get(mem)->renderer_data.get());
 
     switch (renderer.current_backend) {
     case Backend::OpenGL:
@@ -574,6 +610,10 @@ COMMAND_SET_STATE(vertex_stream) {
     renderer::GXMStreamInfo &info = render_context->record.vertex_streams[stream_index];
     info.data = stream_data;
     info.size = stream_data_length;
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        static_cast<metal::MetalContext &>(*render_context).vertex_stream_snapshots.at(stream_index) = helper.pop<uint64_t>();
+#endif
 }
 
 COMMAND_SET_STATE(fragment_program_enable) {
