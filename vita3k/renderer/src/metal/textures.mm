@@ -375,10 +375,14 @@ bool surface_texture_layout_overlap(const SceGxmColorSurface &surface, const Sce
     if (type != SCE_GXM_TEXTURE_LINEAR_STRIDED) pitch = pixels * texture_bits / 8;
     const uint64_t surface_pitch = uint64_t(surface.strideInPixels) * surface_bits / 8;
     const uint64_t address = uint64_t(texture.data_addr) << 2;
-    // Plus's ownership interval is stride * logical height, not rounded tile
-    // allocation size. Wide arithmetic also handles surfaces near guest-RAM end.
+    // The final row of a linear surface ends at its visible width. Its trailing
+    // stride padding cannot own a texture view starting there. Tiled and
+    // swizzled surfaces retain their complete allocated row extent.
+    const uint64_t owned_bytes = layout == SCE_GXM_COLOR_SURFACE_LINEAR
+        ? surface_pitch * (surface.height - 1) + uint64_t(surface.width) * surface_bits / 8
+        : surface_pitch * surface.height;
     return pitch && pitch == surface_pitch && address >= surface.data.address()
-        && address - surface.data.address() < surface_pitch * surface.height;
+        && address - surface.data.address() < owned_bytes;
 }
 
 std::optional<SurfaceRect> surface_subrectangle(const SceGxmColorSurface &surface, const SceGxmTexture &texture) {
