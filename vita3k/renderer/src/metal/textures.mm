@@ -1550,7 +1550,11 @@ kernel void unpack_words(texture2d<uint, access::read> input [[texture(0)]],
     // beyond the GPU surface; the unsupported trailing word is deterministic.
     const uint component = (separate_word ? config.z : address%2) ^ (config.y & 1u);
     const uint word = y < input.get_height() ? input.read(uint2(x,y))[component] : 0;
-    output.write(uint4(word&255, (word>>8)&255, (word>>16)&255, word>>24),p);
+    const uint component_bytes = config.y >> 2;
+    const uint4 components = component_bytes == 4 ? uint4(word,0u,0u,0u)
+        : component_bytes == 2 ? uint4(word&65535u,word>>16,0u,0u)
+        : uint4(word&255u,(word>>8)&255u,(word>>16)&255u,word>>24);
+    output.write(components,p);
 }
 kernel void unpack_halfwords(texture2d<uint, access::read> input [[texture(0)]],
     texture2d<uint, access::write> output [[texture(1)]], constant uint4 &config [[buffer(0)]],
@@ -2475,6 +2479,43 @@ id<MTLTexture> SurfaceCaster::rgba8_from_rg32(id<MTLTexture> source, bool swap_w
     [encoder setTexture:words atIndex:0];
     [encoder setTexture:bytes atIndex:1];
     const uint32_t config[] = {guest_width, uint32_t(swap_words) | (separate_word ? 2u : 0u), word_offset, guest_height};
+    [encoder setBytes:config length:sizeof(config) atIndex:0];
+    [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+    [encoder endEncoding];
+    if (!pending_commands) {
+        std::string error;
+        if (!device.submit_and_wait(commands,error)) throw std::runtime_error(error);
+    }
+    return result;
+}
+id<MTLTexture> SurfaceCaster::word_texture_from_rg32(id<MTLTexture> source,
+    SceGxmTextureBaseFormat texture, bool swap_words, uint32_t word_offset,
+    uint32_t guest_width, uint32_t guest_height, id<MTLCommandBuffer> pending_commands,
+    bool separate_word) {
+    const auto target=texture_components(texture);
+    if (!source.width || !source.height || source.pixelFormat!=MTLPixelFormatRG32Float
+        || !surface_word_target_supported(texture) || target.count*target.bytes!=4
+        || word_offset>1 || bool(guest_width)!=bool(guest_height)
+        || (pending_commands && pending_commands.status!=MTLCommandBufferStatusNotEnqueued))
+        throw std::runtime_error("Metal: invalid RG32 surface word cast");
+    auto words=[source newTextureViewWithPixelFormat:MTLPixelFormatRG32Uint];
+    if (!words) throw std::runtime_error("Metal: cannot view RG32 surface words");
+    auto desc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:target.native
+        width:(guest_width ? guest_width : source.width)*2
+        height:guest_height ? guest_height : source.height mipmapped:NO];
+    desc.usage=MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+    desc.storageMode=MTLStorageModeShared;
+    auto result=[device.native_device() newTextureWithDescriptor:desc];
+    if (!result) throw std::runtime_error("Metal: cannot allocate RG32 word alias");
+    auto bits=[result newTextureViewWithPixelFormat:sample_bits_format(target.native)];
+    if (!bits) throw std::runtime_error("Metal: cannot write RG32 word alias bits");
+    auto commands=pending_commands ? pending_commands : surface_command_buffer(device,@"Vita3K surface RG32 word cast");
+    auto encoder=[commands computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setTexture:words atIndex:0];
+    [encoder setTexture:bits atIndex:1];
+    const uint32_t config[]={guest_width,uint32_t(swap_words) | (separate_word ? 2u : 0u)
+        | (target.bytes << 2),word_offset,guest_height};
     [encoder setBytes:config length:sizeof(config) atIndex:0];
     [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
     [encoder endEncoding];

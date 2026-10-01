@@ -178,6 +178,10 @@ public:
         uint32_t word_offset = 0, bool signed_normalized = false,
         uint32_t guest_width = 0, uint32_t guest_height = 0,
         id<MTLCommandBuffer> pending_commands = nil, bool separate_word = false);
+    id<MTLTexture> word_texture_from_rg32(id<MTLTexture> source, SceGxmTextureBaseFormat texture,
+        bool swap_words, uint32_t word_offset, uint32_t guest_width = 0,
+        uint32_t guest_height = 0, id<MTLCommandBuffer> pending_commands = nil,
+        bool separate_word = false);
     id<MTLTexture> word_texture_from_rgba16(id<MTLTexture> source, SceGxmColorFormat color,
         SceGxmTextureBaseFormat texture, uint32_t word_offset, uint32_t guest_width = 0,
         uint32_t guest_height = 0, id<MTLCommandBuffer> pending_commands = nil,

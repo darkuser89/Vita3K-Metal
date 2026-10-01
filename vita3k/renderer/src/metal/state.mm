@@ -4434,6 +4434,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 ? gxm::get_stride_in_bytes(texture)
                 : uint64_t(align(gxm::get_width(texture),8))*4;
             return surface.color.pixelFormat==MTLPixelFormatRG32Float
+                && surface_word_target_supported(gxm::get_base_format(gxm::get_format(texture)))
                 && (texture_address==surface.guest.data.address()
                     || uint64_t(texture_address)==uint64_t(surface.guest.data.address())+4)
                 && guest.surfaceType==SCE_GXM_COLOR_SURFACE_LINEAR
@@ -4482,9 +4483,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             if (address < 4 || !surface_word_target_supported(base)) continue;
             const auto source = find_texture_surface(address - 4);
             if (source != impl->surfaces.end()
-                && (((base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
-                        || base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)
-                        && rg32_linear_alias(source->second, texture, address))
+                && (rg32_linear_alias(source->second, texture, address)
                     || rgba16_linear_alias(source->second, texture, address))
                 && !source->second.has_word_offset_view) {
                 source->second.has_word_offset_view = true;
@@ -4685,9 +4684,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             }
             if (source!=impl->surfaces.end() && surface_memory_size(source->second.guest)) {
                 const bool direct_word_alias=rgba16_linear_alias(source->second,texture,texture_address)
-                    || ((texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
-                        || texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)
-                        && rg32_linear_alias(source->second,texture,texture_address));
+                    || rg32_linear_alias(source->second,texture,texture_address);
                 // A native surface can only be sampled directly when both
                 // its byte layout and format match the guest texture view.
                 incompatible_alias=!direct_word_alias
@@ -4698,8 +4695,6 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     source=find_texture_surface(texture_address-4);
                 incompatible_alias|=source!=impl->surfaces.end()
                     && ((source->second.color.pixelFormat==MTLPixelFormatRG32Float
-                            && (texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
-                                || texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)
                             && !rg32_linear_alias(source->second,texture,texture_address))
                         || (source->second.color.pixelFormat==MTLPixelFormatRGBA16Float
                             && gxm::get_base_format(source->second.guest.colorFormat)==SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16
@@ -5021,10 +5016,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 const auto &texture=ctx.textures[index];
                 const Address address=texture.data_addr<<2;
                 const auto base=gxm::get_base_format(gxm::get_format(texture));
-                const bool rgba8_alias=base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
-                    || base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8;
                 const bool word_alias=uint64_t(address)==uint64_t(ctx.impl->guest_color.data.address())+4
-                    && ((ctx.impl->color.pixelFormat==MTLPixelFormatRG32Float && rgba8_alias)
+                    && ((ctx.impl->color.pixelFormat==MTLPixelFormatRG32Float
+                            && surface_word_target_supported(base))
                         || (ctx.impl->color.pixelFormat==MTLPixelFormatRGBA16Float
                             && surface_word_target_supported(base)
                             && gxm::get_base_format(ctx.impl->guest_color.colorFormat)==SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16));
@@ -6116,9 +6110,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 && surface_word_target_supported(texture_base)) {
                 auto previous = find_texture_surface(texture_address - 4);
                 if (previous != impl->surfaces.end()
-                    && (((texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
-                            || texture_base==SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8)
-                            && previous->second.color.pixelFormat == MTLPixelFormatRG32Float)
+                    && ((rg32_linear_alias(previous->second,texture,texture_address))
                         || rgba16_linear_alias(previous->second,texture,texture_address)))
                     surface = previous;
             }
@@ -6278,6 +6270,34 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     }
                 }
                 rendered_format = nullptr; // The cast has reconstructed guest memory channel order.
+            }
+            if (surface != impl->surfaces.end() && native.pixelFormat==MTLPixelFormatRG32Float
+                && texture_base!=SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8
+                && texture_base!=SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8
+                && rg32_linear_alias(surface->second,texture,texture_address)) {
+                auto &entry=surface->second;
+                const uint32_t word_offset=(texture_address-surface->first)/4;
+                const bool separate_word=res_multiplier!=1 && entry.has_word_offset_view;
+                const bool guest_grid=vertex && res_multiplier<1 && !separate_word;
+                auto &cast=entry.word_casts[{word_offset,uint32_t(texture_base),uint32_t(guest_grid)}];
+                if (!cast) {
+                    if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+                    cast=impl->caster->word_texture_from_rg32(native,texture_base,
+                        (entry.guest.colorFormat & SCE_GXM_COLOR_SWIZZLE_MASK)==SCE_GXM_COLOR_SWIZZLE2_RG,
+                        word_offset,guest_grid ? entry.guest.width : 0,
+                        guest_grid ? entry.guest.height : 0,nil,separate_word);
+                }
+                native=cast;
+                if (!vertex && !entry.has_word_offset_view && res_multiplier!=1) {
+                    const auto &target=static_cast<const MetalRenderTarget &>(*ctx.current_render_target);
+                    texture_mip_info[index].cast_coords={fragment_scale,
+                        1.f/target.width,1.f/target.height,float(word_offset)};
+                }
+                const std::pair<float,float> offset{separate_word || !vertex ? 0.f
+                    : packed_alias_x_offset(res_multiplier,uint32_t(native.width)),0};
+                if (vertex) vertex_info.set_viewport_offset(slot,offset);
+                else fragment_info.set_viewport_offset(slot,offset);
+                rendered_format=nullptr;
             }
             if (surface != impl->surfaces.end()
                 && rgba16_linear_alias(surface->second,texture,texture_address)) {
