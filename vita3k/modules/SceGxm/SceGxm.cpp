@@ -4390,7 +4390,10 @@ EXPORT(int, sceGxmSetDeferredContextVdmBuffer, SceGxmContext *deferredContext, P
     deferredContext->state.vdm_buffer_size = size;
 
     // make sure the next call will use the new vdm buffer
-    deferredContext->alloc_space = deferredContext->alloc_space_end;
+    if (deferredContext->renderer->metal_gxm.enabled && !mem)
+        deferredContext->alloc_space = deferredContext->alloc_space_end = Ptr<uint8_t>();
+    else
+        deferredContext->alloc_space = deferredContext->alloc_space_end;
 
     return 0;
 }
