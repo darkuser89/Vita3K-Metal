@@ -54,6 +54,12 @@ namespace {
 void require(bool condition, const std::string &error) {
     if (!condition) throw std::runtime_error(error);
 }
+template <size_t Size>
+void copy_vertex_attribute_records(uint8_t *destination, size_t destination_stride,
+    const uint8_t *source, size_t source_stride, size_t count) {
+    for (size_t i = 0; i < count; ++i)
+        std::memcpy(destination + i * destination_stride, source + i * source_stride, Size);
+}
 id<MTLCommandBuffer> scene_command_buffer(Device &device) {
     id<MTLCommandBuffer> commands = [device.command_queue() commandBuffer];
     commands.label = @"Vita3K GXM scene";
@@ -6458,9 +6464,26 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     if (attribute.format == MTLVertexFormatInvalid
                         || attribute.buffer_index != shader::metal::VERTEX_STREAM_BUFFER_BASE + stream)
                         continue;
-                    for (size_t i = 0; i < elements; ++i)
-                        std::memcpy(upload + i * layout.stride + attribute.offset,
-                            bytes + i * stride + attribute.source_offset, attribute.byte_size);
+                    auto *destination = upload + attribute.offset;
+                    const auto *source = bytes + attribute.source_offset;
+                    // These are the common Vita attribute widths. Dispatch
+                    // once per attribute so the per-vertex copies have a
+                    // constant size and can be inlined by the compiler.
+                    switch (attribute.byte_size) {
+                    case 1: copy_vertex_attribute_records<1>(destination, layout.stride, source, stride, elements); break;
+                    case 2: copy_vertex_attribute_records<2>(destination, layout.stride, source, stride, elements); break;
+                    case 3: copy_vertex_attribute_records<3>(destination, layout.stride, source, stride, elements); break;
+                    case 4: copy_vertex_attribute_records<4>(destination, layout.stride, source, stride, elements); break;
+                    case 6: copy_vertex_attribute_records<6>(destination, layout.stride, source, stride, elements); break;
+                    case 8: copy_vertex_attribute_records<8>(destination, layout.stride, source, stride, elements); break;
+                    case 12: copy_vertex_attribute_records<12>(destination, layout.stride, source, stride, elements); break;
+                    case 16: copy_vertex_attribute_records<16>(destination, layout.stride, source, stride, elements); break;
+                    default:
+                        for (size_t i = 0; i < elements; ++i)
+                            std::memcpy(destination + i * layout.stride,
+                                source + i * stride, attribute.byte_size);
+                        break;
+                    }
                 }
             } else if (elements) {
                 // The old temporary vector zero-filled padding before copying
