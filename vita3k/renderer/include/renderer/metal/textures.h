@@ -313,7 +313,7 @@ size_t surface_memory_size(const SceGxmColorSurface &surface);
 bool surface_memory_ranges(const SceGxmColorSurface &surface, SurfaceRect rectangle,
     std::vector<SurfaceMemoryRange> &ranges);
 bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surface,
-    std::span<uint8_t> destination);
+    std::span<uint8_t> destination, const SurfaceRect *region = nullptr);
 // Update only written guest bytes, including partial components. Empty ranges
 // validate the mapping without modifying the texture.
 bool write_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surface,

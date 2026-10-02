@@ -443,6 +443,12 @@ static SurfacePublication read_surface_publication(const Surface &entry, const S
     }
     if (bounds.x0 == 0 && bounds.y0 == 0 && bounds.x1 == surface.width && bounds.y1 == surface.height)
         return read_surface_memory(source, surface, output) ? SurfacePublication::Published : SurfacePublication::Unavailable;
+    // Plus limits direct surface writeback to the owned rectangle. For a
+    // matching linear Metal image, read those bytes straight into their guest
+    // rows; layouts requiring conversion still use the full staging path.
+    const SurfaceRect region{bounds.x0, bounds.y0, bounds.x1 - bounds.x0, bounds.y1 - bounds.y0};
+    if (read_surface_memory(source, surface, output, &region))
+        return SurfacePublication::Published;
     // Convert into temporary guest-layout storage, then copy only the owned
     // bytes. Padding remains untouched for every layout and packed format.
     std::vector<uint8_t> converted(output.size());

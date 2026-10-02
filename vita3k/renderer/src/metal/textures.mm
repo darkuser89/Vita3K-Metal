@@ -1175,18 +1175,23 @@ static bool rgb9e5_expanded_surface_memory(id<MTLTexture> texture, const SceGxmC
     return true;
 }
 bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surface,
-    std::span<uint8_t> destination) {
+    std::span<uint8_t> destination, const SurfaceRect *region) {
+    // Packed and expanded storage needs a whole-image conversion. A partial
+    // read is only supported by the direct linear byte-copy path below.
+    if (region && (!region->width || !region->height
+        || uint64_t(region->x) + region->width > surface.width
+        || uint64_t(region->y) + region->height > surface.height)) return false;
     if (gxm::get_base_format(surface.colorFormat)==SCE_GXM_COLOR_BASE_FORMAT_S5S5U6)
-        return s5s5u6_surface_memory(texture,surface,{},destination,{},false);
+        return !region && s5s5u6_surface_memory(texture,surface,{},destination,{},false);
     if (gxm::get_base_format(surface.colorFormat)==SCE_GXM_COLOR_BASE_FORMAT_U8S8S8U8)
-        return u8s8s8u8_surface_memory(texture,surface,{},destination,{},false);
+        return !region && u8s8s8u8_surface_memory(texture,surface,{},destination,{},false);
     if (gxm::get_base_format(surface.colorFormat) == SCE_GXM_COLOR_BASE_FORMAT_U8U3U3U2)
-        return u8u3u3u2_surface_memory(texture, surface, {}, destination, {}, false);
+        return !region && u8u3u3u2_surface_memory(texture, surface, {}, destination, {}, false);
     if (gxm::get_base_format(surface.colorFormat) == SCE_GXM_COLOR_BASE_FORMAT_U2F10F10F10)
-        return packed_float_surface_memory(texture, surface, {}, destination, {}, false);
+        return !region && packed_float_surface_memory(texture, surface, {}, destination, {}, false);
     if (gxm::get_base_format(surface.colorFormat) == SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9
         && texture && texture.pixelFormat == MTLPixelFormatRGBA16Float)
-        return rgb9e5_expanded_surface_memory(texture,surface,{},destination,{},false);
+        return !region && rgb9e5_expanded_surface_memory(texture,surface,{},destination,{},false);
     const auto size = surface_memory_size(surface);
     const auto components = surface_components(surface.colorFormat);
     if (!size || size > destination.size() || !texture || !raw_storage_matches(texture.pixelFormat, components.native)
@@ -1232,10 +1237,14 @@ bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surfa
         && texture.width == surface.width && texture.height == surface.height
         && components.count != 3 && native_byte_order
         && !reverse565 && !reverse_u1 && !reverse_e5 && (!packed_u2 || u2_mode == 0)) {
-        [texture getBytes:destination.data() bytesPerRow:size_t(surface.strideInPixels) * pixel_bytes
-            fromRegion:MTLRegionMake2D(0, 0, surface.width, surface.height) mipmapLevel:0];
+        const auto read = region ? *region : SurfaceRect{0, 0, surface.width, surface.height};
+        const size_t stride = size_t(surface.strideInPixels) * pixel_bytes;
+        const size_t offset = size_t(read.y) * stride + size_t(read.x) * pixel_bytes;
+        [texture getBytes:destination.data() + offset bytesPerRow:stride
+            fromRegion:MTLRegionMake2D(read.x, read.y, read.width, read.height) mipmapLevel:0];
         return true;
     }
+    if (region) return false;
     const size_t native_pixel_bytes = components.count == 3 ? 4 : pixel_bytes;
     const size_t native_width = texture.width, native_height = texture.height;
     const size_t native_stride = native_width * native_pixel_bytes;
