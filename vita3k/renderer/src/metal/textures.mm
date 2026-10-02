@@ -1244,6 +1244,31 @@ bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surfa
             fromRegion:MTLRegionMake2D(read.x, read.y, read.width, read.height) mipmapLevel:0];
         return true;
     }
+    if (region && surface.surfaceType == SCE_GXM_COLOR_SURFACE_TILED
+        && texture.width == surface.width && texture.height == surface.height
+        && components.count != 3 && native_byte_order
+        && !reverse565 && !reverse_u1 && !reverse_e5 && (!packed_u2 || u2_mode == 0)) {
+        // Match Plus' tile-wise partial copy: fetch only the visible region,
+        // then place each row segment into its complete 32x32 guest tile.
+        const size_t row_bytes = size_t(region->width) * pixel_bytes;
+        std::vector<uint8_t> pixels(row_bytes * region->height);
+        [texture getBytes:pixels.data() bytesPerRow:row_bytes
+            fromRegion:MTLRegionMake2D(region->x, region->y, region->width, region->height) mipmapLevel:0];
+        const size_t tiles_per_row = surface.strideInPixels / 32;
+        for (uint32_t y = region->y; y < region->y + region->height; ++y) {
+            for (uint32_t x = region->x; x < region->x + region->width;) {
+                const uint32_t count = std::min(region->x + region->width - x, 32 - x % 32);
+                const size_t tile_pixel = ((size_t(y / 32) * tiles_per_row + x / 32) * 1024)
+                    + size_t(y % 32) * 32 + x % 32;
+                std::memcpy(destination.data() + tile_pixel * pixel_bytes,
+                    pixels.data() + size_t(y - region->y) * row_bytes
+                        + size_t(x - region->x) * pixel_bytes,
+                    size_t(count) * pixel_bytes);
+                x += count;
+            }
+        }
+        return true;
+    }
     if (region) return false;
     const size_t native_pixel_bytes = components.count == 3 ? 4 : pixel_bytes;
     const size_t native_width = texture.width, native_height = texture.height;
