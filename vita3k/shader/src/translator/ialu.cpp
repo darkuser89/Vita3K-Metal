@@ -579,6 +579,8 @@ bool USSETranslatorVisitor::i32mad2(
         inst.opr.src2.flags |= RegisterFlags::Negative;
     }
 
+    // Apply the upstream I32MAD2 repeat fix to native Metal; preserve the
+    // existing behavior of the Vulkan backend in this Metal-only branch.
     if (m_spirv_params.native_metal)
         set_repeat_multiplier(1, 1, 1, 1);
 
@@ -606,8 +608,11 @@ bool USSETranslatorVisitor::i32mad2(
         store(inst.opr.dest, vsrc2, 0b1, dest_repeat_offset);
     }
 
-    LOG_DISASM("{:016x}: {}{} {} {} {} {} [sn={}]", m_instr, disasm::e_predicate_str(pred), "IMAD", disasm::operand_to_str(inst.opr.dest, 0b1),
-        disasm::operand_to_str(inst.opr.src0, 0b1), disasm::operand_to_str(inst.opr.src1, 0b1), disasm::operand_to_str(inst.opr.src2, 0b1), sn);
+    // load() does not step an immediate, so print it unstepped
+    LOG_DISASM("{:016x}: {}{} {} {} {} {} [sn={}]", m_instr, disasm::e_predicate_str(pred), "IMAD", disasm::operand_to_str(inst.opr.dest, 0b1, dest_repeat_offset),
+        disasm::operand_to_str(inst.opr.src0, 0b1, src0_repeat_offset),
+        disasm::operand_to_str(inst.opr.src1, 0b1, inst.opr.src1.bank == RegisterBank::IMMEDIATE ? 0 : src1_repeat_offset),
+        disasm::operand_to_str(inst.opr.src2, 0b1, inst.opr.src2.bank == RegisterBank::IMMEDIATE ? 0 : src2_repeat_offset), sn);
 
     END_REPEAT()
 

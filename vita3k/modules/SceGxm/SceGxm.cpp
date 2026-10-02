@@ -5576,6 +5576,9 @@ EXPORT(int, sceGxmTerminate) {
         emuenv.gxm.display_queue.abort_synchronized();
     else
         emuenv.gxm.display_queue.abort();
+    // a later sceGxmInitialize reassigns this std::thread, which terminates if still joinable
+    if (emuenv.gxm.display_host_thread.joinable())
+        emuenv.gxm.display_host_thread.join();
     emuenv.kernel.get_thread(emuenv.gxm.display_queue_thread)->exit_delete();
     return 0;
 }
