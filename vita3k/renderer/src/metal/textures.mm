@@ -1782,12 +1782,12 @@ kernel void unpack_halfwords(texture2d<uint, access::read> input [[texture(0)]],
     const uint guest_y = address/row_words;
     const uint x = config.x ? guest_x*input.get_width()/config.x : guest_x;
     const uint y = config.w ? guest_y*input.get_height()/config.w : guest_y;
-    const uint half = (separate_word ? config.z : address%2)*2;
+    const uint half_offset = (separate_word ? config.z : address%2)*2;
     uint word = 0;
     if (x < input.get_width() && y < input.get_height()) {
         const uint4 channels = input.read(uint2(x,y));
-        word = (channels[memory_channels[half]] & 65535u)
-            | ((channels[memory_channels[half+1]] & 65535u) << 16);
+        word = (channels[memory_channels[half_offset]] & 65535u)
+            | ((channels[memory_channels[half_offset+1]] & 65535u) << 16);
     }
     const uint4 components = component_bytes == 4 ? uint4(word,0u,0u,0u)
         : component_bytes == 2 ? uint4(word&65535u,word>>16,0u,0u)
@@ -1927,12 +1927,12 @@ kernel void unpack_halfwords_buffer(texture2d<uint, access::read> input [[textur
     const uint guest_y=address/layout.x;
     const uint x=config.x ? guest_x*input.get_width()/config.x : guest_x;
     const uint y=config.w ? guest_y*input.get_height()/config.w : guest_y;
-    const uint half=(separate_word ? config.z : address%2u)*2u;
+    const uint half_offset=(separate_word ? config.z : address%2u)*2u;
     uint word=0u;
     if (x<input.get_width() && y<input.get_height()) {
         const uint4 channels=input.read(uint2(x,y));
-        word=(channels[memory_channels[half]]&65535u)
-            | ((channels[memory_channels[half+1u]]&65535u)<<16);
+        word=(channels[memory_channels[half_offset]]&65535u)
+            | ((channels[memory_channels[half_offset+1u]]&65535u)<<16);
     }
     output[p.y*layout.z+p.x]=native_packed_word(word,layout.w);
 }
