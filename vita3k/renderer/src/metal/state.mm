@@ -338,7 +338,7 @@ static bool surface_cpu_bytes_changed(const Surface &entry, std::span<const uint
 }
 // Keep Plus' accumulated write ownership and render-target extent separate
 // from the latest scene rectangle. Conversion must not publish unowned bytes.
-enum class SurfacePublication { Unavailable, Published, CpuNewer };
+enum class SurfacePublication { Unavailable, Published, CpuNewer, Skipped };
 static SurfacePublication read_surface_publication(const Surface &entry, const SceGxmColorSurface &surface,
     std::span<uint8_t> output, std::vector<SurfaceMemoryRange> &written,
     Device &device, std::unique_ptr<SurfaceCaster> &caster) {
@@ -386,7 +386,7 @@ static SurfacePublication read_surface_publication(const Surface &entry, const S
         && tiles.x1 >= surface.width && tiles.y1 >= surface.height;
     // Plus defers incomplete small tiled writebacks. Keep the existing native
     // small-linear conversion support while restricting it to the scene.
-    if (small_tiled && !covers_all) return SurfacePublication::Published;
+    if (small_tiled && !covers_all) return SurfacePublication::Skipped;
     if (small_linear && !covers_all) {
         intersect(entry.scene_writes);
         ownership_clamped = true;
@@ -1707,7 +1707,7 @@ bool MetalState::finish(MetalContext &ctx, bool publish_color, bool wait_without
             } else if (publication == SurfacePublication::Unavailable)
                 LOG_WARN_ONCE("Metal: automatic color surface sync unavailable for format={:#x}",
                     uint32_t(surface.colorFormat));
-            else {
+            else if (publication == SurfacePublication::Published) {
                 published_color = true;
                 ctx.impl->color_guest_current = true;
                 ctx.impl->color_guest_dirty = false;
@@ -2076,7 +2076,7 @@ bool MetalState::sync_surface(MemState &mem, const SceGxmColorSurface &surface) 
     const auto publication = impl->surface_writes.writeback(mem, [&] {
         return read_surface_publication(found->second, surface, output, written, *impl->device, impl->caster);
     });
-    if (publication == SurfacePublication::Unavailable) return false;
+    if (publication == SurfacePublication::Unavailable || publication == SurfacePublication::Skipped) return false;
     if (publication == SurfacePublication::CpuNewer) return true;
     if (found->second.guest.strideInPixels == surface.strideInPixels
         && found->second.guest.surfaceType == surface.surfaceType) {
@@ -2113,7 +2113,7 @@ int MetalState::sync_surfaces_for_cpu_read(MemState &mem, Address address, uint3
             return read_surface_publication(*entry, entry->guest, guest, written, *impl->device, impl->caster);
         });
         if (result == SurfacePublication::Unavailable) return CommandErrorSurfaceSyncFailed;
-        if (result == SurfacePublication::CpuNewer) continue;
+        if (result == SurfacePublication::CpuNewer || result == SurfacePublication::Skipped) continue;
         update_cpu_snapshot(*entry, guest, written);
         if (context) {
             auto &ctx = *static_cast<MetalContext *>(context);
