@@ -251,6 +251,33 @@ id<MTLTexture> make_texture(Device &device, MTLPixelFormat format, uint32_t w, u
     require(result != nil, "Metal: texture allocation failed");
     return result;
 }
+id<MTLTexture> make_linear_buffer_texture(Device &device, MTLPixelFormat format,
+    uint32_t w, uint32_t h, MTLTextureUsage usage) {
+    size_t pixel_bytes = 0;
+    switch (format) {
+    case MTLPixelFormatR8Unorm: pixel_bytes = 1; break;
+    case MTLPixelFormatR32Float:
+    case MTLPixelFormatRGBA8Unorm:
+    case MTLPixelFormatRGBA8Unorm_sRGB:
+    case MTLPixelFormatBGRA8Unorm:
+    case MTLPixelFormatBGRA8Unorm_sRGB:
+    case MTLPixelFormatRG11B10Float: pixel_bytes = 4; break;
+    case MTLPixelFormatRG32Float:
+    case MTLPixelFormatRGBA16Float: pixel_bytes = 8; break;
+    default: return nil;
+    }
+    id<MTLDevice> native = device.native_device();
+    const size_t alignment = [native minimumLinearTextureAlignmentForPixelFormat:format];
+    if (!alignment || !w || !h) return nil;
+    const size_t row_bytes = ((size_t(w) * pixel_bytes + alignment - 1) / alignment) * alignment;
+    if (!row_bytes || row_bytes > 64u * 1024u * 1024u / h) return nil;
+    id<MTLBuffer> backing = [native newBufferWithLength:row_bytes * h options:MTLResourceStorageModeShared];
+    if (!backing) return nil;
+    auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:w height:h mipmapped:NO];
+    desc.storageMode = MTLStorageModeShared;
+    desc.usage = usage;
+    return [backing newTextureWithDescriptor:desc offset:0 bytesPerRow:row_bytes];
+}
 }
 
 // Match Plus: only discard beyond the far plane when both active faces fail
@@ -2952,7 +2979,12 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                 entry.raw_multisample_color = nil;
                 entry.raw_multisample_dirty = true;
                 entry.multisample_color = nil;
-                entry.color = make_texture(*impl->device, format, color_width, color_height, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView | MTLTextureUsageShaderWrite);
+                const auto usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead
+                    | MTLTextureUsagePixelFormatView | MTLTextureUsageShaderWrite;
+                if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR && samples == 1 && res_multiplier == 1.f)
+                    entry.color = make_linear_buffer_texture(*impl->device, format, color_width, color_height, usage);
+                if (!entry.color)
+                    entry.color = make_texture(*impl->device, format, color_width, color_height, usage);
                 entry.cpu_snapshot.clear();
                 if (gxm::get_base_format(surface.colorFormat)==SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16) {
                     std::vector<uint8_t> zero(size_t(color_width)*color_height*8);
@@ -3100,8 +3132,12 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
             if (gxm::get_base_format(surface.colorFormat)==SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16) {
                 const bool new_raw_color=!entry.raw_color;
                 if (new_raw_color) {
-                    entry.raw_color=make_texture(*impl->device,format,color_width,color_height,
-                        MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView|MTLTextureUsageShaderWrite);
+                    const auto usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead
+                        | MTLTextureUsagePixelFormatView | MTLTextureUsageShaderWrite;
+                    if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR && samples == 1 && res_multiplier == 1.f)
+                        entry.raw_color = make_linear_buffer_texture(*impl->device, format, color_width, color_height, usage);
+                    if (!entry.raw_color)
+                        entry.raw_color = make_texture(*impl->device, format, color_width, color_height, usage);
                 }
                 if (new_raw_color || entry.raw_color_invalidated) {
                     seed_raw_color=true;
@@ -5838,17 +5874,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         mask_blend.colorMask = SCE_GXM_COLOR_MASK_ALL;
         auto blend = fragment_color_disabled ? SceGxmBlendInfo{}
             : record.is_maskupdate ? mask_blend : static_cast<const MetalFragmentProgram &>(*fp->fragment_program).blend;
-        // Metal enables blending for the whole attachment. An independently
-        // disabled channel group must still replace its destination. Normalize
-        // before constructing either pipeline key so cached descriptors agree.
-        if (blend.colorFunc == SCE_GXM_BLEND_FUNC_NONE) {
-            blend.colorSrc = SCE_GXM_BLEND_FACTOR_ONE;
-            blend.colorDst = SCE_GXM_BLEND_FACTOR_ZERO;
-        }
-        if (blend.alphaFunc == SCE_GXM_BLEND_FUNC_NONE) {
-            blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
-            blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
-        }
+        // Metal enables blending for the whole attachment when either channel
+        // group uses it. Keep the guest factors for the other group: a NONE
+        // operation maps to ADD there, just as it does in the Vulkan path.
         id<MTLTexture> attachment = record.is_maskupdate ? ctx.impl->mask : ctx.impl->render_color;
         const auto target_base=gxm::get_base_format(record.color_surface.colorFormat);
         const bool rgb_target=!record.is_maskupdate && (target_base==SCE_GXM_COLOR_BASE_FORMAT_U8U8U8

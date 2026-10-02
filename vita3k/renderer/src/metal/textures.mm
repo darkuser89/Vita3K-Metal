@@ -1080,7 +1080,8 @@ static bool packed_float_surface_memory(id<MTLTexture> texture, const SceGxmColo
     if (!size || (upload ? source.size() : destination.size()) < size || !texture || mode >= 4
         || texture.pixelFormat != MTLPixelFormatRGBA16Float
         || texture.textureType != MTLTextureType2D || texture.storageMode != MTLStorageModeShared
-        || !texture.width || !texture.height || texture.width%samples_x || texture.height%samples_y) return false;
+        || !texture.width || !texture.height || !samples_x || !samples_y
+        || texture.width%samples_x || texture.height%samples_y) return false;
     size_t previous_end = 0;
     for (const auto &range : ranges) {
         if (!range.size || range.offset < previous_end || range.offset > size || range.size > size - range.offset)
@@ -1088,10 +1089,42 @@ static bool packed_float_surface_memory(id<MTLTexture> texture, const SceGxmColo
         previous_end = range.offset + range.size;
     }
     if (upload && ranges.empty()) return true;
-    const size_t stride = texture.width * 8;
-    std::vector<uint8_t> raw(stride * texture.height);
-    [texture getBytes:raw.data() bytesPerRow:stride
-        fromRegion:MTLRegionMake2D(0, 0, texture.width, texture.height) mipmapLevel:0];
+    const size_t native_width = texture.width, native_height = texture.height;
+    const size_t stride = native_width * 8;
+    id<MTLBuffer> backing = upload ? nil : texture.buffer;
+    const size_t buffer_stride = backing ? texture.bufferBytesPerRow : 0;
+    const size_t buffer_offset = backing ? texture.bufferOffset : 0;
+    const bool direct = backing && backing.contents && buffer_stride >= stride
+        && buffer_offset <= backing.length
+        && buffer_stride <= (backing.length - buffer_offset) / native_height;
+    std::vector<uint8_t> fetched;
+    const uint8_t *pixels;
+    size_t pixel_stride;
+    if (direct) {
+        pixels = static_cast<const uint8_t *>(backing.contents) + buffer_offset;
+        pixel_stride = buffer_stride;
+    } else {
+        fetched.resize(stride * native_height);
+        [texture getBytes:fetched.data() bytesPerRow:stride
+            fromRegion:MTLRegionMake2D(0, 0, native_width, native_height) mipmapLevel:0];
+        pixels = fetched.data();
+        pixel_stride = stride;
+    }
+    if (!upload && surface.surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR
+        && native_width == surface.width && native_height == surface.height) {
+        const size_t guest_stride = size_t(surface.strideInPixels) * 4;
+        for (uint32_t y = 0; y < surface.height; ++y) {
+            const auto *input = pixels + size_t(y) * pixel_stride;
+            auto *output = destination.data() + size_t(y) * guest_stride;
+            for (uint32_t x = 0; x < surface.width; ++x, input += 8, output += 4) {
+                uint16_t channels[4];
+                std::memcpy(channels, input, sizeof(channels));
+                const uint32_t word = packed_float_word(channels, mode);
+                std::memcpy(output, &word, sizeof(word));
+            }
+        }
+        return true;
+    }
     bool changed = false;
     for (uint32_t y = 0; y < surface.height; ++y) for (uint32_t x = 0; x < surface.width; ++x) {
         const size_t offset = packed_float_guest_pixel(surface, x, y) * 4;
@@ -1103,23 +1136,23 @@ static bool packed_float_surface_memory(id<MTLTexture> texture, const SceGxmColo
             std::memcpy(&word, source.data() + offset, 4);
             uint16_t channels[4];
             unpack_packed_float(word, mode, channels);
-            const auto [top,bottom]=write_native_interval(y,surface.height,texture.height,samples_y);
-            const auto [left,right]=write_native_interval(x,surface.width,texture.width,samples_x);
+            const auto [top,bottom]=write_native_interval(y,surface.height,native_height,samples_y);
+            const auto [left,right]=write_native_interval(x,surface.width,native_width,samples_x);
             for (size_t ny=top;ny<bottom;++ny)
                 for (size_t nx=left;nx<right;++nx)
-                    std::memcpy(raw.data() + ny * stride + nx * 8, channels, 8);
+                    std::memcpy(fetched.data() + ny * stride + nx * 8, channels, 8);
             changed = true;
         } else {
-            const size_t ny = size_t(y) * texture.height / surface.height;
-            const size_t nx = size_t(x) * texture.width / surface.width;
+            const size_t ny = size_t(y) * native_height / surface.height;
+            const size_t nx = size_t(x) * native_width / surface.width;
             uint16_t channels[4];
-            std::memcpy(channels, raw.data() + ny * stride + nx * 8, 8);
+            std::memcpy(channels, pixels + ny * pixel_stride + nx * 8, 8);
             const uint32_t word = packed_float_word(channels, mode);
             std::memcpy(destination.data() + offset, &word, 4);
         }
     }
-    if (changed) [texture replaceRegion:MTLRegionMake2D(0, 0, texture.width, texture.height)
-        mipmapLevel:0 withBytes:raw.data() bytesPerRow:stride];
+    if (changed) [texture replaceRegion:MTLRegionMake2D(0, 0, native_width, native_height)
+        mipmapLevel:0 withBytes:fetched.data() bytesPerRow:stride];
     return true;
 }
 static bool rgb9e5_expanded_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surface,
@@ -1240,30 +1273,51 @@ bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surfa
         const auto read = region ? *region : SurfaceRect{0, 0, surface.width, surface.height};
         const size_t stride = size_t(surface.strideInPixels) * pixel_bytes;
         const size_t offset = size_t(read.y) * stride + size_t(read.x) * pixel_bytes;
-        [texture getBytes:destination.data() + offset bytesPerRow:stride
-            fromRegion:MTLRegionMake2D(read.x, read.y, read.width, read.height) mipmapLevel:0];
+        id<MTLBuffer> backing = texture.buffer;
+        const size_t source_stride = texture.bufferBytesPerRow;
+        const size_t source_offset = texture.bufferOffset;
+        if (backing && backing.contents && source_stride >= size_t(surface.width) * pixel_bytes
+            && source_offset <= backing.length
+            && source_stride <= (backing.length - source_offset) / surface.height) {
+            const auto *source = static_cast<const uint8_t *>(backing.contents) + source_offset;
+            for (uint32_t y = read.y; y < read.y + read.height; ++y)
+                std::memcpy(destination.data() + size_t(y) * stride + size_t(read.x) * pixel_bytes,
+                    source + size_t(y) * source_stride + size_t(read.x) * pixel_bytes,
+                    size_t(read.width) * pixel_bytes);
+        } else {
+            [texture getBytes:destination.data() + offset bytesPerRow:stride
+                fromRegion:MTLRegionMake2D(read.x, read.y, read.width, read.height) mipmapLevel:0];
+        }
         return true;
     }
-    if (region && surface.surfaceType == SCE_GXM_COLOR_SURFACE_TILED
+    if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_TILED
         && texture.width == surface.width && texture.height == surface.height
-        && components.count != 3 && native_byte_order
+        && ((components.count != 3 && native_byte_order)
+            || (components.count == 4 && components.bytes == 1))
         && !reverse565 && !reverse_u1 && !reverse_e5 && (!packed_u2 || u2_mode == 0)) {
-        // Match Plus' tile-wise partial copy: fetch only the visible region,
-        // then place each row segment into its complete 32x32 guest tile.
-        const size_t row_bytes = size_t(region->width) * pixel_bytes;
-        std::vector<uint8_t> pixels(row_bytes * region->height);
+        // Copy whole 32-pixel row spans into guest tiles. The full-surface
+        // path used to revisit every pixel and every channel separately.
+        const auto read = region ? *region : SurfaceRect{0, 0, surface.width, surface.height};
+        const size_t row_bytes = size_t(read.width) * pixel_bytes;
+        std::vector<uint8_t> pixels(row_bytes * read.height);
         [texture getBytes:pixels.data() bytesPerRow:row_bytes
-            fromRegion:MTLRegionMake2D(region->x, region->y, region->width, region->height) mipmapLevel:0];
+            fromRegion:MTLRegionMake2D(read.x, read.y, read.width, read.height) mipmapLevel:0];
         const size_t tiles_per_row = surface.strideInPixels / 32;
-        for (uint32_t y = region->y; y < region->y + region->height; ++y) {
-            for (uint32_t x = region->x; x < region->x + region->width;) {
-                const uint32_t count = std::min(region->x + region->width - x, 32 - x % 32);
+        for (uint32_t y = read.y; y < read.y + read.height; ++y) {
+            for (uint32_t x = read.x; x < read.x + read.width;) {
+                const uint32_t count = std::min(read.x + read.width - x, 32 - x % 32);
                 const size_t tile_pixel = ((size_t(y / 32) * tiles_per_row + x / 32) * 1024)
                     + size_t(y % 32) * 32 + x % 32;
-                std::memcpy(destination.data() + tile_pixel * pixel_bytes,
-                    pixels.data() + size_t(y - region->y) * row_bytes
-                        + size_t(x - region->x) * pixel_bytes,
-                    size_t(count) * pixel_bytes);
+                auto *output = destination.data() + tile_pixel * pixel_bytes;
+                const auto *input = pixels.data() + size_t(y - read.y) * row_bytes
+                    + size_t(x - read.x) * pixel_bytes;
+                if (native_byte_order) std::memcpy(output, input, size_t(count) * pixel_bytes);
+                else for (uint32_t i = 0; i < count; ++i, input += 4, output += 4) {
+                    output[0] = input[channel[0]];
+                    output[1] = input[channel[1]];
+                    output[2] = input[channel[2]];
+                    output[3] = input[channel[3]];
+                }
                 x += count;
             }
         }
@@ -1275,17 +1329,33 @@ bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surfa
     const size_t fetch_width = region ? region->width : native_width;
     const size_t fetch_height = region ? region->height : native_height;
     const size_t native_stride = fetch_width * native_pixel_bytes;
-    std::vector<uint8_t> raw(native_stride * fetch_height);
-    [texture getBytes:raw.data() bytesPerRow:native_stride
-        fromRegion:MTLRegionMake2D(region ? region->x : 0, region ? region->y : 0,
-            fetch_width, fetch_height) mipmapLevel:0];
+    id<MTLBuffer> backing = texture.buffer;
+    const size_t buffer_stride = texture.bufferBytesPerRow;
+    const size_t buffer_offset = texture.bufferOffset;
+    const bool direct = backing && backing.contents && buffer_stride >= native_width * native_pixel_bytes
+        && buffer_offset <= backing.length
+        && buffer_stride <= (backing.length - buffer_offset) / native_height;
+    std::vector<uint8_t> fetched;
+    const uint8_t *raw;
+    size_t raw_stride;
+    if (direct) {
+        raw = static_cast<const uint8_t *>(backing.contents) + buffer_offset;
+        raw_stride = buffer_stride;
+    } else {
+        fetched.resize(native_stride * fetch_height);
+        [texture getBytes:fetched.data() bytesPerRow:native_stride
+            fromRegion:MTLRegionMake2D(region ? region->x : 0, region ? region->y : 0,
+                fetch_width, fetch_height) mipmapLevel:0];
+        raw = fetched.data();
+        raw_stride = native_stride;
+    }
     // Linear byte-channel surfaces need only a permutation. Keep the four
     // byte copies explicit so this common readback avoids dynamic memcpy
     // calls and Objective-C texture queries for every component and pixel.
     if (!region && surface.surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR && components.count == 4 && components.bytes == 1
         && native_width == surface.width && native_height == surface.height) {
         for (uint32_t y = 0; y < surface.height; ++y) {
-            const auto *input = raw.data() + y * native_stride;
+            const auto *input = raw + y * raw_stride;
             auto *output = destination.data() + size_t(y) * surface.strideInPixels * 4;
             for (uint32_t x = 0; x < surface.width; ++x, input += 4, output += 4) {
                 output[0] = input[channel[0]];
@@ -1308,9 +1378,9 @@ bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surfa
         else offset = size_t(y) * surface.strideInPixels + x;
         // Point-select the top-left native sample of each guest pixel, matching
         // the existing GL readback convention; never average packed data words.
-        const size_t source_y = region ? y - y0 : size_t(y) * native_height / surface.height;
-        const size_t source_x = region ? x - x0 : size_t(x) * native_width / surface.width;
-        const auto *input = raw.data() + source_y * native_stride + source_x * native_pixel_bytes;
+        const size_t source_y = region ? (direct ? y : y - y0) : size_t(y) * native_height / surface.height;
+        const size_t source_x = region ? (direct ? x : x - x0) : size_t(x) * native_width / surface.width;
+        const auto *input = raw + source_y * raw_stride + source_x * native_pixel_bytes;
         auto *output = destination.data() + offset * pixel_bytes;
         if (packed565) {
             uint16_t word;
