@@ -1395,10 +1395,45 @@ static bool write_surface_memory_mapped(id<MTLTexture> texture, const SceGxmColo
     const size_t pixel_bytes = components.count * components.bytes;
     const size_t native_pixel_bytes = components.count == 3 ? 4 : pixel_bytes;
     const size_t native_stride = texture.width * native_pixel_bytes;
+    // A linear, unscaled surface with identical guest/native channel order
+    // needs no per-pixel address lookup or channel conversion. Preserve bytes
+    // outside partial ranges in one native read, then upload the whole image.
+    // Full-range writes can upload the guest image without reading it back.
+    const bool direct_linear = surface.surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR
+        && samples_x == 1 && samples_y == 1
+        && texture.width == surface.width && texture.height == surface.height
+        && surface.strideInPixels >= surface.width
+        && pixel_bytes == native_pixel_bytes
+        && size == size_t(surface.strideInPixels) * texture.height * pixel_bytes
+        && mapping == identity && !packed565 && !packed4444 && !packed_u1
+        && !packed_e5 && !packed_u2 && !packed_f11;
+    if (direct_linear) {
+        const auto region = MTLRegionMake2D(0, 0, texture.width, texture.height);
+        const size_t guest_stride = size_t(surface.strideInPixels) * pixel_bytes;
+        if (ranges.size() == 1 && ranges.front().offset == 0 && ranges.front().size == size) {
+            [texture replaceRegion:region mipmapLevel:0 withBytes:source.data() bytesPerRow:guest_stride];
+            return true;
+        }
+        std::vector<uint8_t> native(native_stride * texture.height);
+        [texture getBytes:native.data() bytesPerRow:native_stride fromRegion:region mipmapLevel:0];
+        for (const auto &range : ranges) {
+            const size_t end = range.offset + range.size;
+            for (size_t y = range.offset / guest_stride; y < texture.height && y * guest_stride < end; ++y) {
+                const size_t row_begin = y * guest_stride;
+                const size_t first = std::max(range.offset, row_begin);
+                const size_t last = std::min(end, row_begin + native_stride);
+                if (first < last)
+                    std::memcpy(native.data() + y * native_stride + first - row_begin, source.data() + first, last - first);
+            }
+        }
+        [texture replaceRegion:region mipmapLevel:0 withBytes:native.data() bytesPerRow:native_stride];
+        return true;
+    }
     std::vector<uint8_t> raw(native_stride * texture.height);
     [texture getBytes:raw.data() bytesPerRow:native_stride
         fromRegion:MTLRegionMake2D(0,0,texture.width,texture.height) mipmapLevel:0];
     bool changed = false;
+    size_t linear_range_index = 0;
     for (uint32_t y = 0; y < surface.height; ++y) for (uint32_t x = 0; x < surface.width; ++x) {
         size_t pixel;
         if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_TILED)
@@ -1407,8 +1442,16 @@ static bool write_surface_memory_mapped(id<MTLTexture> texture, const SceGxmColo
             pixel = texture::encode_morton(x,y,surface.width,surface.height);
         else pixel = size_t(y) * surface.strideInPixels + x;
         const size_t offset = pixel * pixel_bytes;
-        auto range = std::lower_bound(ranges.begin(), ranges.end(), offset,
-            [](const auto &range, size_t offset) { return range.offset + range.size <= offset; });
+        auto range = ranges.begin();
+        if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR) {
+            while (linear_range_index < ranges.size()
+                && ranges[linear_range_index].offset + ranges[linear_range_index].size <= offset)
+                ++linear_range_index;
+            range += linear_range_index;
+        } else {
+            range = std::lower_bound(ranges.begin(), ranges.end(), offset,
+                [](const auto &range, size_t offset) { return range.offset + range.size <= offset; });
+        }
         if (range == ranges.end() || range->offset >= offset + pixel_bytes) continue;
         std::array<bool,16> written{};
         for (; range != ranges.end() && range->offset < offset + pixel_bytes; ++range)
@@ -3831,7 +3874,15 @@ bool SurfaceCaster::patch_depth_memory(id<MTLTexture> texture,const SceGxmDepthS
         return result;
     };
     const auto depth_ranges=normalize(depth_changes),stencil_ranges=normalize(stencil_changes);
-    const auto changed=[](size_t offset,const auto &ranges) {
+    // Linear depth rows visit guest offsets in order. Carry the range cursor
+    // forward instead of searching the same change list for every byte of
+    // every depth sample. Tiled rows keep the random-access lookup.
+    size_t depth_range_index=0,stencil_range_index=0;
+    const auto changed=[&](size_t offset,const auto &ranges,size_t &index) {
+        if (!layout.tiled) {
+            while (index<ranges.size() && ranges[index].offset+ranges[index].size<=offset) ++index;
+            return index<ranges.size() && ranges[index].offset<=offset;
+        }
         const auto it=std::lower_bound(ranges.begin(),ranges.end(),offset,[](const auto &range,size_t byte) {
             return range.offset+range.size<=byte;
         });
@@ -3850,7 +3901,7 @@ bool SurfaceCaster::patch_depth_memory(id<MTLTexture> texture,const SceGxmDepthS
         if (layout.depth_size) {
             std::memcpy(&patch[0],depth.data()+address*layout.depth_bytes,layout.depth_bytes);
             for (uint32_t b=0;b<layout.depth_bytes;++b)
-                if (changed(address*layout.depth_bytes+b,depth_ranges)) patch[1]|=0xffu<<(8*b);
+                if (changed(address*layout.depth_bytes+b,depth_ranges,depth_range_index)) patch[1]|=0xffu<<(8*b);
             if (layout.packed) {
                 patch[2]=patch[0]>>24;
                 patch[3]=bool(patch[1]&0xff000000u);
@@ -3859,7 +3910,7 @@ bool SurfaceCaster::patch_depth_memory(id<MTLTexture> texture,const SceGxmDepthS
         if (layout.stencil_size) {
             const size_t offset=address*(layout.packed ? 4 : 1)+(layout.packed ? 3 : 0);
             patch[2]=stencil[offset];
-            patch[3]|=changed(offset,stencil_ranges);
+            patch[3]|=changed(offset,stencil_ranges,stencil_range_index);
         }
         patch_depth|=bool(patch[1]&depth_bits);
         patch_stencil|=bool(patch[3]);

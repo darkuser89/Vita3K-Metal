@@ -2084,6 +2084,17 @@ bool MetalState::sync_surface(MemState &mem, const SceGxmColorSurface &surface) 
         || end > uint64_t(UINT32_MAX) - 4095
         || !is_valid_addr_range(mem, surface.data.address(), Address(end))) return false;
     const std::span<uint8_t> output{static_cast<uint8_t *>(surface.data.get(mem)), bytes};
+    // finish() may have just published this attachment. Precise texture
+    // aliases often request it again in the same draw sequence; repeating a
+    // GPU readback only converts the same native pixels a second time.
+    if (context) {
+        auto &ctx = *static_cast<MetalContext *>(context);
+        if (ctx.impl->color_guest_current && owns_color_binding(found->second, ctx)
+            && found->second.guest.strideInPixels == surface.strideInPixels
+            && found->second.guest.surfaceType == surface.surfaceType
+            && !surface_cpu_bytes_changed(found->second, output))
+            return true;
+    }
     std::vector<SurfaceMemoryRange> written;
     const auto publication = impl->surface_writes.writeback(mem, surface.data.address(), bytes, [&] {
         return read_surface_publication(found->second, surface, output, written, *impl->device, impl->caster);
