@@ -5328,9 +5328,10 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     entry.guest.height,rect,ctx.impl->commands);
             }
             prepared_images[index]=sampling_view(crop,gxm::get_format(texture),nullptr);
-            narrow_cast_coords[index]=!vertex && rect.x==0 && rect.y==0
-                && uint64_t(rect.width)==uint64_t(entry.guest.width)*2
-                && rect.height==entry.guest.height;
+            // The cast image starts at the requested rectangle. A guest word
+            // boundary keeps its pair phase at zero even for offset or cropped
+            // views, so the screen-relative UV correction still applies.
+            narrow_cast_coords[index]=!vertex && (rect.x%2)==0;
         }
         // A 16-bit color texel can be sampled as two consecutive guest bytes.
         // Recover the byte order before cropping the linear view.
@@ -5361,9 +5362,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     entry.guest.height,rect,ctx.impl->commands);
             }
             prepared_images[index]=sampling_view(crop,gxm::get_format(texture),nullptr);
-            narrow_cast_coords[index]=!vertex && rect.x==0 && rect.y==0
-                && uint64_t(rect.width)==uint64_t(entry.guest.width)*2
-                && rect.height==entry.guest.height;
+            narrow_cast_coords[index]=!vertex && (rect.x%2)==0;
         }
         // A four-byte RGBA8 color texel may also be addressed as four
         // individual guest bytes, including a rectangle within the surface.
@@ -5394,9 +5393,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     entry.guest.height,rect,ctx.impl->commands);
             }
             prepared_images[index]=sampling_view(crop,gxm::get_format(texture),nullptr);
-            narrow_cast_coords[index]=!vertex && rect.x==0 && rect.y==0
-                && uint64_t(rect.width)==uint64_t(entry.guest.width)*4
-                && rect.height==entry.guest.height;
+            narrow_cast_coords[index]=!vertex && (rect.x%4)==0;
         }
         // Split 64-bit F16x4/RG32 storage into one- or two-byte guest texels.
         // Cropping after reconstruction keeps offsets in guest byte units.
@@ -5428,9 +5425,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     entry.guest.height,rect,ctx.impl->commands);
             }
             prepared_images[index]=sampling_view(crop,gxm::get_format(texture),nullptr);
-            narrow_cast_coords[index]=!vertex && rect.x==0 && rect.y==0
-                && uint64_t(rect.width)==uint64_t(entry.guest.width)*(8/bytes)
-                && rect.height==entry.guest.height;
+            narrow_cast_coords[index]=!vertex && (rect.x%(8/bytes))==0;
         }
         // Other native 32-bit stores (F32 and two 16-bit components) can
         // expose their raw guest bytes through the same narrow GPU caster.
@@ -5462,9 +5457,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     entry.guest.height,rect,ctx.impl->commands);
             }
             prepared_images[index]=sampling_view(crop,gxm::get_format(texture),nullptr);
-            narrow_cast_coords[index]=!vertex && rect.x==0 && rect.y==0
-                && uint64_t(rect.width)==uint64_t(entry.guest.width)*(4/bytes)
-                && rect.height==entry.guest.height;
+            narrow_cast_coords[index]=!vertex && (rect.x%(4/bytes))==0;
         }
         // Carry direct 64-bit float aliases through normalized halfwords. A
         // bit-exact copy alone is insufficient: sampling an RG32Float view
