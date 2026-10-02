@@ -376,11 +376,12 @@ bool surface_texture_layout_overlap(const SceGxmColorSurface &surface, const Sce
     const uint64_t surface_pitch = uint64_t(surface.strideInPixels) * surface_bits / 8;
     const uint64_t address = uint64_t(texture.data_addr) << 2;
     // The final row of a linear surface ends at its visible width. Its trailing
-    // stride padding cannot own a texture view starting there. Tiled and
-    // swizzled surfaces retain their complete allocated row extent.
+    // stride padding cannot own a texture view starting there. Tiled storage
+    // allocates complete 32-row bands, including a partially visible last band.
     const uint64_t owned_bytes = layout == SCE_GXM_COLOR_SURFACE_LINEAR
         ? surface_pitch * (surface.height - 1) + uint64_t(surface.width) * surface_bits / 8
-        : surface_pitch * surface.height;
+        : surface_pitch * (layout == SCE_GXM_COLOR_SURFACE_TILED
+            ? ((uint64_t(surface.height) + 31) & ~uint64_t(31)) : surface.height);
     return pitch && pitch == surface_pitch && address >= surface.data.address()
         && address - surface.data.address() < owned_bytes;
 }
