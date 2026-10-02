@@ -4588,6 +4588,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         std::array<id<MTLTexture>, SCE_GXM_MAX_TEXTURE_UNITS*2> prepared_images{};
         std::array<std::optional<std::pair<float,float>>, SCE_GXM_MAX_TEXTURE_UNITS*2> surface_viewports{};
         std::array<shader::metal::TextureMipInfo,SCE_GXM_MAX_TEXTURE_UNITS*2> texture_mip_info{};
+        std::array<bool,SCE_GXM_MAX_TEXTURE_UNITS*2> narrow_cast_coords{};
         const auto rendered_cube=[&](const SceGxmTexture &texture,bool &raw)->id<MTLTexture> {
             const auto type=texture.texture_type();
             // Retain the existing full mip-chain assembler. This direct path
@@ -5312,6 +5313,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     entry.guest.height,rect,ctx.impl->commands);
             }
             prepared_images[index]=sampling_view(crop,gxm::get_format(texture),nullptr);
+            narrow_cast_coords[index]=!vertex && rect.x==0 && rect.y==0
+                && uint64_t(rect.width)==uint64_t(entry.guest.width)*2
+                && rect.height==entry.guest.height;
         }
         // A 16-bit color texel can be sampled as two consecutive guest bytes.
         // Recover the byte order before cropping the linear view.
@@ -5342,6 +5346,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     entry.guest.height,rect,ctx.impl->commands);
             }
             prepared_images[index]=sampling_view(crop,gxm::get_format(texture),nullptr);
+            narrow_cast_coords[index]=!vertex && rect.x==0 && rect.y==0
+                && uint64_t(rect.width)==uint64_t(entry.guest.width)*2
+                && rect.height==entry.guest.height;
         }
         // A four-byte RGBA8 color texel may also be addressed as four
         // individual guest bytes, including a rectangle within the surface.
@@ -5434,6 +5441,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     entry.guest.height,rect,ctx.impl->commands);
             }
             prepared_images[index]=sampling_view(crop,gxm::get_format(texture),nullptr);
+            narrow_cast_coords[index]=!vertex && bytes==2 && rect.x==0 && rect.y==0
+                && uint64_t(rect.width)==uint64_t(entry.guest.width)*2
+                && rect.height==entry.guest.height;
         }
         // Carry direct 64-bit float aliases through normalized halfwords. A
         // bit-exact copy alone is insufficient: sampling an RG32Float view
@@ -6779,6 +6789,12 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 dump_bytes(fmt::format("{}-texture-{}.gxm",vertex ? "vertex" : "fragment",slot),&texture,sizeof(texture));
             }
             auto &mip_info=texture_mip_info[index];
+            if (narrow_cast_coords[index] && fragment_scale!=1.f) {
+                const auto &target=static_cast<const MetalRenderTarget &>(*ctx.current_render_target);
+                // A complete two-texel view of each stored pixel has the
+                // same screen-relative word phase as the Plus cast sampler.
+                mip_info.cast_coords={fragment_scale,1.f/target.width,1.f/target.height,0.f};
+            }
             if (surface_viewports[index]) {
                 if (vertex) vertex_info.set_viewport_ratio(slot,*surface_viewports[index]);
                 else fragment_info.set_viewport_ratio(slot,*surface_viewports[index]);
