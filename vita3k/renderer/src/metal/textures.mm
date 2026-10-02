@@ -2150,13 +2150,20 @@ uint packed_depth_unorm(float depth,uint maximum) {
     return uint((product+(1ul<<(shift-1u)))>>shift);
 }
 uint packed_depth24(float depth) { return packed_depth_unorm(depth,0xffffffu); }
+uint packed_depth_alias24(float depth) {
+    // Plus reconstructs an S8D24 texture alias from a D32F attachment with
+    // a float32 product and round-to-even. Guest depth stores use the exact
+    // mantissa path above; the two differ at some quantization boundaries.
+    const float value=isnan(depth) ? 0.f : clamp(depth,0.f,1.f);
+    return uint(rint(value*16777215.f));
+}
 kernel void copy_packed_depth(depth2d<float,access::read> input [[texture(0)]],
     texture2d<uint,access::read> stencil [[texture(1)]],
     texture2d<float,access::write> output [[texture(2)]], uint2 p [[thread_position_in_grid]]) {
     if (p.x>=output.get_width() || p.y>=output.get_height()) return;
-    // Match Metal's guest S8D24 store, including its exact quantization.
-    // Texture channel swizzling and gamma decoding happen after packing.
-    const uint word=packed_depth24(input.read(p)) | ((stencil.read(p).x&255u)<<24);
+    // Match the Plus D32F-to-S8D24 alias conversion. Texture channel
+    // swizzling and gamma decoding happen after packing.
+    const uint word=packed_depth_alias24(input.read(p)) | ((stencil.read(p).x&255u)<<24);
     output.write(float4(uint4(word,word>>8,word>>16,word>>24)&255u)/255.f,p);
 }
 kernel void store_packed_depth_samples(depth2d<float,access::read> input [[texture(0)]],
