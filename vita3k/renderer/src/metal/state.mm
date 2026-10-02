@@ -1693,7 +1693,7 @@ bool MetalState::finish(MetalContext &ctx, bool publish_color, bool wait_without
             std::vector<SurfaceMemoryRange> written;
             const auto cached = impl->surfaces.find(surface.data.address());
             if (cached != impl->surfaces.end() && owns_color_binding(cached->second, ctx)) {
-                publication = impl->surface_writes.writeback(*ctx.impl->mem, [&] {
+                publication = impl->surface_writes.writeback(*ctx.impl->mem, surface.data.address(), bytes, [&] {
                     return read_surface_publication(cached->second, surface, output, written, *impl->device, impl->caster);
                 });
             }
@@ -2079,7 +2079,7 @@ bool MetalState::sync_surface(MemState &mem, const SceGxmColorSurface &surface) 
         || !is_valid_addr_range(mem, surface.data.address(), Address(end))) return false;
     const std::span<uint8_t> output{static_cast<uint8_t *>(surface.data.get(mem)), bytes};
     std::vector<SurfaceMemoryRange> written;
-    const auto publication = impl->surface_writes.writeback(mem, [&] {
+    const auto publication = impl->surface_writes.writeback(mem, surface.data.address(), bytes, [&] {
         return read_surface_publication(found->second, surface, output, written, *impl->device, impl->caster);
     });
     if (publication == SurfacePublication::Unavailable) return false;
@@ -2119,7 +2119,7 @@ int MetalState::sync_surfaces_for_cpu_read(MemState &mem, Address address, uint3
     for (auto *entry : candidates) {
         const std::span<uint8_t> guest{static_cast<uint8_t *>(entry->guest.data.get(mem)), surface_memory_size(entry->guest)};
         std::vector<SurfaceMemoryRange> written;
-        const auto result = impl->surface_writes.writeback(mem, [&] {
+        const auto result = impl->surface_writes.writeback(mem, entry->guest.data.address(), guest.size(), [&] {
             return read_surface_publication(*entry, entry->guest, guest, written, *impl->device, impl->caster);
         });
         if (result == SurfacePublication::Unavailable) return CommandErrorSurfaceSyncFailed;

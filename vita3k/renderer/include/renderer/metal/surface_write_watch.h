@@ -58,6 +58,30 @@ class SurfaceWriteTracker {
         }
     }
 
+    static void release_cpu_writeback_protection(MemState &mem, Address address, size_t size) {
+        if (mem.use_page_table) return;
+        const uint64_t end = uint64_t(address) + size;
+        if (!address || !size || end > UINT32_MAX)
+            throw std::runtime_error("Metal: invalid CPU writeback range");
+        for (;;) {
+            Address protected_address = 0;
+            {
+                const std::lock_guard lock(mem.protect_mutex);
+                for (const auto &[base, segment] : mem.protect_tree)
+                    if (uint64_t(base) < end && uint64_t(base) + segment.size > address) {
+                        protected_address = std::max(base, address);
+                        break;
+                    }
+            }
+            if (!protected_address) break;
+            // getBytes can write from inside the Metal driver. Release the
+            // watched guest page here so its host fault does not first enter
+            // Dynarmic's unrelated Mach exception handler.
+            if (!handle_access_violation(mem, mem.memory.get() + protected_address, true))
+                throw std::runtime_error("Metal: cannot release protection for CPU writeback");
+        }
+    }
+
 public:
     SurfaceWriteStamp capture(MemState &mem, Address address, size_t size) {
         const uint64_t page = mem.host_page_size;
@@ -106,6 +130,14 @@ public:
             try { rearm(mem); } catch (...) {}
             std::rethrow_exception(failure);
         }
+    }
+
+    template <typename Function>
+    auto writeback(MemState &mem, Address address, size_t size, Function &&function) {
+        return writeback(mem, [&] {
+            release_cpu_writeback_protection(mem, address, size);
+            return function();
+        });
     }
     // Apple no-copy buffers created over CPU-ReadOnly pages can receive GPU
     // stores in a separate mapping. Make shader-store ranges writable before
