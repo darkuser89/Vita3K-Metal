@@ -1466,9 +1466,9 @@ void SettingsDialog::update_gpu_visibility() {
     const int mask = app::get_supported_memory_mapping_mask(emuenv, gpu_idx);
     const bool has_mapping = is_vulkan && (mask > 1);
 
-    // Vulkan-only widgets
+    // Renderer accuracy is supported by Vulkan and native Metal.
     m_ui->gb_gpu_device->setVisible(is_vulkan);
-    m_ui->gb_renderer_accuracy->setVisible(is_vulkan);
+    m_ui->gb_renderer_accuracy->setVisible(is_vulkan || is_metal);
     m_ui->gb_vulkan_options->setVisible(is_vulkan);
     m_ui->spirv_shader->setVisible(is_vulkan);
 

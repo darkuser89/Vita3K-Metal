@@ -2026,8 +2026,8 @@ void MainWindow::update_renderer_button() {
 
 void MainWindow::update_accuracy_button() {
     const bool high = emuenv.cfg.current_config.high_accuracy;
-    const bool is_vulkan = emuenv.cfg.current_config.backend_renderer == "Vulkan";
-    m_accuracy_button->setVisible(is_vulkan);
+    const auto &renderer = emuenv.cfg.current_config.backend_renderer;
+    m_accuracy_button->setVisible(renderer == "Vulkan" || renderer == "Metal");
     if (high) {
         m_accuracy_button->setText(tr("HIGH"));
         update_status_button_accent(m_accuracy_button, QStringLiteral("high"));

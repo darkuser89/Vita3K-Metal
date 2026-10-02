@@ -2328,8 +2328,13 @@ bool MetalState::transfer_fill(MemState &mem, const SceGxmTransferImage &image, 
         }
         if (update.ranges.empty()) continue;
         const uint64_t end = uint64_t(address)+update.bytes;
-        if (!update.bytes || end > uint64_t(UINT32_MAX)-4095 || !is_valid_addr_range(mem,address,Address(end))
-            || !write_surface_storage(surface,surface.guest,
+        if (!update.bytes || end > uint64_t(UINT32_MAX)-4095 || !is_valid_addr_range(mem,address,Address(end))) return false;
+        // A complete fill replaces every guest byte represented by this
+        // attachment. Importing the old CPU image first would upload data that
+        // the fill immediately overwrites; partial rows still need that import.
+        const bool complete_fill = update.ranges.size() == 1 && update.ranges[0].offset == 0
+            && update.ranges[0].size == update.bytes;
+        if (!complete_fill && !write_surface_storage(surface,surface.guest,
                 {static_cast<const uint8_t *>(surface.guest.data.get(mem)),update.bytes},{})) return false;
         updates.push_back(std::move(update));
     }
