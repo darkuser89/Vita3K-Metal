@@ -2529,6 +2529,31 @@ EXPORT(int, sceGxmDisplayQueueFinish) {
     return 0;
 }
 
+static uint32_t metal_mapped_uniform_size(const GxmState &gxm, Address address, uint32_t requested_size) {
+    const uint64_t requested_end = uint64_t(address) + requested_size;
+    const auto next = gxm.memory_mapped_regions.upper_bound(address);
+    uint64_t mapped_end = address;
+
+    // A later overlapping mapping may end before the binding while an older
+    // mapping still contains it. Find the full mapped prefix from this address.
+    for (auto it = next; it != gxm.memory_mapped_regions.begin();) {
+        --it;
+        mapped_end = std::max(mapped_end, uint64_t(it->first) + it->second.size);
+        if (mapped_end >= requested_end)
+            return requested_size;
+    }
+    if (mapped_end == address)
+        return requested_size; // No GXM mapping at the binding address.
+
+    // Adjacent or overlapping mappings extend the readable prefix.
+    for (auto it = next; it != gxm.memory_mapped_regions.end() && it->first <= mapped_end; ++it) {
+        mapped_end = std::max(mapped_end, uint64_t(it->first) + it->second.size);
+        if (mapped_end >= requested_end)
+            return requested_size;
+    }
+    return static_cast<uint32_t>(mapped_end - address);
+}
+
 static void gxmSetUniformBuffers(renderer::State &state, GxmState &gxm, SceGxmContext *context, const SceGxmProgram &program, std::span<UniformBuffer> buffers, const UniformBufferSizes &sizes, const MemState &mem) {
     for (size_t i = 0; i < buffers.size(); i++) {
         if (!buffers[i] || sizes.at(i) == 0) {
@@ -2536,21 +2561,10 @@ static void gxmSetUniformBuffers(renderer::State &state, GxmState &gxm, SceGxmCo
         }
 
         uint32_t bytes_to_copy = sizes.at(i) * 4;
+        if (state.current_backend == renderer::Backend::Metal)
+            bytes_to_copy = metal_mapped_uniform_size(gxm, buffers[i].address(), bytes_to_copy);
         if (sizes.at(i) == SCE_GXM_MAX_UB_IN_FLOAT_UNIT) {
-            if (state.current_backend == renderer::Backend::Metal) {
-                // Plus bounds an open-ended uniform by its containing mapping
-                // and any following touching/overlapping mappings. lower_bound
-                // alone selects the next mapping for an interior address.
-                const Address address = buffers[i].address();
-                auto ite = gxm.memory_mapped_regions.upper_bound(address);
-                if (ite != gxm.memory_mapped_regions.begin()
-                    && uint64_t(std::prev(ite)->first) + std::prev(ite)->second.size > address) {
-                    uint64_t span_end = uint64_t(std::prev(ite)->first) + std::prev(ite)->second.size;
-                    for (; ite != gxm.memory_mapped_regions.end() && ite->first <= span_end; ++ite)
-                        span_end = std::max(span_end, uint64_t(ite->first) + ite->second.size);
-                    bytes_to_copy = static_cast<uint32_t>(std::min<uint64_t>(span_end - address, bytes_to_copy));
-                }
-            } else {
+            if (state.current_backend != renderer::Backend::Metal) {
                 // The region containing the address is the last one starting at or before it.
                 auto ite = gxm.memory_mapped_regions.upper_bound(buffers[i].address());
                 if (ite != gxm.memory_mapped_regions.begin()) {
