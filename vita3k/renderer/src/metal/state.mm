@@ -391,7 +391,7 @@ static SurfacePublication read_surface_publication(const Surface &entry, const S
         intersect(entry.scene_writes);
         ownership_clamped = true;
     }
-    if (bounds.empty()) return SurfacePublication::Published;
+    if (bounds.empty()) return SurfacePublication::Skipped;
     if (!surface_memory_ranges(surface,
             {bounds.x0, bounds.y0, bounds.x1 - bounds.x0, bounds.y1 - bounds.y0}, written)) return SurfacePublication::Unavailable;
     for (const auto &range : written) {
