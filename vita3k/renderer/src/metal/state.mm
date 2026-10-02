@@ -2876,10 +2876,10 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                 && uint64_t(target->width)>=uint64_t(color_width)*2
                 && uint64_t(target->height)>=uint64_t(color_height)*2
             ? 0.5f : 1.f;
-        require(!ctx.impl->expanded_color || (!(surface.width%(samples/2)) && !(surface.height%2)),"Metal: invalid expanded MSAA color extent");
-        // Fractionally scaled expanded images may end inside a sample tile.
-        // Keep the exact resolved extent and allocate one extra native pixel
-        // for that partial tile; the conversion passes map its valid samples.
+        // A valid GXM color surface may end inside a 2x/4x sample tile. Keep
+        // the exact guest extent and allocate the last partial native pixel;
+        // the conversion passes map its valid samples and duplicate the edge
+        // value only into samples with no corresponding guest pixel.
         const auto width=ctx.impl->expanded_color ? (color_width+samples/2-1)/(samples/2) : color_width;
         const auto height=ctx.impl->expanded_color ? (color_height+1)/2 : color_height;
         require(width && height, "Metal: empty render target");

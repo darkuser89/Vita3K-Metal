@@ -2036,7 +2036,7 @@ kernel void decode_rg_gamma(texture2d<float, access::read> input [[texture(0)]],
 uint2 sample_axis(uint p, uint output_size, uint native_size, uint guest_size, uint sample_extent) {
     if (output_size<guest_size) return uint2(min(p/sample_extent,native_size-1),p%sample_extent);
     const uint guest=min(((p+1)*guest_size-1)/output_size,guest_size-1);
-    const uint groups=guest_size/sample_extent, group=guest/sample_extent;
+    const uint groups=(guest_size+sample_extent-1)/sample_extent, group=guest/sample_extent;
     const uint first=group*native_size/groups, last=(group+1)*native_size/groups;
     const uint start=guest*output_size/guest_size, end=(guest+1)*output_size/guest_size;
     const uint native=first+min((p-start)*(last-first)/max(end-start,1u),last-first-1);
@@ -2048,10 +2048,13 @@ uint3 sample_address(uint2 p, uint2 output_size, uint2 native_size, uint2 guest_
     return uint3(x.x,y.x,y.y*(samples/2)+x.y);
 }
 uint2 seed_axis(uint native, uint native_size, uint source_size, uint guest_size, uint sample_extent, uint sample) {
-    const uint groups=guest_size/sample_extent;
+    const uint groups=(guest_size+sample_extent-1)/sample_extent;
     const uint group=min(native_size<groups ? native*groups/native_size
         : ((native+1)*groups-1)/native_size,groups-1);
-    const uint guest=group*sample_extent+sample;
+    // The last native pixel can contain samples beyond an odd guest extent.
+    // Seed those samples from the last valid guest pixel so later resolves or
+    // clipped continuations never read outside the packed image.
+    const uint guest=min(group*sample_extent+sample,guest_size-1);
     if (source_size<guest_size)
         return uint2(min(native*sample_extent+sample,source_size-1),guest);
     const uint first=group*native_size/groups, last=(group+1)*native_size/groups;
@@ -2473,7 +2476,7 @@ void SurfaceCaster::expand_multisample(id<MTLTexture> source, id<MTLTexture> des
     const uint32_t sx=uint32_t(source.sampleCount/2);
     if (!guest_width) guest_width=uint32_t(std::ceil(double(destination.width)/scale));
     if (!guest_height) guest_height=uint32_t(std::ceil(double(destination.height)/scale));
-    if (!guest_width || !guest_height || guest_width%sx || guest_height%2
+    if (!guest_width || !guest_height
         || destination.width>source.width*sx || destination.height>source.height*2
         || !source.width || !source.height)
         throw std::runtime_error("Metal: invalid expanded sample guest extent");
@@ -2507,7 +2510,7 @@ void SurfaceCaster::seed_multisample(id<MTLTexture> source, id<MTLTexture> desti
     const uint32_t sx=uint32_t(destination.sampleCount/2);
     if (!guest_width) guest_width=uint32_t(std::ceil(double(source.width)/scale));
     if (!guest_height) guest_height=uint32_t(std::ceil(double(source.height)/scale));
-    if (expanded && (!guest_width || !guest_height || guest_width%sx || guest_height%2
+    if (expanded && (!guest_width || !guest_height
         || source.width>destination.width*sx || source.height>destination.height*2
         || !destination.width || !destination.height))
         throw std::runtime_error("Metal: invalid sample seed guest extent");
