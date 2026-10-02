@@ -2076,8 +2076,12 @@ bool MetalState::sync_surface(MemState &mem, const SceGxmColorSurface &surface) 
     const auto publication = impl->surface_writes.writeback(mem, [&] {
         return read_surface_publication(found->second, surface, output, written, *impl->device, impl->caster);
     });
-    if (publication == SurfacePublication::Unavailable || publication == SurfacePublication::Skipped) return false;
-    if (publication == SurfacePublication::CpuNewer) return true;
+    if (publication == SurfacePublication::Unavailable) return false;
+    // Plus deliberately leaves incomplete small tiled surfaces in guest RAM.
+    // A texture alias can still decode those existing bytes; skipping the GPU
+    // writeback is not a fatal conversion failure. Keep the CPU baseline and
+    // GPU dirty state untouched so a later complete surface can publish.
+    if (publication == SurfacePublication::Skipped || publication == SurfacePublication::CpuNewer) return true;
     if (found->second.guest.strideInPixels == surface.strideInPixels
         && found->second.guest.surfaceType == surface.surfaceType) {
         update_cpu_snapshot(found->second, output, written);
