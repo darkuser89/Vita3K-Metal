@@ -229,8 +229,6 @@ void KernelState::process_exit() {
     {
         std::lock_guard<std::mutex> lock(mutex);
         process_exiting = true;
-        for (auto &[_, timer] : timers)
-            timer->condvar.notify_all();
         for (auto &[_, thread] : threads)
             thread->exit_delete(false);
     }

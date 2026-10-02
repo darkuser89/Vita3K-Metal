@@ -2551,10 +2551,13 @@ static void gxmSetUniformBuffers(renderer::State &state, GxmState &gxm, SceGxmCo
                     bytes_to_copy = static_cast<uint32_t>(std::min<uint64_t>(span_end - address, bytes_to_copy));
                 }
             } else {
-                auto ite = gxm.memory_mapped_regions.lower_bound(buffers[i].address());
-                if ((ite != gxm.memory_mapped_regions.end()) && ((ite->first + ite->second.size) > buffers[i].address())) {
-                    // Bound the size
-                    bytes_to_copy = std::min<uint32_t>(ite->first + ite->second.size - buffers[i].address(), bytes_to_copy);
+                // The region containing the address is the last one starting at or before it.
+                auto ite = gxm.memory_mapped_regions.upper_bound(buffers[i].address());
+                if (ite != gxm.memory_mapped_regions.begin()) {
+                    --ite;
+                    if (uint64_t(ite->first) + ite->second.size > buffers[i].address())
+                        bytes_to_copy = static_cast<uint32_t>(std::min<uint64_t>(
+                            uint64_t(ite->first) + ite->second.size - buffers[i].address(), bytes_to_copy));
                 }
             }
 
