@@ -5379,6 +5379,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     entry.guest.height,rect,ctx.impl->commands);
             }
             prepared_images[index]=sampling_view(crop,gxm::get_format(texture),nullptr);
+            narrow_cast_coords[index]=!vertex && rect.x==0 && rect.y==0
+                && uint64_t(rect.width)==uint64_t(entry.guest.width)*4
+                && rect.height==entry.guest.height;
         }
         // Split 64-bit F16x4/RG32 storage into one- or two-byte guest texels.
         // Cropping after reconstruction keeps offsets in guest byte units.
@@ -5410,6 +5413,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     entry.guest.height,rect,ctx.impl->commands);
             }
             prepared_images[index]=sampling_view(crop,gxm::get_format(texture),nullptr);
+            narrow_cast_coords[index]=!vertex && rect.x==0 && rect.y==0
+                && uint64_t(rect.width)==uint64_t(entry.guest.width)*(8/bytes)
+                && rect.height==entry.guest.height;
         }
         // Other native 32-bit stores (F32 and two 16-bit components) can
         // expose their raw guest bytes through the same narrow GPU caster.
@@ -5441,8 +5447,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     entry.guest.height,rect,ctx.impl->commands);
             }
             prepared_images[index]=sampling_view(crop,gxm::get_format(texture),nullptr);
-            narrow_cast_coords[index]=!vertex && bytes==2 && rect.x==0 && rect.y==0
-                && uint64_t(rect.width)==uint64_t(entry.guest.width)*2
+            narrow_cast_coords[index]=!vertex && rect.x==0 && rect.y==0
+                && uint64_t(rect.width)==uint64_t(entry.guest.width)*(4/bytes)
                 && rect.height==entry.guest.height;
         }
         // Carry direct 64-bit float aliases through normalized halfwords. A
@@ -6791,8 +6797,8 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             auto &mip_info=texture_mip_info[index];
             if (narrow_cast_coords[index] && fragment_scale!=1.f) {
                 const auto &target=static_cast<const MetalRenderTarget &>(*ctx.current_render_target);
-                // A complete two-texel view of each stored pixel has the
-                // same screen-relative word phase as the Plus cast sampler.
+                // Plus snaps a screen-relative cast to a pair of guest texels
+                // regardless of how many bytes the source pixel contains.
                 mip_info.cast_coords={fragment_scale,1.f/target.width,1.f/target.height,0.f};
             }
             if (surface_viewports[index]) {
