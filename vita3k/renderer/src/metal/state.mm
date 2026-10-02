@@ -3114,10 +3114,10 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
         const auto &ds = ctx.record.depth_stencil_surface;
         ctx.impl->guest_depth=ds;
         const uint32_t guest_depth_width=surface.data
-            ? surface.width/(ctx.impl->expanded_color ? samples/2 : 1)
+            ? (surface.width+(ctx.impl->expanded_color ? samples/2 : 1)-1)/(ctx.impl->expanded_color ? samples/2 : 1)
             : target->guest_width ? target->guest_width : uint32_t(std::lround(double(width)/res_multiplier));
         const uint32_t guest_depth_height=surface.data
-            ? surface.height/(ctx.impl->expanded_color ? 2 : 1)
+            ? (surface.height+(ctx.impl->expanded_color ? 2 : 1)-1)/(ctx.impl->expanded_color ? 2 : 1)
             : target->guest_height ? target->guest_height : uint32_t(std::lround(double(height)/res_multiplier));
         ctx.impl->depth_layout=res_multiplier>0
             ? depth_memory_layout(ds,guest_depth_width,guest_depth_height,target->multisample_mode):std::nullopt;
@@ -6257,9 +6257,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
         vert.viewport_flip = {record.viewport_flat ? 1.0f : record.viewport_flip[0], record.viewport_flat ? -1.0f : -record.viewport_flip[1], 1, 1};
         vert.viewport_flag = record.viewport_flat ? 0 : 1;
         vert.screen_width = ctx.impl->expanded_color
-            ? float(ctx.impl->guest_color.width/(ctx.impl->samples/2)) : ctx.impl->width/res_multiplier;
+            ? float((ctx.impl->guest_color.width+ctx.impl->samples/2-1)/(ctx.impl->samples/2)) : ctx.impl->width/res_multiplier;
         vert.screen_height = ctx.impl->expanded_color
-            ? float(ctx.impl->guest_color.height/2) : ctx.impl->height/res_multiplier;
+            ? float((ctx.impl->guest_color.height+1)/2) : ctx.impl->height/res_multiplier;
         vert.z_offset = record.z_offset; vert.z_scale = record.z_scale;
         vert.point_size = float(std::max(1u, record.line_width)) * res_multiplier;
         auto &frag = fragment_info.base_block;
