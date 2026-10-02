@@ -5047,18 +5047,23 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             const bool cropped=rect.x || rect.y || rect.width!=entry.guest.width || rect.height!=entry.guest.height;
             const bool same_format=surface_texture_format_matches(entry.guest.colorFormat,gxm::get_format(texture));
             const auto texture_base=gxm::get_base_format(gxm::get_format(texture));
-            const bool gpu_cast=!same_format && !texture.gamma_mode
-                && surface_format_cast_enqueueable(entry.guest.colorFormat,texture_base,texture.swizzle_format);
+            const bool enqueueable_cast=surface_format_cast_enqueueable(entry.guest.colorFormat,
+                texture_base,texture.swizzle_format);
+            const bool gpu_cast=!same_format && !texture.gamma_mode && enqueueable_cast;
             const bool raw_cast=surface_raw_cast_required(entry.guest.colorFormat,texture_base);
+            const bool native_resolution_cast=!same_format
+                && surface_format_cast_supported(entry.guest.colorFormat,texture_base,texture.swizzle_format);
+            const bool synchronous_native_cast=native_resolution_cast && !enqueueable_cast;
             if (surface_texture_needs_native_resolution(entry.guest.colorFormat, texture,
                     res_multiplier, features.use_texture_viewport)
-                && (same_format || surface_format_cast_enqueueable(entry.guest.colorFormat,
-                    texture_base, texture.swizzle_format))) {
+                && (same_format || native_resolution_cast)) {
                 // Restore the guest texel grid for small point-filtered data
                 // textures at fractional resolution, as in Plus' cast path.
                 // Do not publish through RAM: recent GPU owners can coexist
                 // with newer CPU bytes that this texture reader must preserve.
-                if (capture_draw) {
+                // Packed casts read the converted image on the CPU. Complete
+                // the producer and the resample before inspecting those bytes.
+                if (capture_draw || synchronous_native_cast) {
                     finish(ctx, false, true);
                     inline_color_expanded = false;
                 } else if (entry.color == ctx.impl->color) prepare_inline_color();
@@ -5069,7 +5074,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 const uint32_t y = std::min<uint32_t>(uint32_t(rect.y * double(res_multiplier)), source.height - 1);
                 const uint32_t w = std::min<uint32_t>(std::max(1u, uint32_t(rect.width * double(res_multiplier))), source.width - x);
                 const uint32_t h = std::min<uint32_t>(std::max(1u, uint32_t(rect.height * double(res_multiplier))), source.height - y);
-                const auto commands = capture_draw ? nil : ctx.impl->commands;
+                const auto commands = capture_draw || synchronous_native_cast ? nil : ctx.impl->commands;
                 auto native = impl->caster->resample_publication(source, rect.width, rect.height,
                     {x, y, w, h}, {0, 0, rect.width, rect.height}, !same_format, commands);
                 std::optional<SceGxmColorFormat> format = entry.guest.colorFormat;
