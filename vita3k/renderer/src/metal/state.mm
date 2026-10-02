@@ -3032,6 +3032,26 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                         ctx.impl->color_guest_current = true;
                 }
             }
+            // Plus initializes a newly created large linear atlas from guest
+            // memory even when normal scene writeback is disabled. This is a
+            // one-time import, not a change to the surface-sync preference.
+            const auto base_format=gxm::get_base_format(surface.colorFormat);
+            if (disable_surface_sync && new_color && res_multiplier > 0
+                && surface.surfaceType==SCE_GXM_COLOR_SURFACE_LINEAR
+                && surface.width>=1024 && surface.height>=1024
+                && base_format!=SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16
+                && base_format!=SCE_GXM_COLOR_BASE_FORMAT_U2F10F10F10
+                && base_format!=SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9) {
+                const size_t bytes=surface_memory_size(surface);
+                const uint64_t end=uint64_t(surface.data.address())+bytes;
+                if (bytes && end<=uint64_t(UINT32_MAX)-4095
+                    && is_valid_addr_range(mem,surface.data.address(),Address(end))) {
+                    const std::span<const uint8_t> cpu{static_cast<const uint8_t *>(surface.data.get(mem)),bytes};
+                    const SurfaceMemoryRange all{0,bytes};
+                    if (write_surface_storage(entry,surface,cpu,{&all,1}))
+                        entry.cpu_snapshot.assign(cpu.begin(),cpu.end());
+                }
+            }
             if (new_color || samples==1) entry.multisample_dirty=true;
             if (new_color || samples==1) entry.raw_multisample_dirty=true;
             if (samples>1) {
