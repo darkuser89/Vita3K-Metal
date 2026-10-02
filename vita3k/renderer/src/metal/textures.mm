@@ -774,20 +774,16 @@ static size_t packed_float_guest_pixel(const SceGxmColorSurface &surface, uint32
     return size_t(y) * surface.strideInPixels + x;
 }
 static uint16_t packed_float10_from_half(uint16_t bits) {
-    // The existing GXM texture decoder expands each unsigned 10-bit float
-    // by shifting its five exponent and five mantissa bits into binary16.
-    if (bits & 0x8000) return 0;
-    uint16_t result = std::min<uint16_t>((uint32_t(bits) + 16) >> 5, 0x3ff);
-    if ((bits & 0x7c00) == 0x7c00 && (bits & 0x03ff) && !(result & 31))
-        result |= 1; // Keep a small NaN payload from rounding to infinity.
-    return result;
+    // Match Plus's color-surface writeback: discard the five low mantissa
+    // bits of a positive half word and clamp negative words to zero.
+    return (bits & 0x8000) ? 0 : (bits >> 5) & 0x3ff;
 }
 static uint32_t packed_float_word(const uint16_t *channels, uint32_t mode) {
-    __fp16 alpha_half;
-    std::memcpy(&alpha_half, channels + 3, sizeof(alpha_half));
-    const float alpha = static_cast<float>(alpha_half);
-    const uint32_t alpha2 = std::isnan(alpha) ? 0
-        : uint32_t(std::clamp(std::lround(std::clamp(alpha, 0.0f, 1.0f) * 3.0f), 0l, 3l));
+    const uint16_t alpha_half = channels[3];
+    const uint32_t alpha2 = (alpha_half & 0x8000) ? 0
+        : alpha_half >= 0x3aab ? 3
+        : alpha_half >= 0x3800 ? 2
+        : alpha_half >= 0x3155 ? 1 : 0;
     const bool blue_first = mode == 1 || mode == 2;
     const uint32_t first = packed_float10_from_half(channels[blue_first ? 2 : 0]);
     const uint32_t second = packed_float10_from_half(channels[1]);
