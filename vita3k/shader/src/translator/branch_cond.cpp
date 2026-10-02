@@ -252,7 +252,12 @@ spv::Id USSETranslatorVisitor::vtst_impl(Instruction inst, ExtPredicate pred, in
     // 0 - alway pass
     // 1 - zero
     // 2 - non-zero
-    const bool compare_include_equal = (zero_test == 1);
+    // When the zero test is disabled, a signed shift result with its sign
+    // bit clear includes zero. This matters for shifts of comparison masks:
+    // a zero mask must satisfy the nonnegative sign test on Metal.
+    const bool compare_include_equal = (zero_test == 1)
+        || (m_spirv_params.native_metal && inst.opcode == Opcode::SHL
+            && load_data_type == DataType::UINT32 && sign_test == 2 && zero_test == 0);
 
     // Sign test number
 
