@@ -1176,8 +1176,8 @@ static bool rgb9e5_expanded_surface_memory(id<MTLTexture> texture, const SceGxmC
 }
 bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surface,
     std::span<uint8_t> destination, const SurfaceRect *region) {
-    // Packed and expanded storage needs a whole-image conversion. A partial
-    // read is only supported by the direct linear byte-copy path below.
+    // Expanded storage needs a whole-image conversion. Ordinary native
+    // formats can convert a bounded region on the same guest pixel grid.
     if (region && (!region->width || !region->height
         || uint64_t(region->x) + region->width > surface.width
         || uint64_t(region->y) + region->height > surface.height)) return false;
@@ -1269,17 +1269,20 @@ bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surfa
         }
         return true;
     }
-    if (region) return false;
+    if (region && (texture.width != surface.width || texture.height != surface.height)) return false;
     const size_t native_pixel_bytes = components.count == 3 ? 4 : pixel_bytes;
     const size_t native_width = texture.width, native_height = texture.height;
-    const size_t native_stride = native_width * native_pixel_bytes;
-    std::vector<uint8_t> raw(native_stride * native_height);
+    const size_t fetch_width = region ? region->width : native_width;
+    const size_t fetch_height = region ? region->height : native_height;
+    const size_t native_stride = fetch_width * native_pixel_bytes;
+    std::vector<uint8_t> raw(native_stride * fetch_height);
     [texture getBytes:raw.data() bytesPerRow:native_stride
-        fromRegion:MTLRegionMake2D(0, 0, native_width, native_height) mipmapLevel:0];
+        fromRegion:MTLRegionMake2D(region ? region->x : 0, region ? region->y : 0,
+            fetch_width, fetch_height) mipmapLevel:0];
     // Linear byte-channel surfaces need only a permutation. Keep the four
     // byte copies explicit so this common readback avoids dynamic memcpy
     // calls and Objective-C texture queries for every component and pixel.
-    if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR && components.count == 4 && components.bytes == 1
+    if (!region && surface.surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR && components.count == 4 && components.bytes == 1
         && native_width == surface.width && native_height == surface.height) {
         for (uint32_t y = 0; y < surface.height; ++y) {
             const auto *input = raw.data() + y * native_stride;
@@ -1293,7 +1296,10 @@ bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surfa
         }
         return true;
     }
-    for (uint32_t y = 0; y < surface.height; ++y) for (uint32_t x = 0; x < surface.width; ++x) {
+    const uint32_t x0 = region ? region->x : 0, y0 = region ? region->y : 0;
+    const uint32_t x1 = region ? region->x + region->width : surface.width;
+    const uint32_t y1 = region ? region->y + region->height : surface.height;
+    for (uint32_t y = y0; y < y1; ++y) for (uint32_t x = x0; x < x1; ++x) {
         size_t offset;
         if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_TILED)
             offset = ((size_t(y / 32) * (surface.strideInPixels / 32) + x / 32) * 1024) + (y % 32) * 32 + x % 32;
@@ -1302,8 +1308,9 @@ bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surfa
         else offset = size_t(y) * surface.strideInPixels + x;
         // Point-select the top-left native sample of each guest pixel, matching
         // the existing GL readback convention; never average packed data words.
-        const auto *input = raw.data() + (size_t(y) * native_height / surface.height) * native_stride
-            + (size_t(x) * native_width / surface.width) * native_pixel_bytes;
+        const size_t source_y = region ? y - y0 : size_t(y) * native_height / surface.height;
+        const size_t source_x = region ? x - x0 : size_t(x) * native_width / surface.width;
+        const auto *input = raw.data() + source_y * native_stride + source_x * native_pixel_bytes;
         auto *output = destination.data() + offset * pixel_bytes;
         if (packed565) {
             uint16_t word;
