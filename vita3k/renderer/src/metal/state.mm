@@ -1381,20 +1381,46 @@ void MetalState::precompile_shader(const ShadersHash &hash) {
                     LOG_WARN("Metal: cached {} warmup {:016x} failed; draw will rebuild it: {}",
                         kind, XXH3_64bits(key.data(), key.size()), error);
             };
-            const auto warm_shader = [&](const std::string &key, shader::metal::Stage stage, bool gamma) {
-                if (render_abort.load(std::memory_order_relaxed) || impl->shaders.contains(key)
-                    || impl->warmup_failed_shaders.contains(key)) return;
+            // The render thread alone owns the resident maps and counters.
+            // Two independent compiler jobs overlap CPU/driver work while their
+            // futures retain the source/result until this call joins them.
+            using WarmShader = std::future<std::unique_ptr<CompiledProgram>>;
+            std::deque<std::pair<std::string, WarmShader>> warming;
+            const auto retire_shader = [&] {
+                auto [key, future] = std::move(warming.front());
+                warming.pop_front();
                 try {
-                    auto program = impl->device->load_cached_program(key);
-                    if (!program || program->stage != stage) {
+                    auto compiled = future.get();
+                    if (!compiled) {
                         impl->warmup_failed_shaders.insert(key);
                         return;
                     }
-                    std::string error;
-                    auto compiled = impl->device->compile(*program, gamma, error);
-                    require(bool(compiled), error.empty() ? "compiler returned no shader" : error);
                     impl->shaders.emplace(key, std::move(compiled));
                     ++shaders_count_compiled;
+                } catch (const std::exception &error) {
+                    remember_warmup_failure(impl->warmup_failed_shaders, key, "shader", error.what());
+                }
+            };
+            const auto drain_shaders = [&] {
+                while (!warming.empty()) retire_shader();
+            };
+            const auto warm_shader = [&](const std::string &key, shader::metal::Stage stage, bool gamma) {
+                if (render_abort.load(std::memory_order_relaxed) || impl->shaders.contains(key)
+                    || impl->warmup_failed_shaders.contains(key)) return;
+                if (warming.size() == 2) retire_shader();
+                Device *device = impl->device.get();
+                try {
+                    warming.emplace_back(key, std::async(std::launch::async,
+                        [device, key, stage, gamma]() -> std::unique_ptr<CompiledProgram> {
+                            @autoreleasepool {
+                                auto program = device->load_cached_program(key);
+                                if (!program || program->stage != stage) return nullptr;
+                                std::string error;
+                                auto compiled = device->compile(*program, gamma, error);
+                                require(bool(compiled), error.empty() ? "compiler returned no shader" : error);
+                                return compiled;
+                            }
+                        }));
                 } catch (const std::exception &error) {
                     remember_warmup_failure(impl->warmup_failed_shaders, key, "shader", error.what());
                 }
@@ -1412,6 +1438,7 @@ void MetalState::precompile_shader(const ShadersHash &hash) {
                     warm_shader(variant.key, stage, variant.gamma_correction);
                 }
             }
+            drain_shaders();
             if (!render_abort.load(std::memory_order_relaxed)) {
                 for (auto &saved : impl->device->cached_pipeline_templates(hex_string(hash.frag), hex_string(hash.vert))) {
                     if (render_abort.load(std::memory_order_relaxed)) break;
@@ -1419,8 +1446,10 @@ void MetalState::precompile_shader(const ShadersHash &hash) {
                     if (const auto found = impl->pipelines.find(saved.key);
                         found != impl->pipelines.end() && found->second) continue;
                     try {
-                        if (saved.fragment_key.starts_with("metal-depth-only"))
+                        if (saved.fragment_key.starts_with("metal-depth-only")) {
                             warm_shader(saved.fragment_key, shader::metal::Stage::Fragment, false);
+                            drain_shaders();
+                        }
                         if (render_abort.load(std::memory_order_relaxed)) break;
                         const auto vertex = impl->shaders.find(saved.vertex_key);
                         const auto fragment = impl->shaders.find(saved.fragment_key);
