@@ -35,6 +35,7 @@
 #include <overlay/shader_precompile_progress.h>
 #include <util/log.h>
 
+#include <chrono>
 #include <memory>
 #include <exception>
 #include <thread>
@@ -256,6 +257,7 @@ static void render_loop_body(renderer::State &state, DisplayState &display, GxmS
 
         const int total = static_cast<int>(state.precompile_queue.size());
         state.precompile_total = total;
+        auto next_metal_progress_frame = std::chrono::steady_clock::time_point::min();
 
         for (int i = 0; i < total && !state.render_abort.load(std::memory_order_relaxed); ++i) {
             if (!state.set_current())
@@ -265,9 +267,15 @@ static void render_loop_body(renderer::State &state, DisplayState &display, GxmS
             state.precompile_progress = i + 1;
 
             if (progress_overlay) {
-                progress_overlay->set_progress(i + 1, total);
-                state.render_frame(display, gxm, mem);
-                state.swap_window();
+                const auto now = std::chrono::steady_clock::now();
+                // Warm-cache entries may finish much faster than a display
+                // interval. Avoid a full Metal present for every saved pair.
+                if (state.current_backend != Backend::Metal || i + 1 == total || now >= next_metal_progress_frame) {
+                    progress_overlay->set_progress(i + 1, total);
+                    state.render_frame(display, gxm, mem);
+                    state.swap_window();
+                    next_metal_progress_frame = now + std::chrono::milliseconds(33);
+                }
             }
         }
 

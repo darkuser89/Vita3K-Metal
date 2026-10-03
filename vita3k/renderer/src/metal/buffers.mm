@@ -15,11 +15,22 @@ bool memory_backed_uniform_slot(uint32_t buffer_flags, uint32_t renderer_slot) {
         ? SCE_GXM_MAX_UNIFORM_BUFFERS : renderer_slot - SCE_GXM_UNIFORM_BUFFER_OFFSET;
     return (buffer_flags & (2u << (2 * guest_slot))) != 0;
 }
+void MappedGuestRegions::update_prefixes(std::map<uint32_t, Region>::iterator first) {
+    uint64_t prefix_end = first == regions.begin() ? 0 : std::prev(first)->second.prefix_end;
+    for (auto region = first; region != regions.end(); ++region) {
+        prefix_end = std::max(prefix_end, uint64_t(region->first) + region->second.size);
+        if (region->second.prefix_end == prefix_end)
+            break;
+        region->second.prefix_end = prefix_end;
+    }
+}
 void MappedGuestRegions::map(uint32_t address, uint32_t size) {
-    if (size) regions[address] = size;
+    if (!size) return;
+    update_prefixes(regions.insert_or_assign(address, Region{size, 0}).first);
 }
 void MappedGuestRegions::unmap(uint32_t address) {
-    regions.erase(address);
+    if (auto region = regions.find(address); region != regions.end())
+        update_prefixes(regions.erase(region));
 }
 MappedGuestRange MappedGuestRegions::range(uint32_t address, size_t bound_size) const {
     const uint64_t bound_end = uint64_t(address) + bound_size;
@@ -28,7 +39,11 @@ MappedGuestRange MappedGuestRegions::range(uint32_t address, size_t bound_size) 
     bool mapped = false;
     for (auto region = regions.upper_bound(address); region != regions.begin();) {
         --region;
-        const uint64_t region_end = uint64_t(region->first) + region->second;
+        // If this prefix cannot reach the binding's end, no earlier mapping
+        // can contain it either. Most draws inspect only their nearest map.
+        if (region->second.prefix_end < bound_end)
+            break;
+        const uint64_t region_end = uint64_t(region->first) + region->second.size;
         if (bound_end <= region_end) {
             // Every included range contains the binding, so their union has
             // no gaps. Keep the prefix too: GXP offsets can be negative.

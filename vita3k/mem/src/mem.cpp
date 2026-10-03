@@ -328,6 +328,52 @@ void protect_inner(MemState &state, Address addr, uint32_t size, const MemPerm p
 #endif
 }
 
+static void consume_protection(MemState &state, ProtectSegmentTrees::iterator it, Address address, bool write) {
+    for (auto &[block_addr, block] : it->second.blocks)
+        block.callback(address, write);
+    unprotect_inner(state, it->first, it->second.size);
+    state.protect_tree.erase(it);
+}
+
+bool prepare_host_write(MemState &state, Address address, size_t size) {
+    if (state.use_page_table) return false;
+    const uint64_t end = uint64_t(address) + size;
+    if (!size || address < state.host_page_size || size > UINT32_MAX
+        || end > UINT32_MAX || !is_valid_addr_range(state, address, Address(end))) return false;
+    const std::lock_guard lock(state.protect_mutex);
+    // Select and consume under one lock: another thread cannot retire/rearm
+    // the selected segment between lookup and callback delivery.
+    for (auto it = state.protect_tree.begin(); it != state.protect_tree.end();) {
+        const auto &segment = it->second;
+        if (uint64_t(it->first) >= end || uint64_t(it->first) + segment.size <= address
+            || (segment.perm != MemPerm::None && segment.perm != MemPerm::ReadOnly)
+            || std::any_of(segment.blocks.begin(), segment.blocks.end(), [](const auto &entry) {
+                   return !entry.second.retain_on_read;
+               })) {
+            // Guest fault handlers can observe the precise first store address
+            // and execution context. Only write watches opt into eager delivery.
+            ++it;
+            continue;
+        }
+        Address touched = std::max(address, it->first);
+        if (segment.write_watch_ranges_only) {
+            // A consumed read trap can leave writable holes between retained
+            // watches. Writing a hole must not consume its neighbours.
+            touched = 0;
+            for (const auto &[base, block] : segment.blocks) {
+                if (uint64_t(base) < end && uint64_t(base) + block.size > address) {
+                    touched = std::max(address, base);
+                    break;
+                }
+            }
+            if (!touched) { ++it; continue; }
+        }
+        const auto current = it++;
+        consume_protection(state, current, touched, true);
+    }
+    return true;
+}
+
 bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcept {
     const uintptr_t memory_addr = reinterpret_cast<uintptr_t>(state.memory.get());
     const uintptr_t fault_addr = reinterpret_cast<uintptr_t>(addr);
@@ -412,12 +458,7 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
         return true;
     }
 
-    for (auto &[block_addr, block] : info.blocks) {
-        block.callback(vaddr, write);
-    }
-
-    unprotect_inner(state, it->first, info.size);
-    state.protect_tree.erase(it);
+    consume_protection(state, it, vaddr, write);
 
     return true;
 }

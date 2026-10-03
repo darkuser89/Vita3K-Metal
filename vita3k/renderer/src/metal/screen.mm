@@ -100,15 +100,24 @@ fragment float4 screen_fxaa(V v [[stage_in]], texture2d<float> image [[texture(0
     float3 result = dot(rgb_b, luma) < luma_min || dot(rgb_b, luma) > luma_max ? rgb_a : rgb_b;
     return float4(result, 1.0);
 })";
+    // Both screen entry points live in the same fixed source. Compile it once
+    // instead of invoking the Metal source compiler separately for each stage.
+    auto options = [MTLCompileOptions new];
+    options.languageVersion = MTLLanguageVersion3_0;
+    options.fastMathEnabled = NO;
+    NSError *native_error = nil;
+    auto library = [device.native_device() newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()]
+                                                    options:options error:&native_error];
+    if (!library) throw std::runtime_error(native_error.localizedDescription.UTF8String ?: "Metal: screen shader compilation failed");
+    vertex_function = [library newFunctionWithName:@"screen_vertex"];
+    auto fragment_function = [library newFunctionWithName:@"screen_fragment"];
+    if (!vertex_function || vertex_function.functionType != MTLFunctionTypeVertex
+        || !fragment_function || fragment_function.functionType != MTLFunctionTypeFragment)
+        throw std::runtime_error("Metal: invalid screen shader entry points");
     std::string error;
-    auto vert = device.compile({source, "screen_vertex", shader::metal::Stage::Vertex}, false, error);
-    if (!vert) throw std::runtime_error(error);
-    vertex_function = vert->function;
-    auto frag = device.compile({source, "screen_fragment", shader::metal::Stage::Fragment}, false, error);
-    if (!frag) throw std::runtime_error(error);
     auto desc = [MTLRenderPipelineDescriptor new];
     desc.vertexFunction = vertex_function;
-    desc.fragmentFunction = frag->function;
+    desc.fragmentFunction = fragment_function;
     desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     pipeline = device.create_pipeline(desc, error);
     if (!pipeline) throw std::runtime_error(error);

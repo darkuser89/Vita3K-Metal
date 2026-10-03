@@ -9,6 +9,7 @@
 #include <overlay/font.h>
 #include <overlay/shader_precompile_progress.h>
 #include <util/log.h>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <stdexcept>
@@ -40,6 +41,14 @@ struct OverlayRenderer::Impl {
     id<MTLSamplerState> sampler;
     id<MTLTexture> white, white_array;
     std::map<const overlay::font *, id<MTLTexture>> fonts;
+    struct CachedImage {
+        int width = 0, height = 0, channels = 0;
+        std::vector<uint8_t> pixels;
+        id<MTLTexture> texture = nil;
+        uint64_t last_used = 0;
+    };
+    std::map<const overlay::image_info_base *, CachedImage> images;
+    uint64_t image_frame = 0;
     overlay::resource_config resources;
     bool resources_loaded = false;
     size_t last_view_count = SIZE_MAX, last_command_count = SIZE_MAX, last_nontransparent_count = SIZE_MAX;
@@ -56,8 +65,26 @@ struct OverlayRenderer::Impl {
         if (!info || !info->get_data() || info->w <= 0 || info->h <= 0) return white;
         if (info->channels != 1 && info->channels != 4)
             throw std::runtime_error("Metal: invalid overlay image channels");
+        const size_t bytes = size_t(info->w) * info->h * info->channels;
+        const uint8_t *data = info->get_data();
+        auto &cached = images[info];
+        cached.last_used = image_frame;
+        if (cached.texture && cached.width == info->w && cached.height == info->h
+            && cached.channels == info->channels && cached.pixels.size() == bytes
+            && std::memcmp(cached.pixels.data(), data, bytes) == 0) {
+            info->dirty = false;
+            return cached.texture;
+        }
+        // A changed image gets a new resource: an older command buffer may
+        // still be sampling the previous texture asynchronously.
         auto result = texture(info->channels == 4 ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatR8Unorm, info->w, info->h);
-        [result replaceRegion:MTLRegionMake2D(0,0,info->w,info->h) mipmapLevel:0 withBytes:info->get_data() bytesPerRow:info->w * info->channels];
+        [result replaceRegion:MTLRegionMake2D(0,0,info->w,info->h) mipmapLevel:0 withBytes:data bytesPerRow:info->w * info->channels];
+        cached.width = info->w;
+        cached.height = info->h;
+        cached.channels = info->channels;
+        cached.pixels.assign(data, data + bytes);
+        cached.texture = result;
+        info->dirty = false;
         return result;
     }
     id<MTLTexture> font(const overlay::font *font) {
@@ -212,9 +239,17 @@ struct OverlayRenderer::Impl {
             vertices = &converted; break;
         }
         if (vertices->empty()) return;
-        auto buffer = [device.native_device() newBufferWithBytes:vertices->data() length:vertices->size()*sizeof(overlay::vertex) options:MTLResourceStorageModeShared];
-        if (!buffer) throw std::runtime_error("Metal: overlay vertex allocation failed");
-        [encoder setVertexBuffer:buffer offset:0 atIndex:1];
+        const size_t vertex_bytes = vertices->size() * sizeof(overlay::vertex);
+        if (vertex_bytes <= 4096) {
+            // Most UI commands are a single quad. Inline bytes avoid a new
+            // MTLBuffer allocation and a resource lifetime per command.
+            [encoder setVertexBytes:vertices->data() length:vertex_bytes atIndex:1];
+        } else {
+            auto buffer = [device.native_device() newBufferWithBytes:vertices->data()
+                length:vertex_bytes options:MTLResourceStorageModeShared];
+            if (!buffer) throw std::runtime_error("Metal: overlay vertex allocation failed");
+            [encoder setVertexBuffer:buffer offset:0 atIndex:1];
+        }
         if (config.primitives == overlay::primitive_type::quad_list) {
             for (size_t i = 0; i + 3 < count; i += 4) [encoder drawPrimitives:type vertexStart:i vertexCount:4];
         } else [encoder drawPrimitives:type vertexStart:0 vertexCount:vertices->size()];
@@ -250,6 +285,7 @@ OverlayRenderer::OverlayRenderer(Device &device, const std::filesystem::path &as
 }
 OverlayRenderer::~OverlayRenderer() = default;
 void OverlayRenderer::render(id<MTLRenderCommandEncoder> encoder, const overlay::display_manager &manager, MTLViewport viewport) {
+    ++impl->image_frame;
     struct Prepared { std::shared_ptr<overlay::overlay> view; overlay::compiled_resource resource; };
     std::vector<Prepared> prepared;
     {
@@ -285,6 +321,13 @@ void OverlayRenderer::render(id<MTLRenderCommandEncoder> encoder, const overlay:
     for (auto &view : prepared) {
         for (const auto &command : view.resource.draw_commands) impl->draw(encoder, command, viewport);
         view.view->update(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+    // Dialogs and loading backgrounds can disappear between frames. Bound
+    // retained CPU copies and GPU textures to images used recently.
+    for (auto image = impl->images.begin(); image != impl->images.end();) {
+        if (impl->image_frame - image->second.last_used > 2)
+            image = impl->images.erase(image);
+        else ++image;
     }
 }
 } // namespace renderer::metal

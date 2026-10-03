@@ -5,9 +5,11 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <dispatch/dispatch.h>
 #include <fcntl.h>
 #include <fstream>
 #include <metal_cache_revision.h>
+#include <map>
 #include <mutex>
 #include <renderer/metal/cache.h>
 #include <renderer/metal/device.h>
@@ -199,10 +201,15 @@ struct PersistentCache::Impl {
     std::filesystem::path root, programs, native;
     mutable std::mutex mutex;
     CacheStats counters;
+    dispatch_queue_t writer = dispatch_queue_create("org.vita3k.metal.cache-writer", DISPATCH_QUEUE_SERIAL);
+    dispatch_semaphore_t archive_slots = dispatch_semaphore_create(8);
+    dispatch_semaphore_t file_slots = dispatch_semaphore_create(8);
+    std::map<std::filesystem::path, id<MTLBinaryArchive>> pending_archives;
+    std::map<std::filesystem::path, std::shared_ptr<const std::string>> pending_programs;
     int lock_fd = -1;
     Impl(Device &d, const std::filesystem::path &path)
         : device(d) {
-        root = path / ("v2-abi" + std::to_string(shader::metal::SHADER_ABI_VERSION) + "-" + METAL_CACHE_REVISION);
+        root = path / ("v3-abi" + std::to_string(shader::metal::SHADER_ABI_VERSION) + "-" + METAL_CACHE_REVISION);
         programs = root / "programs";
         // Registry IDs can change across reboots; model/architecture names do not.
         std::string architecture = "metal3";
@@ -210,7 +217,7 @@ struct PersistentCache::Impl {
             architecture = d.native_device().architecture.name.UTF8String ?: "metal3";
         const std::string hardware = std::string(d.native_device().name.UTF8String ?: "unknown") + "\n" + architecture + "\n"
             + std::string(NSProcessInfo.processInfo.operatingSystemVersionString.UTF8String ?: "unknown") + "\nmsl3.0;fast-math=off;archive-v2";
-        native = root / "native" / digest(hardware);
+        native = root / "native" / METAL_NATIVE_CACHE_REVISION / digest(hardware);
         std::error_code ec;
         std::filesystem::create_directories(programs, ec);
         if (ec)
@@ -223,6 +230,9 @@ struct PersistentCache::Impl {
         counters.archive_writable = lock_fd >= 0 && flock(lock_fd, LOCK_EX | LOCK_NB) == 0;
     }
     ~Impl() {
+        // Cache/device ownership and the process writer lock outlive every
+        // queued publication, including error handling and archive release.
+        drain_writes();
         if (lock_fd >= 0)
             close(lock_fd);
     }
@@ -231,34 +241,43 @@ struct PersistentCache::Impl {
             LOG_WARN("Metal cache: {} (rendering continues without cache writes)", message);
     }
     id<MTLBinaryArchive> load_archive(const std::filesystem::path &path) {
-        auto desc = [MTLBinaryArchiveDescriptor new];
+        // The archive is immutable after pipeline creation. Keep it available
+        // while its serialization/fsync runs, so immediate reuse does not
+        // compile the same pipeline again because its file is not ready yet.
+        if (auto found = pending_archives.find(path); found != pending_archives.end()) {
+            counters.archive_loaded = true;
+            return found->second;
+        }
         std::error_code ec;
         const auto size = std::filesystem::file_size(path, ec);
-        const bool exists = !ec;
-        if (exists && size <= 512ull * 1024 * 1024)
-            desc.url = url(path);
-        else if (exists)
+        if (ec)
+            return nil;
+        if (size > 512ull * 1024 * 1024) {
             ++counters.rejected_files;
+            return nil;
+        }
+        auto desc = [MTLBinaryArchiveDescriptor new];
+        desc.url = url(path);
         NSError *error = nil;
         auto archive = [device.native_device() newBinaryArchiveWithDescriptor:desc error:&error];
-        if (archive && desc.url)
+        if (archive)
             counters.archive_loaded = true;
-        if (!archive && desc.url) {
+        else {
             ++counters.rejected_files;
             LOG_WARN("Metal cache: ignoring invalid native archive: {}", error_text(error));
-            desc.url = nil;
-            error = nil;
-            archive = [device.native_device() newBinaryArchiveWithDescriptor:desc error:&error];
         }
         return archive;
     }
-    void save(id<MTLBinaryArchive> archive, const std::filesystem::path &path) {
-        if (!archive || !counters.archive_writable)
-            return;
+    void publish_archive(id<MTLBinaryArchive> archive, const std::filesystem::path &path) {
+        {
+            std::lock_guard lock(mutex);
+            if (!counters.archive_writable) return;
+        }
         TemporaryFile file(path);
         NSError *error = nil;
         if (file.fd < 0 || ![archive serializeToURL:url(file.path) error:&error]) {
             LOG_WARN("Metal native archive serialization failed: {}", error_text(error));
+            std::lock_guard lock(mutex);
             counters.archive_writable = false;
             io_error("Cannot serialize native archive");
             return;
@@ -266,11 +285,114 @@ struct PersistentCache::Impl {
         close(file.fd);
         file.fd = open(file.path.c_str(), O_RDONLY);
         if (!file.publish(path)) {
+            std::lock_guard lock(mutex);
             counters.archive_writable = false;
             io_error("Cannot publish native archive");
             return;
         }
+        std::lock_guard lock(mutex);
         ++counters.archive_writes;
+    }
+    void save(id<MTLBinaryArchive> archive, const std::filesystem::path &path) {
+        if (!archive) return;
+        // Backpressure bounds retained native archives, even on a slow disk.
+        // Never hold the cache mutex while waiting for the writer to progress.
+        dispatch_semaphore_wait(archive_slots, DISPATCH_TIME_FOREVER);
+        try {
+            const auto destination = path;
+            {
+                std::lock_guard lock(mutex);
+                if (!counters.archive_writable) {
+                    dispatch_semaphore_signal(archive_slots);
+                    return;
+                }
+                pending_archives.insert_or_assign(destination, archive);
+            }
+            dispatch_async(writer, ^{
+                @autoreleasepool {
+                    try {
+                        publish_archive(archive, destination);
+                    } catch (const std::exception &) {
+                        std::lock_guard lock(mutex);
+                        counters.archive_writable = false;
+                        io_error("Cannot publish queued native archive");
+                    }
+                    {
+                        std::lock_guard lock(mutex);
+                        const auto found = pending_archives.find(destination);
+                        if (found != pending_archives.end() && found->second == archive)
+                            pending_archives.erase(found);
+                    }
+                    dispatch_semaphore_signal(archive_slots);
+                }
+            });
+        } catch (...) {
+            {
+                std::lock_guard lock(mutex);
+                const auto found = pending_archives.find(path);
+                if (found != pending_archives.end() && found->second == archive)
+                    pending_archives.erase(found);
+            }
+            dispatch_semaphore_signal(archive_slots);
+            throw;
+        }
+    }
+    void drain_writes() {
+        dispatch_sync(writer, ^{});
+    }
+    void queue_file(const std::filesystem::path &path, std::string bytes, bool program,
+        const std::filesystem::path &index_path = {}, std::string index_bytes = {}) {
+        // Bound retained MSL payloads independently of native archives. The
+        // caller never waits with the cache mutex held.
+        dispatch_semaphore_wait(file_slots, DISPATCH_TIME_FOREVER);
+        std::shared_ptr<const std::string> contents;
+        try {
+            const auto destination = path;
+            const auto index_destination = index_path;
+            contents = std::make_shared<const std::string>(std::move(bytes));
+            const auto index = std::make_shared<const std::string>(std::move(index_bytes));
+            std::lock_guard lock(mutex);
+            if (program) pending_programs.insert_or_assign(destination, contents);
+            // Enqueue under the same lock as the pending entry, preserving
+            // last-store ordering for simultaneous writes to the same key.
+            dispatch_async(writer, ^{
+                @autoreleasepool {
+                    try {
+                        std::error_code ec;
+                        std::filesystem::create_directories(destination.parent_path(), ec);
+                        const bool published = !ec && atomic_write(destination, *contents);
+                        bool indexed = true;
+                        // Never advertise a variant whose shader failed to publish.
+                        if (published && !index_destination.empty()) {
+                            std::filesystem::create_directories(index_destination.parent_path(), ec);
+                            indexed = !ec && atomic_write(index_destination, *index);
+                        }
+                        std::lock_guard lock(mutex);
+                        if (published && program) ++counters.program_writes;
+                        if (!published || !indexed) io_error("Cannot publish queued shader cache file");
+                    } catch (const std::exception &) {
+                        std::lock_guard lock(mutex);
+                        io_error("Cannot publish queued shader cache file");
+                    }
+                    {
+                        std::lock_guard lock(mutex);
+                        const auto found = pending_programs.find(destination);
+                        if (found != pending_programs.end() && found->second == contents)
+                            pending_programs.erase(found);
+                    }
+                    dispatch_semaphore_signal(file_slots);
+                }
+            });
+        } catch (...) {
+            {
+                std::lock_guard lock(mutex);
+                const auto found = pending_programs.find(path);
+                if (found != pending_programs.end() && found->second == contents)
+                    pending_programs.erase(found);
+            }
+            dispatch_semaphore_signal(file_slots);
+            throw;
+        }
     }
 };
 PersistentCache::PersistentCache(Device &device, const std::filesystem::path &root)
@@ -281,23 +403,26 @@ std::optional<shader::metal::Program> PersistentCache::load_program(std::string_
     const auto hash = digest(key);
     const auto path = impl->programs / (hash + ".mslcache");
     std::error_code ec;
-    const auto size = std::filesystem::file_size(path, ec);
     auto miss = [&](bool rejected) -> std::optional<shader::metal::Program> {
         ++impl->counters.program_misses;
         if (rejected)
             ++impl->counters.rejected_files;
         return std::nullopt;
     };
-    if (ec)
-        return miss(false);
     constexpr size_t header = 8 + 64 + 64 + 4;
-    if (size < header + 16 || size > max_program_bytes + header)
-        return miss(true);
-    std::string bytes(size, '\0');
-    std::ifstream file(path, std::ios::binary);
-    if (!file.read(bytes.data(), bytes.size()))
-        return miss(true);
-    std::string_view view(bytes), body = view.substr(header);
+    std::shared_ptr<const std::string> pending;
+    std::string bytes;
+    if (auto found = impl->pending_programs.find(path); found != impl->pending_programs.end()) {
+        pending = found->second;
+    } else {
+        const auto size = std::filesystem::file_size(path, ec);
+        if (ec) return miss(false);
+        if (size < header + 16 || size > max_program_bytes + header) return miss(true);
+        bytes.resize(size);
+        std::ifstream file(path, std::ios::binary);
+        if (!file.read(bytes.data(), bytes.size())) return miss(true);
+    }
+    const std::string_view view(pending ? *pending : bytes), body = view.substr(header);
     if (view.substr(0, 8) != magic || view.substr(8, 64) != hash || view.substr(72, 64) != digest(body)
         || get32(view, 136) != body.size())
         return miss(true);
@@ -322,7 +447,6 @@ std::optional<shader::metal::Program> PersistentCache::load_program(std::string_
 }
 void PersistentCache::store_program(std::string_view key, const shader::metal::Program &program,
     std::string_view guest_hash, bool gamma_correction) {
-    std::lock_guard lock(impl->mutex);
     if (program.source.empty() || program.source.size() + program.entry_point.size() + 16 > max_program_bytes
         || program.entry_point.empty() || program.entry_point.size() > 256)
         return;
@@ -340,32 +464,27 @@ void PersistentCache::store_program(std::string_view key, const shader::metal::P
     file += digest(body);
     put32(file, uint32_t(body.size()));
     file += body;
-    if (atomic_write(impl->programs / (hash + ".mslcache"), file)) {
-        ++impl->counters.program_writes;
-        if (guest_hash.empty()) return;
-        if (!valid_guest_hash(guest_hash) || key.size() > max_variant_key_bytes
-            || key.substr(0, guest_hash.size()) != guest_hash) return;
-        const auto directory = impl->programs / "variants" / std::string(guest_hash);
-        std::error_code ec;
-        std::filesystem::create_directories(directory, ec);
-        if (ec) {
-            impl->io_error("Cannot create shader variant index");
-            return;
-        }
+    std::filesystem::path variant_path;
+    std::string variant;
+    if (valid_guest_hash(guest_hash) && key.size() <= max_variant_key_bytes
+        && key.substr(0, guest_hash.size()) == guest_hash) {
+        variant_path = impl->programs / "variants" / std::string(guest_hash) / (hash + ".variant");
         std::string body;
         put32(body, uint32_t(key.size()));
         body.push_back(char(gamma_correction));
         body += key;
-        std::string variant(variant_magic);
+        variant = variant_magic;
         variant += hash;
         variant += digest(body);
         variant += body;
-        if (!atomic_write(directory / (hash + ".variant"), variant))
-            impl->io_error("Cannot save shader variant index");
-    } else
-        impl->io_error("Cannot save translated shader");
+    }
+    impl->queue_file(impl->programs / (hash + ".mslcache"), std::move(file), true,
+        variant_path, std::move(variant));
 }
 std::vector<CachedVariant> PersistentCache::variants(std::string_view guest_hash) {
+    // Warmup enumeration requires completed indices, not an in-flight snapshot.
+    // Ordinary shader lookup uses pending_programs and never drains the writer.
+    impl->drain_writes();
     std::lock_guard lock(impl->mutex);
     std::vector<CachedVariant> result;
     if (!valid_guest_hash(guest_hash)) return result;
@@ -406,7 +525,6 @@ std::vector<CachedVariant> PersistentCache::variants(std::string_view guest_hash
 void PersistentCache::store_render_pipeline_template(std::string_view fragment_hash, std::string_view vertex_hash,
     std::string_view key, std::string_view vertex_key, std::string_view fragment_key,
     MTLRenderPipelineDescriptor *descriptor) {
-    std::lock_guard lock(impl->mutex);
     if (!valid_guest_hash(fragment_hash) || !valid_guest_hash(vertex_hash) || !descriptor
         || key.empty() || key.size()>max_variant_key_bytes
         || vertex_key.empty() || vertex_key.size()>max_variant_key_bytes
@@ -424,13 +542,11 @@ void PersistentCache::store_render_pipeline_template(std::string_view fragment_h
     std::string file(pipeline_magic);
     file+=digest(body);file+=body;
     const auto directory=impl->native/"warmup"/std::string(fragment_hash)/std::string(vertex_hash);
-    std::error_code ec;
-    std::filesystem::create_directories(directory,ec);
-    if (ec || !atomic_write(directory/(digest(key)+".pipeline"),file))
-        impl->io_error("Cannot save Metal pipeline warmup descriptor");
+    impl->queue_file(directory/(digest(key)+".pipeline"), std::move(file), false);
 }
 std::vector<CachedPipeline> PersistentCache::render_pipeline_templates(std::string_view fragment_hash,
     std::string_view vertex_hash) {
+    impl->drain_writes();
     std::lock_guard lock(impl->mutex);
     std::vector<CachedPipeline> result;
     if (!valid_guest_hash(fragment_hash) || !valid_guest_hash(vertex_hash)) return result;
@@ -479,27 +595,39 @@ std::vector<CachedPipeline> PersistentCache::render_pipeline_templates(std::stri
     return result;
 }
 id<MTLRenderPipelineState> PersistentCache::create_render_pipeline(MTLRenderPipelineDescriptor *descriptor, std::string &error) {
-    std::lock_guard lock(impl->mutex);
     error.clear();
     const auto path = impl->native / (digest(render_key(descriptor)) + ".metalarc");
-    auto archive = impl->load_archive(path);
+    id<MTLBinaryArchive> archive;
+    {
+        std::lock_guard lock(impl->mutex);
+        archive = impl->load_archive(path);
+    }
     MTLRenderPipelineDescriptor *desc = [descriptor copy];
     NSError *native_error = nil;
     if (archive) {
         desc.binaryArchives = @[ archive ];
         auto cached = [impl->device.native_device() newRenderPipelineStateWithDescriptor:desc options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&native_error];
         if (cached) {
+            std::lock_guard lock(impl->mutex);
             ++impl->counters.pipeline_hits;
             return cached;
         }
     }
-    ++impl->counters.pipeline_misses;
+    bool archive_writable;
+    {
+        std::lock_guard lock(impl->mutex);
+        ++impl->counters.pipeline_misses;
+        archive_writable = impl->counters.archive_writable;
+    }
     // A mismatching indexed file must not retain an unrelated pipeline: even
     // collisions are safe, because Metal performs the authoritative match above.
-    auto empty = [MTLBinaryArchiveDescriptor new];
-    archive = [impl->device.native_device() newBinaryArchiveWithDescriptor:empty error:&native_error];
     desc.binaryArchives = nil;
-    bool added = archive && [archive addRenderPipelineFunctionsWithDescriptor:desc error:&native_error];
+    bool added = false;
+    if (archive_writable) {
+        auto empty = [MTLBinaryArchiveDescriptor new];
+        archive = [impl->device.native_device() newBinaryArchiveWithDescriptor:empty error:&native_error];
+        added = archive && [archive addRenderPipelineFunctionsWithDescriptor:desc error:&native_error];
+    }
     if (added)
         desc.binaryArchives = @[ archive ];
     native_error = nil;
@@ -511,15 +639,19 @@ id<MTLRenderPipelineState> PersistentCache::create_render_pipeline(MTLRenderPipe
     }
     if (!result)
         error = error_text(native_error);
-    else if (added)
+    else if (added) {
         impl->save(archive, path);
+    }
     return result;
 }
 id<MTLComputePipelineState> PersistentCache::create_compute_pipeline(id<MTLFunction> function, std::string &error) {
-    std::lock_guard lock(impl->mutex);
     error.clear();
     const auto path = impl->native / (digest(std::string("compute\n") + (function.name.UTF8String ?: "")) + ".metalarc");
-    auto archive = impl->load_archive(path);
+    id<MTLBinaryArchive> archive;
+    {
+        std::lock_guard lock(impl->mutex);
+        archive = impl->load_archive(path);
+    }
     auto desc = [MTLComputePipelineDescriptor new];
     desc.computeFunction = function;
     NSError *native_error = nil;
@@ -527,15 +659,24 @@ id<MTLComputePipelineState> PersistentCache::create_compute_pipeline(id<MTLFunct
         desc.binaryArchives = @[ archive ];
         auto cached = [impl->device.native_device() newComputePipelineStateWithDescriptor:desc options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&native_error];
         if (cached) {
+            std::lock_guard lock(impl->mutex);
             ++impl->counters.pipeline_hits;
             return cached;
         }
     }
-    ++impl->counters.pipeline_misses;
-    auto empty = [MTLBinaryArchiveDescriptor new];
-    archive = [impl->device.native_device() newBinaryArchiveWithDescriptor:empty error:&native_error];
+    bool archive_writable;
+    {
+        std::lock_guard lock(impl->mutex);
+        ++impl->counters.pipeline_misses;
+        archive_writable = impl->counters.archive_writable;
+    }
     desc.binaryArchives = nil;
-    bool added = archive && [archive addComputePipelineFunctionsWithDescriptor:desc error:&native_error];
+    bool added = false;
+    if (archive_writable) {
+        auto empty = [MTLBinaryArchiveDescriptor new];
+        archive = [impl->device.native_device() newBinaryArchiveWithDescriptor:empty error:&native_error];
+        added = archive && [archive addComputePipelineFunctionsWithDescriptor:desc error:&native_error];
+    }
     if (added)
         desc.binaryArchives = @[ archive ];
     native_error = nil;
@@ -547,11 +688,12 @@ id<MTLComputePipelineState> PersistentCache::create_compute_pipeline(id<MTLFunct
     }
     if (!result)
         error = error_text(native_error);
-    else if (added)
+    else if (added) {
         impl->save(archive, path);
+    }
     return result;
 }
-void PersistentCache::flush() {} // Each completed pipeline is published immediately.
+void PersistentCache::flush() { impl->drain_writes(); }
 CacheStats PersistentCache::stats() const {
     std::lock_guard lock(impl->mutex);
     return impl->counters;

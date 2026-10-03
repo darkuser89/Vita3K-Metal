@@ -121,7 +121,7 @@ std::optional<DepthMemoryLayout> depth_memory_layout(const SceGxmDepthStencilSur
 struct DepthStoreReadback {
     id<MTLBuffer> depth = nil;
     id<MTLBuffer> mask = nil;
-    // The shared buffer already contains final guest words (S8D24 or DF32).
+    // The shared buffer already contains final guest words (D16, S8D24 or DF32).
     bool packed_direct = false;
 };
 struct DepthMemoryWrite {
@@ -130,6 +130,8 @@ struct DepthMemoryWrite {
 class SurfaceCaster {
     Device &device;
     std::map<uint32_t,id<MTLRenderPipelineState>> depth_seed_pipelines;
+    std::array<id<MTLDepthStencilState>,4> depth_states{};
+    id<MTLDepthStencilState> depth_state(bool depth_write, bool stencil_write);
     std::map<std::pair<uint32_t,bool>,id<MTLRenderPipelineState>> depth_copy_pipelines;
     std::map<std::pair<uint32_t,uint32_t>,id<MTLRenderPipelineState>> depth_patch_pipelines;
     std::map<std::pair<uint32_t,bool>,id<MTLRenderPipelineState>> depth_clear_pipelines;
@@ -283,7 +285,9 @@ id<MTLTexture> sampling_view(id<MTLTexture> texture, SceGxmTextureFormat format,
 id<MTLTexture> rgba8_gamma_view(id<MTLTexture> texture, bool srgb);
 // Effective hardware setting after point-filter and strided-descriptor rules.
 uint32_t effective_sampler_anisotropy(const SceGxmTexture &texture, uint32_t requested);
-id<MTLSamplerState> make_sampler(Device &device, const SceGxmTexture &texture, uint32_t anisotropy);
+using SamplerCache = std::map<std::array<uint32_t,7>,id<MTLSamplerState>>;
+id<MTLSamplerState> make_sampler(Device &device, const SceGxmTexture &texture, uint32_t anisotropy,
+    SamplerCache *cache = nullptr);
 bool surface_format_cast_supported(SceGxmColorFormat, SceGxmTextureBaseFormat,
     uint32_t texture_swizzle = UINT32_MAX);
 bool surface_word_target_supported(SceGxmTextureBaseFormat);

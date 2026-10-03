@@ -26,7 +26,12 @@ struct MappedGuestRange {
 // Preserve GXM map extents for shaders that use memory-backed uniform slots.
 // An overlapping later map must not hide a larger earlier region.
 class MappedGuestRegions {
-    std::map<uint32_t, uint32_t> regions;
+    struct Region {
+        uint32_t size;
+        uint64_t prefix_end;
+    };
+    std::map<uint32_t, Region> regions;
+    void update_prefixes(std::map<uint32_t, Region>::iterator first);
 public:
     void map(uint32_t address, uint32_t size);
     void unmap(uint32_t address);

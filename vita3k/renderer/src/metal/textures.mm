@@ -14,6 +14,9 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 namespace renderer::metal {
 namespace {
@@ -27,6 +30,28 @@ constexpr auto R = MTLTextureSwizzleRed, G = MTLTextureSwizzleGreen;
 constexpr auto B = MTLTextureSwizzleBlue, A = MTLTextureSwizzleAlpha;
 constexpr auto Z = MTLTextureSwizzleZero, O = MTLTextureSwizzleOne;
 constexpr Map identity{R,G,B,A};
+void copy_rgba8_row(uint8_t *output,const uint8_t *input,uint32_t pixels,
+    const std::array<uint32_t,4> &channel) {
+#if defined(__aarch64__)
+    if(pixels>=4) {
+        uint8_t indices[16];
+        for(uint32_t i=0;i<16;++i) indices[i]=uint8_t((i&~3u)+channel[i&3u]);
+        const uint8x16_t table=vld1q_u8(indices);
+        do {
+            vst1q_u8(output,vqtbl1q_u8(vld1q_u8(input),table));
+            input+=16;output+=16;pixels-=4;
+        } while(pixels>=4);
+    }
+#endif
+    // A short tail never reads beyond the visible row, including cropped
+    // regions and incomplete tile rows. Unaligned byte storage is supported.
+    for(uint32_t i=0;i<pixels;++i,input+=4,output+=4) {
+        output[0]=input[channel[0]];
+        output[1]=input[channel[1]];
+        output[2]=input[channel[2]];
+        output[3]=input[channel[3]];
+    }
+}
 constexpr Map four[] = {{R,G,B,A}, {B,G,R,A}, {A,B,G,R}, {G,B,A,R},
     {R,G,B,O}, {B,G,R,O}, {A,B,G,O}, {G,B,A,O}};
 constexpr Map packed_four[] = {{A,B,G,R}, {G,B,A,R}, {R,G,B,A}, {B,G,R,A}};
@@ -258,6 +283,10 @@ std::optional<DepthMemoryLayout> depth_memory_layout(const SceGxmDepthStencilSur
 }
 static size_t depth_sample_offset(const DepthMemoryLayout &layout,uint32_t x,uint32_t y) {
     return layout.tiled?((size_t(y/32)*(layout.stride/32)+x/32)*1024)+(y%32)*32+x%32:size_t(y)*layout.stride+x;
+}
+static bool contiguous_depth_store(const DepthMemoryLayout &layout) {
+    return layout.stride==layout.width
+        && (!layout.tiled || ((layout.width%32u)==0 && (layout.height%32u)==0));
 }
 std::optional<SurfaceRect> depth_subrectangle(const SceGxmDepthStencilSurface &surface, uint32_t width, uint32_t height,
     SceGxmMultisampleMode multisample, const SceGxmTexture &texture) {
@@ -866,6 +895,7 @@ static bool u8u3u3u2_surface_memory(id<MTLTexture> texture, const SceGxmColorSur
         || texture.textureType != MTLTextureType2D || texture.storageMode != MTLStorageModeShared
         || !texture.width || !texture.height || !samples_x || !samples_y
         || texture.width % samples_x || texture.height % samples_y) return false;
+    const size_t native_width = texture.width, native_height = texture.height;
     size_t previous_end = 0;
     for (const auto &range : ranges) {
         if (!range.size || range.offset < previous_end || range.offset > size || range.size > size - range.offset)
@@ -873,10 +903,10 @@ static bool u8u3u3u2_surface_memory(id<MTLTexture> texture, const SceGxmColorSur
         previous_end = range.offset + range.size;
     }
     if (upload && ranges.empty()) return true;
-    const size_t stride = texture.width * 4;
-    std::vector<uint8_t> raw(stride * texture.height);
+    const size_t stride = native_width * 4;
+    std::vector<uint8_t> raw(stride * native_height);
     [texture getBytes:raw.data() bytesPerRow:stride
-        fromRegion:MTLRegionMake2D(0, 0, texture.width, texture.height) mipmapLevel:0];
+        fromRegion:MTLRegionMake2D(0, 0, native_width, native_height) mipmapLevel:0];
     bool changed = false;
     for (uint32_t y = 0; y < surface.height; ++y) for (uint32_t x = 0; x < surface.width; ++x) {
         const size_t offset = packed_float_guest_pixel(surface, x, y) * 2;
@@ -884,8 +914,8 @@ static bool u8u3u3u2_surface_memory(id<MTLTexture> texture, const SceGxmColorSur
             auto range = std::lower_bound(ranges.begin(), ranges.end(), offset,
                 [](const auto &range, size_t byte) { return range.offset + range.size <= byte; });
             if (range == ranges.end() || range->offset >= offset + 2) continue;
-            const auto [top,bottom] = write_native_interval(y,surface.height,texture.height,samples_y);
-            const auto [left,right] = write_native_interval(x,surface.width,texture.width,samples_x);
+            const auto [top,bottom] = write_native_interval(y,surface.height,native_height,samples_y);
+            const auto [left,right] = write_native_interval(x,surface.width,native_width,samples_x);
             for (size_t ny = top; ny < bottom; ++ny) for (size_t nx = left; nx < right; ++nx) {
                 auto *rgba = raw.data() + ny * stride + nx * 4;
                 uint16_t word = pack_u8u3u3u2(rgba);
@@ -898,13 +928,13 @@ static bool u8u3u3u2_surface_memory(id<MTLTexture> texture, const SceGxmColorSur
             }
             changed = true;
         } else {
-            const size_t ny = size_t(y) * texture.height / surface.height;
-            const size_t nx = size_t(x) * texture.width / surface.width;
+            const size_t ny = size_t(y) * native_height / surface.height;
+            const size_t nx = size_t(x) * native_width / surface.width;
             const uint16_t word = pack_u8u3u3u2(raw.data() + ny * stride + nx * 4);
             std::memcpy(destination.data() + offset, &word, 2);
         }
     }
-    if (changed) [texture replaceRegion:MTLRegionMake2D(0, 0, texture.width, texture.height)
+    if (changed) [texture replaceRegion:MTLRegionMake2D(0, 0, native_width, native_height)
         mipmapLevel:0 withBytes:raw.data() bytesPerRow:stride];
     return true;
 }
@@ -943,6 +973,7 @@ static bool s5s5u6_surface_memory(id<MTLTexture> texture,const SceGxmColorSurfac
         || texture.textureType!=MTLTextureType2D || texture.storageMode!=MTLStorageModeShared
         || !texture.width || !texture.height || !samples_x || !samples_y
         || texture.width%samples_x || texture.height%samples_y) return false;
+    const size_t native_width = texture.width, native_height = texture.height;
     size_t previous_end=0;
     for (const auto &range:ranges) {
         if (!range.size || range.offset<previous_end || range.offset>size || range.size>size-range.offset)
@@ -950,10 +981,10 @@ static bool s5s5u6_surface_memory(id<MTLTexture> texture,const SceGxmColorSurfac
         previous_end=range.offset+range.size;
     }
     if (upload && ranges.empty()) return true;
-    const size_t stride=texture.width*8;
-    std::vector<uint8_t> raw(stride*texture.height);
+    const size_t stride=native_width*8;
+    std::vector<uint8_t> raw(stride*native_height);
     [texture getBytes:raw.data() bytesPerRow:stride
-        fromRegion:MTLRegionMake2D(0,0,texture.width,texture.height) mipmapLevel:0];
+        fromRegion:MTLRegionMake2D(0,0,native_width,native_height) mipmapLevel:0];
     bool changed=false;
     for (uint32_t y=0;y<surface.height;++y) for (uint32_t x=0;x<surface.width;++x) {
         const size_t offset=packed_float_guest_pixel(surface,x,y)*2;
@@ -961,8 +992,8 @@ static bool s5s5u6_surface_memory(id<MTLTexture> texture,const SceGxmColorSurfac
             auto range=std::lower_bound(ranges.begin(),ranges.end(),offset,
                 [](const auto &range,size_t byte) { return range.offset+range.size<=byte; });
             if (range==ranges.end() || range->offset>=offset+2) continue;
-            const auto [top,bottom]=write_native_interval(y,surface.height,texture.height,samples_y);
-            const auto [left,right]=write_native_interval(x,surface.width,texture.width,samples_x);
+            const auto [top,bottom]=write_native_interval(y,surface.height,native_height,samples_y);
+            const auto [left,right]=write_native_interval(x,surface.width,native_width,samples_x);
             for (size_t ny=top;ny<bottom;++ny) for (size_t nx=left;nx<right;++nx) {
                 auto *native=raw.data()+ny*stride+nx*8;
                 uint16_t rgba[4];std::memcpy(rgba,native,8);
@@ -977,15 +1008,15 @@ static bool s5s5u6_surface_memory(id<MTLTexture> texture,const SceGxmColorSurfac
             }
             changed=true;
         } else {
-            const size_t ny=size_t(y)*texture.height/surface.height;
-            const size_t nx=size_t(x)*texture.width/surface.width;
+            const size_t ny=size_t(y)*native_height/surface.height;
+            const size_t nx=size_t(x)*native_width/surface.width;
             uint16_t rgba[4];
             std::memcpy(rgba,raw.data()+ny*stride+nx*8,8);
             const uint16_t word=pack_s5s5u6(rgba,mode);
             std::memcpy(destination.data()+offset,&word,2);
         }
     }
-    if (changed) [texture replaceRegion:MTLRegionMake2D(0,0,texture.width,texture.height)
+    if (changed) [texture replaceRegion:MTLRegionMake2D(0,0,native_width,native_height)
         mipmapLevel:0 withBytes:raw.data() bytesPerRow:stride];
     return true;
 }
@@ -1026,6 +1057,7 @@ static bool u8s8s8u8_surface_memory(id<MTLTexture> texture, const SceGxmColorSur
         || texture.textureType!=MTLTextureType2D || texture.storageMode!=MTLStorageModeShared
         || !texture.width || !texture.height || !samples_x || !samples_y
         || texture.width%samples_x || texture.height%samples_y) return false;
+    const size_t native_width = texture.width, native_height = texture.height;
     size_t previous_end=0;
     for (const auto &range:ranges) {
         if (!range.size || range.offset<previous_end || range.offset>size || range.size>size-range.offset)
@@ -1033,10 +1065,10 @@ static bool u8s8s8u8_surface_memory(id<MTLTexture> texture, const SceGxmColorSur
         previous_end=range.offset+range.size;
     }
     if (upload && ranges.empty()) return true;
-    const size_t stride=texture.width*8;
-    std::vector<uint8_t> raw(stride*texture.height);
+    const size_t stride=native_width*8;
+    std::vector<uint8_t> raw(stride*native_height);
     [texture getBytes:raw.data() bytesPerRow:stride
-        fromRegion:MTLRegionMake2D(0,0,texture.width,texture.height) mipmapLevel:0];
+        fromRegion:MTLRegionMake2D(0,0,native_width,native_height) mipmapLevel:0];
     bool changed=false;
     for (uint32_t y=0;y<surface.height;++y) for (uint32_t x=0;x<surface.width;++x) {
         const size_t offset=packed_float_guest_pixel(surface,x,y)*4;
@@ -1044,8 +1076,8 @@ static bool u8s8s8u8_surface_memory(id<MTLTexture> texture, const SceGxmColorSur
             auto range=std::lower_bound(ranges.begin(),ranges.end(),offset,
                 [](const auto &range,size_t byte) { return range.offset+range.size<=byte; });
             if (range==ranges.end() || range->offset>=offset+4) continue;
-            const auto [top,bottom]=write_native_interval(y,surface.height,texture.height,samples_y);
-            const auto [left,right]=write_native_interval(x,surface.width,texture.width,samples_x);
+            const auto [top,bottom]=write_native_interval(y,surface.height,native_height,samples_y);
+            const auto [left,right]=write_native_interval(x,surface.width,native_width,samples_x);
             for (size_t ny=top;ny<bottom;++ny) for (size_t nx=left;nx<right;++nx) {
                 auto *native=raw.data()+ny*stride+nx*8;
                 uint16_t rgba[4];
@@ -1061,14 +1093,14 @@ static bool u8s8s8u8_surface_memory(id<MTLTexture> texture, const SceGxmColorSur
             }
             changed=true;
         } else {
-            const size_t ny=size_t(y)*texture.height/surface.height;
-            const size_t nx=size_t(x)*texture.width/surface.width;
+            const size_t ny=size_t(y)*native_height/surface.height;
+            const size_t nx=size_t(x)*native_width/surface.width;
             uint16_t rgba[4];
             std::memcpy(rgba,raw.data()+ny*stride+nx*8,8);
             pack_u8s8s8u8(rgba,mode,destination.data()+offset);
         }
     }
-    if (changed) [texture replaceRegion:MTLRegionMake2D(0,0,texture.width,texture.height)
+    if (changed) [texture replaceRegion:MTLRegionMake2D(0,0,native_width,native_height)
         mipmapLevel:0 withBytes:raw.data() bytesPerRow:stride];
     return true;
 }
@@ -1164,6 +1196,7 @@ static bool rgb9e5_expanded_surface_memory(id<MTLTexture> texture, const SceGxmC
         || texture.pixelFormat!=MTLPixelFormatRGBA16Float
         || texture.textureType!=MTLTextureType2D || texture.storageMode!=MTLStorageModeShared
         || !texture.width || !texture.height || texture.width%samples_x || texture.height%samples_y) return false;
+    const size_t native_width = texture.width, native_height = texture.height;
     size_t previous_end=0;
     for (const auto &range:ranges) {
         if (!range.size || range.offset<previous_end || range.offset>size || range.size>size-range.offset)
@@ -1171,10 +1204,10 @@ static bool rgb9e5_expanded_surface_memory(id<MTLTexture> texture, const SceGxmC
         previous_end=range.offset+range.size;
     }
     if (upload && ranges.empty()) return true;
-    const size_t stride=texture.width*8;
-    std::vector<uint8_t> raw(stride*texture.height);
+    const size_t stride=native_width*8;
+    std::vector<uint8_t> raw(stride*native_height);
     [texture getBytes:raw.data() bytesPerRow:stride
-        fromRegion:MTLRegionMake2D(0,0,texture.width,texture.height) mipmapLevel:0];
+        fromRegion:MTLRegionMake2D(0,0,native_width,native_height) mipmapLevel:0];
     bool changed=false;
     for (uint32_t y=0;y<surface.height;++y) for (uint32_t x=0;x<surface.width;++x) {
         const size_t offset=packed_float_guest_pixel(surface,x,y)*4;
@@ -1187,15 +1220,15 @@ static bool rgb9e5_expanded_surface_memory(id<MTLTexture> texture, const SceGxmC
             if (mode==1) word=swap_e5_red_blue(word);
             uint16_t channels[4];
             unpack_rgb9e5(word,channels);
-            const auto [top,bottom]=write_native_interval(y,surface.height,texture.height,samples_y);
-            const auto [left,right]=write_native_interval(x,surface.width,texture.width,samples_x);
+            const auto [top,bottom]=write_native_interval(y,surface.height,native_height,samples_y);
+            const auto [left,right]=write_native_interval(x,surface.width,native_width,samples_x);
             for (size_t ny=top;ny<bottom;++ny)
                 for (size_t nx=left;nx<right;++nx)
                     std::memcpy(raw.data()+ny*stride+nx*8,channels,8);
             changed=true;
         } else {
-            const size_t ny=size_t(y)*texture.height/surface.height;
-            const size_t nx=size_t(x)*texture.width/surface.width;
+            const size_t ny=size_t(y)*native_height/surface.height;
+            const size_t nx=size_t(x)*native_width/surface.width;
             uint16_t channels[4];
             std::memcpy(channels,raw.data()+ny*stride+nx*8,8);
             uint32_t word=pack_rgb9e5(channels);
@@ -1203,7 +1236,7 @@ static bool rgb9e5_expanded_surface_memory(id<MTLTexture> texture, const SceGxmC
             std::memcpy(destination.data()+offset,&word,4);
         }
     }
-    if (changed) [texture replaceRegion:MTLRegionMake2D(0,0,texture.width,texture.height)
+    if (changed) [texture replaceRegion:MTLRegionMake2D(0,0,native_width,native_height)
         mipmapLevel:0 withBytes:raw.data() bytesPerRow:stride];
     return true;
 }
@@ -1312,12 +1345,7 @@ bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surfa
                 const auto *input = pixels.data() + size_t(y - read.y) * row_bytes
                     + size_t(x - read.x) * pixel_bytes;
                 if (native_byte_order) std::memcpy(output, input, size_t(count) * pixel_bytes);
-                else for (uint32_t i = 0; i < count; ++i, input += 4, output += 4) {
-                    output[0] = input[channel[0]];
-                    output[1] = input[channel[1]];
-                    output[2] = input[channel[2]];
-                    output[3] = input[channel[3]];
-                }
+                else copy_rgba8_row(output,input,count,channel);
                 x += count;
             }
         }
@@ -1349,20 +1377,16 @@ bool read_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surfa
         raw = fetched.data();
         raw_stride = native_stride;
     }
-    // Linear byte-channel surfaces need only a permutation. Keep the four
-    // byte copies explicit so this common readback avoids dynamic memcpy
-    // calls and Objective-C texture queries for every component and pixel.
-    if (!region && surface.surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR && components.count == 4 && components.bytes == 1
+    // Linear byte-channel surfaces need only a permutation, including cropped
+    // reads. Buffer-backed sources keep full-image coordinates; fetched data
+    // starts at the requested region's origin.
+    if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR && components.count == 4 && components.bytes == 1
         && native_width == surface.width && native_height == surface.height) {
-        for (uint32_t y = 0; y < surface.height; ++y) {
-            const auto *input = raw + y * raw_stride;
-            auto *output = destination.data() + size_t(y) * surface.strideInPixels * 4;
-            for (uint32_t x = 0; x < surface.width; ++x, input += 4, output += 4) {
-                output[0] = input[channel[0]];
-                output[1] = input[channel[1]];
-                output[2] = input[channel[2]];
-                output[3] = input[channel[3]];
-            }
+        const auto read=region?*region:SurfaceRect{0,0,surface.width,surface.height};
+        for (uint32_t y=0;y<read.height;++y) {
+            const auto *input=raw+size_t(direct?read.y+y:y)*raw_stride+(direct?size_t(read.x)*4:0);
+            auto *output=destination.data()+(size_t(read.y+y)*surface.strideInPixels+read.x)*4;
+            copy_rgba8_row(output,input,read.width,channel);
         }
         return true;
     }
@@ -1427,6 +1451,7 @@ static bool write_surface_memory_mapped(id<MTLTexture> texture, const SceGxmColo
     if (!size || size > source.size() || !texture || !raw_storage_matches(texture.pixelFormat, components.native)
         || texture.textureType != MTLTextureType2D || texture.storageMode != MTLStorageModeShared
         || !texture.width || !texture.height || texture.width%samples_x || texture.height%samples_y) return false;
+    const size_t native_width = texture.width, native_height = texture.height;
     size_t previous_end = 0;
     for (const auto &range : ranges) {
         if (!range.size || range.offset < previous_end || range.offset > size || range.size > size - range.offset)
@@ -1464,118 +1489,225 @@ static bool write_surface_memory_mapped(id<MTLTexture> texture, const SceGxmColo
     if (ranges.empty()) return true;
     const size_t pixel_bytes = components.count * components.bytes;
     const size_t native_pixel_bytes = components.count == 3 ? 4 : pixel_bytes;
-    const size_t native_stride = texture.width * native_pixel_bytes;
-    // A linear, unscaled surface with identical guest/native channel order
-    // needs no per-pixel address lookup or channel conversion. Preserve bytes
-    // outside partial ranges in one native read, then upload the whole image.
-    // Full-range writes can upload the guest image without reading it back.
+    const size_t native_stride = native_width * native_pixel_bytes;
+    std::array<size_t, 16> native_byte_indices{};
+    for (size_t byte = 0; byte < pixel_bytes; ++byte)
+        native_byte_indices[byte] = channel[byte / components.bytes] * components.bytes + byte % components.bytes;
+    // Linear, unscaled imports can visit just the written row intervals.
+    // Preserve bytes outside partial ranges in one native read. Full writes
+    // need no readback, and identical channel order needs no conversion.
     const bool direct_linear = surface.surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR
         && samples_x == 1 && samples_y == 1
-        && texture.width == surface.width && texture.height == surface.height
+        && native_width == surface.width && native_height == surface.height
         && surface.strideInPixels >= surface.width
         && pixel_bytes == native_pixel_bytes
-        && size == size_t(surface.strideInPixels) * texture.height * pixel_bytes
-        && mapping == identity && !packed565 && !packed4444 && !packed_u1
+        && size == size_t(surface.strideInPixels) * native_height * pixel_bytes
+        && !packed565 && !packed4444 && !packed_u1
         && !packed_e5 && !packed_u2 && !packed_f11;
     if (direct_linear) {
-        const auto region = MTLRegionMake2D(0, 0, texture.width, texture.height);
+        const auto region = MTLRegionMake2D(0, 0, native_width, native_height);
         const size_t guest_stride = size_t(surface.strideInPixels) * pixel_bytes;
-        if (ranges.size() == 1 && ranges.front().offset == 0 && ranges.front().size == size) {
+        const bool complete = ranges.size() == 1 && ranges.front().offset == 0 && ranges.front().size == size;
+        if (complete && mapping == identity) {
             [texture replaceRegion:region mipmapLevel:0 withBytes:source.data() bytesPerRow:guest_stride];
             return true;
         }
-        std::vector<uint8_t> native(native_stride * texture.height);
-        [texture getBytes:native.data() bytesPerRow:native_stride fromRegion:region mipmapLevel:0];
+        std::vector<uint8_t> native(native_stride * native_height);
+        if (!complete)
+            [texture getBytes:native.data() bytesPerRow:native_stride fromRegion:region mipmapLevel:0];
+        const auto copy_row = [&]<size_t Bytes>(uint8_t *destination, const uint8_t *guest,
+                                  size_t first, size_t last) {
+            // Only the interval ends can contain partial pixels. Their other
+            // native components must survive, even across adjacent ranges.
+            for (; first < last && first % Bytes; ++first)
+                destination[first - first % Bytes + native_byte_indices[first % Bytes]] = guest[first];
+            for (; last - first >= Bytes; first += Bytes) {
+                std::array<uint8_t, Bytes> pixel;
+                for (size_t byte = 0; byte < Bytes; ++byte)
+                    pixel[native_byte_indices[byte]] = guest[first + byte];
+                std::memcpy(destination + first, pixel.data(), Bytes);
+            }
+            for (; first < last; ++first)
+                destination[first - first % Bytes + native_byte_indices[first % Bytes]] = guest[first];
+        };
         for (const auto &range : ranges) {
             const size_t end = range.offset + range.size;
-            for (size_t y = range.offset / guest_stride; y < texture.height && y * guest_stride < end; ++y) {
+            for (size_t y = range.offset / guest_stride; y < native_height && y * guest_stride < end; ++y) {
                 const size_t row_begin = y * guest_stride;
                 const size_t first = std::max(range.offset, row_begin);
                 const size_t last = std::min(end, row_begin + native_stride);
-                if (first < last)
-                    std::memcpy(native.data() + y * native_stride + first - row_begin, source.data() + first, last - first);
+                if (first >= last) continue;
+                auto *destination = native.data() + y * native_stride;
+                const auto *guest = source.data() + row_begin;
+                if (mapping == identity)
+                    std::memcpy(destination + first - row_begin, source.data() + first, last - first);
+                else switch (pixel_bytes) {
+                case 1: copy_row.template operator()<1>(destination, guest, first - row_begin, last - row_begin); break;
+                case 2: copy_row.template operator()<2>(destination, guest, first - row_begin, last - row_begin); break;
+                case 4: copy_row.template operator()<4>(destination, guest, first - row_begin, last - row_begin); break;
+                case 8: copy_row.template operator()<8>(destination, guest, first - row_begin, last - row_begin); break;
+                case 16: copy_row.template operator()<16>(destination, guest, first - row_begin, last - row_begin); break;
+                }
             }
         }
         [texture replaceRegion:region mipmapLevel:0 withBytes:native.data() bytesPerRow:native_stride];
         return true;
     }
-    std::vector<uint8_t> raw(native_stride * texture.height);
-    [texture getBytes:raw.data() bytesPerRow:native_stride
-        fromRegion:MTLRegionMake2D(0,0,texture.width,texture.height) mipmapLevel:0];
-    bool changed = false;
-    size_t linear_range_index = 0;
-    for (uint32_t y = 0; y < surface.height; ++y) for (uint32_t x = 0; x < surface.width; ++x) {
-        size_t pixel;
-        if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_TILED)
-            pixel = ((size_t(y / 32) * (surface.strideInPixels / 32) + x / 32) * 1024) + (y % 32) * 32 + x % 32;
-        else if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_SWIZZLED)
-            pixel = texture::encode_morton(x,y,surface.width,surface.height);
-        else pixel = size_t(y) * surface.strideInPixels + x;
-        const size_t offset = pixel * pixel_bytes;
-        auto range = ranges.begin();
-        if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR) {
-            while (linear_range_index < ranges.size()
-                && ranges[linear_range_index].offset + ranges[linear_range_index].size <= offset)
-                ++linear_range_index;
-            range += linear_range_index;
-        } else {
-            range = std::lower_bound(ranges.begin(), ranges.end(), offset,
-                [](const auto &range, size_t offset) { return range.offset + range.size <= offset; });
-        }
-        if (range == ranges.end() || range->offset >= offset + pixel_bytes) continue;
-        std::array<bool,16> written{};
-        for (; range != ranges.end() && range->offset < offset + pixel_bytes; ++range)
-            for (size_t byte = std::max(offset,range->offset); byte < std::min(offset+pixel_bytes,range->offset+range->size); ++byte)
-                written[byte-offset] = true;
-        // Preserve every native pixel/component outside the written guest bytes.
-        // These boundaries are the inverse of read_surface_memory's selection.
-        const auto [top,bottom]=write_native_interval(y,surface.height,texture.height,samples_y);
-        const auto [left,right]=write_native_interval(x,surface.width,texture.width,samples_x);
-        for (size_t ny=top;ny<bottom;++ny)
-            for (size_t nx=left;nx<right;++nx) {
-                auto *native = raw.data()+ny*native_stride+nx*native_pixel_bytes;
-                if (packed565) {
-                    uint16_t word;
-                    std::memcpy(&word,native,2);
-                    if (reverse565) word=swap_565_red_blue(word);
-                    auto *bytes=reinterpret_cast<uint8_t *>(&word);
-                    for (size_t byte=0;byte<2;++byte) if (written[byte]) bytes[byte]=source[offset+byte];
-                    if (reverse565) word=swap_565_red_blue(word);
-                    std::memcpy(native,&word,2);
-                } else if (packed_u1) {
-                    uint16_t word;
-                    std::memcpy(&word,native,2);
-                    if (reverse_u1) word=swap_5551_red_blue(word,u1_mode<2);
-                    auto *bytes=reinterpret_cast<uint8_t *>(&word);
-                    for (size_t byte=0;byte<2;++byte) if (written[byte]) bytes[byte]=source[offset+byte];
-                    if (reverse_u1) word=swap_5551_red_blue(word,u1_mode<2);
-                    std::memcpy(native,&word,2);
-                } else if (packed4444) {
-                    uint16_t word;
-                    std::memcpy(&word,native,2);
-                    word=permute_4444(word,packed_mapping);
-                    auto *bytes=reinterpret_cast<uint8_t *>(&word);
-                    for (size_t byte=0;byte<2;++byte) if (written[byte]) bytes[byte]=source[offset+byte];
-                    word=permute_4444(word,inverse_packed_mapping);
-                    std::memcpy(native,&word,2);
-                } else if (packed_e5 || packed_u2) {
-                    uint32_t word;
-                    std::memcpy(&word,native,4);
-                    if (reverse_e5) word=swap_e5_red_blue(word);
-                    if (packed_u2) word=packed_10_guest_word(word,u2_mode);
-                    auto *bytes=reinterpret_cast<uint8_t *>(&word);
-                    for (size_t byte=0;byte<4;++byte) if (written[byte]) bytes[byte]=source[offset+byte];
-                    if (reverse_e5) word=swap_e5_red_blue(word);
-                    if (packed_u2) word=packed_10_native_word(word,u2_mode);
-                    std::memcpy(native,&word,4);
-                } else for (size_t byte = 0; byte < pixel_bytes; ++byte) if (written[byte]) {
-                    const size_t native_byte = channel[byte/components.bytes]*components.bytes + byte%components.bytes;
-                    native[native_byte] = source[offset+byte];
+    // Column footprints are shared by every row, including overlapping
+    // footprints at fractional resolution. Keep guest traversal order below.
+    std::vector<std::pair<size_t, size_t>> columns(surface.width);
+    for (uint32_t x = 0; x < surface.width; ++x)
+        columns[x] = write_native_interval(x, surface.width, native_width, samples_x);
+    // Full unpacked imports need neither the old native bytes nor per-byte
+    // write masks. Convert each guest pixel once, then replicate that word to
+    // its native sample/scale footprint. RGB24 still needs the existing native
+    // alpha. Keep traversal order for overlapping downscaled footprints.
+    const bool whole_pixel_copy = pixel_bytes == native_pixel_bytes
+        && !packed565 && !packed4444 && !packed_u1 && !packed_e5 && !packed_u2;
+    if (whole_pixel_copy
+        && ranges.size() == 1 && ranges.front().offset == 0 && ranges.front().size == size) {
+        std::vector<uint8_t> converted(native_stride * native_height);
+        const bool one_to_one = samples_x == 1 && samples_y == 1
+            && native_width == surface.width && native_height == surface.height;
+        const auto convert = [&]<size_t Bytes>() {
+            for (uint32_t y = 0; y < surface.height; ++y) {
+                const auto [top, bottom] = write_native_interval(y, surface.height, native_height, samples_y);
+                for (uint32_t x = 0; x < surface.width; ++x) {
+                    const auto *guest = source.data() + packed_float_guest_pixel(surface, x, y) * Bytes;
+                    std::array<uint8_t, Bytes> pixel;
+                    for (size_t byte = 0; byte < Bytes; ++byte)
+                        pixel[native_byte_indices[byte]] = guest[byte];
+                    if (one_to_one) {
+                        std::memcpy(converted.data() + y * native_stride + x * Bytes, pixel.data(), Bytes);
+                        continue;
+                    }
+                    const auto [left, right] = columns[x];
+                    for (size_t ny = top; ny < bottom; ++ny)
+                        for (size_t nx = left; nx < right; ++nx)
+                            std::memcpy(converted.data() + ny * native_stride + nx * Bytes, pixel.data(), Bytes);
                 }
             }
-        changed = true;
+        };
+        switch (pixel_bytes) {
+        case 1: convert.template operator()<1>(); break;
+        case 2: convert.template operator()<2>(); break;
+        case 4: convert.template operator()<4>(); break;
+        case 8: convert.template operator()<8>(); break;
+        case 16: convert.template operator()<16>(); break;
+        }
+        [texture replaceRegion:MTLRegionMake2D(0, 0, native_width, native_height)
+            mipmapLevel:0 withBytes:converted.data() bytesPerRow:native_stride];
+        return true;
     }
-    if (changed) [texture replaceRegion:MTLRegionMake2D(0,0,texture.width,texture.height)
+    std::vector<uint8_t> raw(native_stride * native_height);
+    [texture getBytes:raw.data() bytesPerRow:native_stride
+        fromRegion:MTLRegionMake2D(0,0,native_width,native_height) mipmapLevel:0];
+    bool changed = false;
+    size_t linear_range_index = 0;
+    const uint32_t whole_pixel_mask = (uint32_t(1) << pixel_bytes) - 1;
+    for (uint32_t y = 0; y < surface.height; ++y) {
+        const auto [top, bottom] = write_native_interval(y, surface.height, native_height, samples_y);
+        for (uint32_t x = 0; x < surface.width; ++x) {
+            size_t pixel;
+            if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_TILED)
+                pixel = ((size_t(y / 32) * (surface.strideInPixels / 32) + x / 32) * 1024) + (y % 32) * 32 + x % 32;
+            else if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_SWIZZLED)
+                pixel = texture::encode_morton(x,y,surface.width,surface.height);
+            else pixel = size_t(y) * surface.strideInPixels + x;
+            const size_t offset = pixel * pixel_bytes;
+            auto range = ranges.begin();
+            if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR) {
+                while (linear_range_index < ranges.size()
+                    && ranges[linear_range_index].offset + ranges[linear_range_index].size <= offset)
+                    ++linear_range_index;
+                range += linear_range_index;
+            } else {
+                range = std::lower_bound(ranges.begin(), ranges.end(), offset,
+                    [](const auto &range, size_t offset) { return range.offset + range.size <= offset; });
+            }
+            if (range == ranges.end() || range->offset >= offset + pixel_bytes) continue;
+            uint32_t written = 0;
+            for (; range != ranges.end() && range->offset < offset + pixel_bytes; ++range) {
+                const size_t first = std::max(offset, range->offset) - offset;
+                const size_t last = std::min(offset + pixel_bytes, range->offset + range->size) - offset;
+                written |= ((uint32_t(1) << (last - first)) - 1) << first;
+            }
+            // Preserve every native pixel/component outside the written guest bytes.
+            // These boundaries are the inverse of read_surface_memory's selection.
+            const auto [left, right] = columns[x];
+            if (whole_pixel_copy && written == whole_pixel_mask) {
+                // Reorder complete components once per guest pixel. Fixed-width
+                // byte copies preserve float payloads and permit unaligned input.
+                std::array<uint8_t, 16> converted;
+                for (uint32_t c = 0; c < components.count; ++c) {
+                    auto *out = converted.data() + channel[c] * components.bytes;
+                    const auto *in = source.data() + offset + c * components.bytes;
+                    switch (components.bytes) {
+                    case 1: *out = *in; break;
+                    case 2: std::memcpy(out, in, 2); break;
+                    case 4: std::memcpy(out, in, 4); break;
+                    }
+                }
+                const auto copy_pixel = [&]<size_t Bytes>() {
+                    for (size_t ny = top; ny < bottom; ++ny)
+                        for (size_t nx = left; nx < right; ++nx)
+                            std::memcpy(raw.data() + ny * native_stride + nx * Bytes, converted.data(), Bytes);
+                };
+                switch (pixel_bytes) {
+                case 1: copy_pixel.template operator()<1>(); break;
+                case 2: copy_pixel.template operator()<2>(); break;
+                case 4: copy_pixel.template operator()<4>(); break;
+                case 8: copy_pixel.template operator()<8>(); break;
+                case 16: copy_pixel.template operator()<16>(); break;
+                }
+                changed = true;
+                continue;
+            }
+            for (size_t ny=top;ny<bottom;++ny)
+                for (size_t nx=left;nx<right;++nx) {
+                    auto *native = raw.data()+ny*native_stride+nx*native_pixel_bytes;
+                    if (packed565) {
+                        uint16_t word;
+                        std::memcpy(&word,native,2);
+                        if (reverse565) word=swap_565_red_blue(word);
+                        auto *bytes=reinterpret_cast<uint8_t *>(&word);
+                        for (size_t byte=0;byte<2;++byte) if (written & (uint32_t(1) << byte)) bytes[byte]=source[offset+byte];
+                        if (reverse565) word=swap_565_red_blue(word);
+                        std::memcpy(native,&word,2);
+                    } else if (packed_u1) {
+                        uint16_t word;
+                        std::memcpy(&word,native,2);
+                        if (reverse_u1) word=swap_5551_red_blue(word,u1_mode<2);
+                        auto *bytes=reinterpret_cast<uint8_t *>(&word);
+                        for (size_t byte=0;byte<2;++byte) if (written & (uint32_t(1) << byte)) bytes[byte]=source[offset+byte];
+                        if (reverse_u1) word=swap_5551_red_blue(word,u1_mode<2);
+                        std::memcpy(native,&word,2);
+                    } else if (packed4444) {
+                        uint16_t word;
+                        std::memcpy(&word,native,2);
+                        word=permute_4444(word,packed_mapping);
+                        auto *bytes=reinterpret_cast<uint8_t *>(&word);
+                        for (size_t byte=0;byte<2;++byte) if (written & (uint32_t(1) << byte)) bytes[byte]=source[offset+byte];
+                        word=permute_4444(word,inverse_packed_mapping);
+                        std::memcpy(native,&word,2);
+                    } else if (packed_e5 || packed_u2) {
+                        uint32_t word;
+                        std::memcpy(&word,native,4);
+                        if (reverse_e5) word=swap_e5_red_blue(word);
+                        if (packed_u2) word=packed_10_guest_word(word,u2_mode);
+                        auto *bytes=reinterpret_cast<uint8_t *>(&word);
+                        for (size_t byte=0;byte<4;++byte) if (written & (uint32_t(1) << byte)) bytes[byte]=source[offset+byte];
+                        if (reverse_e5) word=swap_e5_red_blue(word);
+                        if (packed_u2) word=packed_10_native_word(word,u2_mode);
+                        std::memcpy(native,&word,4);
+                    } else for (size_t byte = 0; byte < pixel_bytes; ++byte) if (written & (uint32_t(1) << byte)) {
+                        native[native_byte_indices[byte]] = source[offset+byte];
+                    }
+                }
+            changed = true;
+        }
+    }
+    if (changed) [texture replaceRegion:MTLRegionMake2D(0,0,native_width,native_height)
         mipmapLevel:0 withBytes:raw.data() bytesPerRow:native_stride];
     return true;
 }
@@ -1671,7 +1803,8 @@ static MTLSamplerAddressMode sampler_address_mode(uint32_t mode) {
         return MTLSamplerAddressModeClampToEdge;
     }
 }
-id<MTLSamplerState> make_sampler(Device &device, const SceGxmTexture &texture, uint32_t anisotropy) {
+id<MTLSamplerState> make_sampler(Device &device, const SceGxmTexture &texture, uint32_t anisotropy,
+    SamplerCache *cache) {
     auto desc = [MTLSamplerDescriptor new];
     // Strided descriptors reuse min_filter for the row stride. Their actual
     // minification filter is the same as their magnification filter.
@@ -1685,8 +1818,21 @@ id<MTLSamplerState> make_sampler(Device &device, const SceGxmTexture &texture, u
     // VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK.
     desc.borderColor = MTLSamplerBorderColorTransparentBlack;
     desc.maxAnisotropy = effective_sampler_anisotropy(texture, anisotropy);
+    const std::array<uint32_t,7> key{uint32_t(desc.minFilter),uint32_t(desc.magFilter),
+        uint32_t(desc.mipFilter),std::bit_cast<uint32_t>(desc.lodMinClamp),
+        uint32_t(desc.sAddressMode),uint32_t(desc.tAddressMode),uint32_t(desc.maxAnisotropy)};
+    if (cache) {
+        const auto found = cache->find(key);
+        if (found != cache->end()) return found->second;
+    }
     auto result = [device.native_device() newSamplerStateWithDescriptor:desc];
     if (!result) throw std::runtime_error("Metal: cannot create texture sampler");
+    if (cache) {
+        // Retain a bounded set across draws; command buffers keep their bound
+        // samplers alive when the map is cleared.
+        if (cache->size() >= 512) cache->clear();
+        cache->emplace(key,result);
+    }
     return result;
 }
 
@@ -2175,9 +2321,25 @@ uint2 seed_axis(uint native, uint native_size, uint source_size, uint guest_size
     // Select the first source pixel that expands back to this native pixel.
     return uint2(start+min(((native-first)*(end-start)+last-first-1)/max(last-first,1u),end-start-1),guest);
 }
+// Invert the downscaled seed n -> floor(n*guest/native). Rounding both
+// directions down moves samples left/up for non-integral ratios, so a later
+// byte patch can merge against a different native value than its CPU baseline.
+uint downscaled_depth_position(uint guest,uint guest_size,uint native_size) {
+    return ((guest+1u)*native_size-1u)/guest_size;
+}
+uint depth_store_position(uint guest,uint guest_size,uint native_size) {
+    return native_size<guest_size ? downscaled_depth_position(guest,guest_size,native_size)
+        : (guest*native_size+guest_size-1u)/guest_size;
+}
 uint2 guest_sample_position(uint2 p, uint2 guest_size, uint2 native_size, uint samples) {
     const uint2 extent(samples/2,2), groups=guest_size/extent;
-    return (p/extent)*native_size/groups;
+    const uint2 group=p/extent;
+    // Upscaled MSAA uses seed_axis's interval ownership, whose first native
+    // sample is floor(group*native/groups). Keep that established mapping.
+    return uint2(native_size.x<groups.x ? downscaled_depth_position(group.x,groups.x,native_size.x)
+            : group.x*native_size.x/groups.x,
+        native_size.y<groups.y ? downscaled_depth_position(group.y,groups.y,native_size.y)
+            : group.y*native_size.y/groups.y);
 }
 uint3 guest_sample_address(uint2 p, uint2 guest_size, uint2 native_size, uint samples) {
     const uint2 extent(samples/2,2);
@@ -2233,13 +2395,10 @@ kernel void store_depth_samples(depth2d<float,access::read> input [[texture(0)]]
     if(p.x>=config.x || p.y>=config.y) return;
     // Select the first native pixel inside this guest pixel's interval.
     const uint2 native_size=uint2(input.get_width(),input.get_height());
-    // A downscaled native pixel represents several guest pixels. Select the
-    // same native pixel for all of them; upscaling retains the first pixel
-    // inside each guest interval.
-    const uint2 q=uint2(native_size.x<config.x ? p.x*native_size.x/config.x
-            : (p.x*native_size.x+config.x-1)/config.x,
-        native_size.y<config.y ? p.y*native_size.y/config.y
-            : (p.y*native_size.y+config.y-1)/config.y);
+    // A downscaled native pixel owns the guest interval beginning at its
+    // seed coordinate; upscaling retains the first pixel in the guest interval.
+    const uint2 q=uint2(depth_store_position(p.x,config.x,native_size.x),
+        depth_store_position(p.y,config.y,native_size.y));
     output[p.y*config.x+p.x]={config.w&1 ? input.read(q) : 0.f,config.w&2 ? stencil.read(q).x : 0u};
 }
 kernel void store_depth_samples_ms(depth2d_ms<float,access::read> input [[texture(0)]],
@@ -2249,7 +2408,7 @@ kernel void store_depth_samples_ms(depth2d_ms<float,access::read> input [[textur
     const uint3 q=guest_sample_address(p,config.xy,uint2(input.get_width(),input.get_height()),input.get_num_samples());
     output[p.y*config.x+p.x]={config.w&1 ? input.read(q.xy,q.z) : 0.f,config.w&2 ? stencil.read(q.xy,q.z).x : 0u};
 }
-// The CPU path rounds a double-precision product by 2^24-1. A float product
+// The CPU path rounds a double-precision product by 2^16-1 or 2^24-1. A float product
 // can round differently near half steps, so retain the exact float mantissa.
 uint packed_depth_unorm(float depth,uint maximum) {
     if (!(depth>0.f)) return 0u;
@@ -2280,42 +2439,44 @@ kernel void copy_packed_depth(depth2d<float,access::read> input [[texture(0)]],
     output.write(float4(uint4(word,word>>8,word>>16,word>>24)&255u)/255.f,p);
 }
 kernel void store_packed_depth_samples(depth2d<float,access::read> input [[texture(0)]],
-    texture2d<uint,access::read> stencil [[texture(1)]], device uint *output [[buffer(0)]],
+    texture2d<uint,access::read> stencil [[texture(1)]], device uchar *output [[buffer(0)]],
     constant uint4 &config [[buffer(1)]], uint2 p [[thread_position_in_grid]]) {
     if(p.x>=config.x || p.y>=config.y) return;
     const uint2 native_size=uint2(input.get_width(),input.get_height());
-    const uint2 q=uint2(native_size.x<config.x ? p.x*native_size.x/config.x
-            : (p.x*native_size.x+config.x-1)/config.x,
-        native_size.y<config.y ? p.y*native_size.y/config.y
-            : (p.y*native_size.y+config.y-1)/config.y);
+    const uint2 q=uint2(depth_store_position(p.x,config.x,native_size.x),
+        depth_store_position(p.y,config.y,native_size.y));
     const uint offset=config.z
         ? ((p.y/32u)*(config.z/32u)+p.x/32u)*1024u+(p.y%32u)*32u+p.x%32u
         : p.y*config.x+p.x;
-    output[offset]=(config.w&4u)
-        ? packed_depth24(input.read(q))|(stencil.read(q).x<<24)
-        : as_type<uint>(input.read(q));
+    if(config.w&8u)
+        reinterpret_cast<device ushort *>(output)[offset]=ushort(packed_depth_unorm(input.read(q),0xffffu));
+    else
+        reinterpret_cast<device uint *>(output)[offset]=(config.w&4u)
+            ? packed_depth24(input.read(q))|(stencil.read(q).x<<24)
+            : as_type<uint>(input.read(q));
 }
 kernel void store_packed_depth_samples_ms(depth2d_ms<float,access::read> input [[texture(0)]],
-    texture2d_ms<uint,access::read> stencil [[texture(1)]], device uint *output [[buffer(0)]],
+    texture2d_ms<uint,access::read> stencil [[texture(1)]], device uchar *output [[buffer(0)]],
     constant uint4 &config [[buffer(1)]], uint2 p [[thread_position_in_grid]]) {
     if(p.x>=config.x || p.y>=config.y) return;
     const uint3 q=guest_sample_address(p,config.xy,uint2(input.get_width(),input.get_height()),input.get_num_samples());
     const uint offset=config.z
         ? ((p.y/32u)*(config.z/32u)+p.x/32u)*1024u+(p.y%32u)*32u+p.x%32u
         : p.y*config.x+p.x;
-    output[offset]=(config.w&4u)
-        ? packed_depth24(input.read(q.xy,q.z))|(stencil.read(q.xy,q.z).x<<24)
-        : as_type<uint>(input.read(q.xy,q.z));
+    if(config.w&8u)
+        reinterpret_cast<device ushort *>(output)[offset]=ushort(packed_depth_unorm(input.read(q.xy,q.z),0xffffu));
+    else
+        reinterpret_cast<device uint *>(output)[offset]=(config.w&4u)
+            ? packed_depth24(input.read(q.xy,q.z))|(stencil.read(q.xy,q.z).x<<24)
+            : as_type<uint>(input.read(q.xy,q.z));
 }
 kernel void store_mask_samples(texture2d<float,access::read> input [[texture(0)]],
     device uint *output [[buffer(0)]], constant uint4 &config [[buffer(1)]],
     uint2 p [[thread_position_in_grid]]) {
     if(p.x>=config.x || p.y>=config.y) return;
     const uint2 native_size=uint2(input.get_width(),input.get_height());
-    const uint2 q=uint2(native_size.x<config.x ? p.x*native_size.x/config.x
-            : (p.x*native_size.x+config.x-1)/config.x,
-        native_size.y<config.y ? p.y*native_size.y/config.y
-            : (p.y*native_size.y+config.y-1)/config.y);
+    const uint2 q=uint2(depth_store_position(p.x,config.x,native_size.x),
+        depth_store_position(p.y,config.y,native_size.y));
     output[p.y*config.x+p.x]=input.read(q).x>=0.5f;
 }
 kernel void store_mask_samples_ms(texture2d_ms<float,access::read> input [[texture(0)]],
@@ -2367,33 +2528,49 @@ float patched_depth(float previous,uint4 patch,uint kind) {
     const uint old=kind==0 ? packed_depth_unorm(previous,0xffffu)
         : kind==1 ? packed_depth24(previous) : as_type<uint>(previous);
     const uint value=((old&~changed)|(patch.x&changed))&valid;
-    return kind==0 ? float(value)/65535.f : kind==1 ? float(value)/16777215.f : as_type<float>(value);
+    // A fast reciprocal multiply can change a reconstructed D24 word by
+    // one unit. Match the CPU load's correctly rounded integer conversion.
+    return kind==0 ? precise::divide(float(value),65535.f)
+        : kind==1 ? precise::divide(float(value),16777215.f) : as_type<float>(value);
+}
+uint4 read_depth_patch(texture2d<uint,access::read> patches,uint2 native,uint sample,
+    constant uint4 *config) {
+    // Coordinates remain relative to the full guest image, including MSAA's
+    // guest sample grid. Only the staging texture is cropped.
+    const uint2 p=depth_patch_coordinate(native,sample,config[0],config[1].xy)-config[1].zw;
+    if (any(p>=uint2(patches.get_width(),patches.get_height()))) discard_fragment();
+    return patches.read(p);
 }
 fragment DepthCopy patch_depth(float4 position [[position]],uint sample [[sample_id]],
     depth2d<float,access::read> previous [[texture(0)]],texture2d<uint,access::read> patches [[texture(1)]],
-    constant uint4 &config [[buffer(0)]]) {
+    constant uint4 *config [[buffer(0)]]) {
     const uint2 native=uint2(position.xy);
-    const uint2 p=depth_patch_coordinate(native,sample,config,uint2(patches.get_width(),patches.get_height()));
-    return {patched_depth(previous.read(native),patches.read(p),config.w)};
+    const uint4 patch=read_depth_patch(patches,native,sample,config);
+    return {patched_depth(previous.read(native),patch,config[0].w)};
 }
 fragment DepthCopy patch_depth_ms(float4 position [[position]],uint sample [[sample_id]],
     depth2d_ms<float,access::read> previous [[texture(0)]],texture2d<uint,access::read> patches [[texture(1)]],
-    constant uint4 &config [[buffer(0)]]) {
+    constant uint4 *config [[buffer(0)]]) {
     const uint2 native=uint2(position.xy);
-    const uint2 p=depth_patch_coordinate(native,sample,config,uint2(patches.get_width(),patches.get_height()));
-    return {patched_depth(previous.read(native,sample),patches.read(p),config.w)};
+    const uint4 patch=read_depth_patch(patches,native,sample,config);
+    return {patched_depth(previous.read(native,sample),patch,config[0].w)};
+}
+fragment DepthCopy patch_depth_words(float4 position [[position]],uint sample [[sample_id]],
+    texture2d<uint,access::read> patches [[texture(1)]],constant uint4 *config [[buffer(0)]]) {
+    const uint4 patch=read_depth_patch(patches,uint2(position.xy),sample,config);
+    // Every changed depth word replaces all of its meaningful bits. The
+    // shared decoder still discards untouched samples and preserves rounding.
+    return {patched_depth(0.0f,patch,config[0].w)};
 }
 fragment StencilCopy patch_stencil(float4 position [[position]],uint sample [[sample_id]],
-    texture2d<uint,access::read> patches [[texture(1)]],constant uint4 &config [[buffer(0)]]) {
-    const uint2 p=depth_patch_coordinate(uint2(position.xy),sample,config,uint2(patches.get_width(),patches.get_height()));
-    const uint4 patch=patches.read(p);
+    texture2d<uint,access::read> patches [[texture(1)]],constant uint4 *config [[buffer(0)]]) {
+    const uint4 patch=read_depth_patch(patches,uint2(position.xy),sample,config);
     if (!patch.w) discard_fragment();
     return {patch.z};
 }
 fragment float4 patch_depth_mask(float4 position [[position]],uint sample [[sample_id]],
-    texture2d<uint,access::read> patches [[texture(1)]],constant uint4 &config [[buffer(0)]]) {
-    const uint2 p=depth_patch_coordinate(uint2(position.xy),sample,config,uint2(patches.get_width(),patches.get_height()));
-    const uint4 patch=patches.read(p);
+    texture2d<uint,access::read> patches [[texture(1)]],constant uint4 *config [[buffer(0)]]) {
+    const uint4 patch=read_depth_patch(patches,uint2(position.xy),sample,config);
     if (!(patch.y&0x80000000u)) discard_fragment();
     return float4(float(patch.x>>31));
 }
@@ -3786,6 +3963,24 @@ static bool depth_memory_valid(id<MTLTexture> texture,const DepthMemoryLayout &l
             : texture.width>=layout.width && texture.height>=layout.height;
     return msaa_depth_extent_valid(texture,layout,scale);
 }
+id<MTLDepthStencilState> SurfaceCaster::depth_state(bool depth_write, bool stencil_write) {
+    auto &cached = depth_states[(uint32_t(depth_write) << 1) | uint32_t(stencil_write)];
+    if (!cached) {
+        auto desc = [MTLDepthStencilDescriptor new];
+        desc.depthCompareFunction = MTLCompareFunctionAlways;
+        desc.depthWriteEnabled = depth_write;
+        if (stencil_write) {
+            auto stencil = [MTLStencilDescriptor new];
+            stencil.stencilCompareFunction = MTLCompareFunctionAlways;
+            stencil.depthStencilPassOperation = MTLStencilOperationReplace;
+            stencil.writeMask = 0xff;
+            desc.frontFaceStencil = desc.backFaceStencil = stencil;
+        }
+        cached = [device.native_device() newDepthStencilStateWithDescriptor:desc];
+        if (!cached) throw std::runtime_error("Metal: surface depth state allocation failed");
+    }
+    return cached;
+}
 void SurfaceCaster::clear_depth_region(id<MTLTexture> texture,SurfaceRect rect,float depth,uint32_t stencil,
     DepthMemoryWrite aspects,id<MTLCommandBuffer> commands,const MTLSamplePosition *sample_positions) {
     if (!texture || !commands || commands.status>=MTLCommandBufferStatusCommitted
@@ -3819,19 +4014,10 @@ void SurfaceCaster::clear_depth_region(id<MTLTexture> texture,SurfaceRect rect,f
         if (sample_positions) pass.depthAttachment.storeAction=MTLStoreActionCustomSampleDepthStore;
     }
     if (sample_positions) [pass setSamplePositions:sample_positions count:texture.sampleCount];
-    auto state=[MTLDepthStencilDescriptor new];
-    state.depthCompareFunction=MTLCompareFunctionAlways;state.depthWriteEnabled=aspects.depth;
-    if (aspects.stencil) {
-        auto descriptor=[MTLStencilDescriptor new];
-        descriptor.stencilCompareFunction=MTLCompareFunctionAlways;
-        descriptor.depthStencilPassOperation=MTLStencilOperationReplace;descriptor.writeMask=0xff;
-        state.frontFaceStencil=state.backFaceStencil=descriptor;
-    }
-    auto depth_state=[device.native_device() newDepthStencilStateWithDescriptor:state];
-    if (!depth_state) throw std::runtime_error("Metal: cannot allocate partial depth clear state");
+    auto clear_state=depth_state(aspects.depth,aspects.stencil);
     auto encoder=[commands renderCommandEncoderWithDescriptor:pass];
     if (!encoder) throw std::runtime_error("Metal: cannot encode partial depth clear");
-    [encoder setRenderPipelineState:pipeline];[encoder setDepthStencilState:depth_state];
+    [encoder setRenderPipelineState:pipeline];[encoder setDepthStencilState:clear_state];
     [encoder setViewport:MTLViewport{0,0,double(texture.width),double(texture.height),0,1}];
     [encoder setScissorRect:MTLScissorRect{rect.x,rect.y,rect.width,rect.height}];
     const uint32_t values[]={std::bit_cast<uint32_t>(depth),stencil};
@@ -3889,20 +4075,11 @@ bool SurfaceCaster::resample_depth(id<MTLTexture> source,id<MTLTexture> destinat
             if (sample_positions) pass.depthAttachment.storeAction=MTLStoreActionCustomSampleDepthStore;
         }
         if (sample_positions) [pass setSamplePositions:sample_positions count:source.sampleCount];
-        auto state=[MTLDepthStencilDescriptor new];
-        state.depthCompareFunction=MTLCompareFunctionAlways;state.depthWriteEnabled=!mask;
-        if (!mask) {
-            auto descriptor=[MTLStencilDescriptor new];
-            descriptor.stencilCompareFunction=MTLCompareFunctionAlways;
-            descriptor.depthStencilPassOperation=MTLStencilOperationReplace;descriptor.writeMask=0xff;
-            state.frontFaceStencil=state.backFaceStencil=descriptor;
-        }
-        auto depth_state=[device.native_device() newDepthStencilStateWithDescriptor:state];
-        if (!depth_state) throw std::runtime_error("Metal: cannot allocate depth resampling state");
+        auto resample_state=depth_state(!mask,!mask);
         auto encoder=[commands renderCommandEncoderWithDescriptor:pass];
         if (!encoder) throw std::runtime_error("Metal: cannot encode depth resampling");
         encoder.label=mask ? @"Vita3K sample-rate mask view" : @"Vita3K sample-rate depth/stencil view";
-        [encoder setRenderPipelineState:pipeline];[encoder setDepthStencilState:depth_state];
+        [encoder setRenderPipelineState:pipeline];[encoder setDepthStencilState:resample_state];
         [encoder setViewport:MTLViewport{0,0,double(destination.width),double(destination.height),0,1}];
         [encoder setFragmentTexture:mask ? source_mask : source atIndex:0];
         if (!mask) [encoder setFragmentTexture:stencil atIndex:1];
@@ -3917,6 +4094,10 @@ bool SurfaceCaster::patch_depth_memory(id<MTLTexture> texture,const SceGxmDepthS
     const DepthMemoryLayout &layout,float scale,std::span<const uint8_t> depth,std::span<const uint8_t> stencil,
     std::span<const SurfaceMemoryRange> depth_changes,std::span<const SurfaceMemoryRange> stencil_changes,
     id<MTLTexture> mask,id<MTLCommandBuffer> commands,DepthMemoryWrite *written) {
+    // Transfers also reach this helper outside the draw/end-scene pools on
+    // GXM's long-lived worker. Driver autoreleases must retire per call;
+    // encoded commands retain every resource needed by pending GPU work.
+    @autoreleasepool {
     if (written) *written={};
     const bool masked=has_depth_mask_bit(surface);
     if (!depth_memory_valid(texture,layout,scale,depth.size(),stencil.size())
@@ -3944,60 +4125,189 @@ bool SurfaceCaster::patch_depth_memory(id<MTLTexture> texture,const SceGxmDepthS
         return result;
     };
     const auto depth_ranges=normalize(depth_changes),stencil_ranges=normalize(stencil_changes);
-    // Linear depth rows visit guest offsets in order. Carry the range cursor
-    // forward instead of searching the same change list for every byte of
-    // every depth sample. Tiled rows keep the random-access lookup.
-    size_t depth_range_index=0,stencil_range_index=0;
-    const auto changed=[&](size_t offset,const auto &ranges,size_t &index) {
-        if (!layout.tiled) {
-            while (index<ranges.size() && ranges[index].offset+ranges[index].size<=offset) ++index;
-            return index<ranges.size() && ranges[index].offset<=offset;
+    const bool full_depth=layout.depth_size && depth_ranges.size()==1
+        && depth_ranges[0].offset==0 && depth_ranges[0].size==layout.depth_size;
+    // Traverse each changed interval as visible row/tile-row runs. The same
+    // mapping determines the staging bounds and later fills its patch words.
+    const auto visit_runs=[&]<size_t Bytes>(const auto &ranges,const auto &visit) {
+        for (const auto &range:ranges) {
+            size_t address=range.offset/Bytes;
+            const size_t last=(range.offset+range.size-1)/Bytes;
+            while (address<=last) {
+                const size_t x=layout.tiled ? (address/1024%(layout.stride/32))*32+address%32 : address%layout.stride;
+                const size_t y=layout.tiled ? (address/1024/(layout.stride/32))*32+(address%1024)/32 : address/layout.stride;
+                const size_t run=std::min(last-address+1,layout.tiled ? 32-address%32 : layout.stride-x);
+                if (x<layout.width && y<layout.height)
+                    visit(range,address,x,y,std::min(run,size_t(layout.width)-x));
+                address+=run;
+            }
         }
-        const auto it=std::lower_bound(ranges.begin(),ranges.end(),offset,[](const auto &range,size_t byte) {
-            return range.offset+range.size<=byte;
-        });
-        return it!=ranges.end() && it->offset<=offset;
     };
+    size_t patch_x=0,patch_y=0,patch_width=layout.width,patch_height=layout.height;
+    if (!full_depth) {
+        size_t right=0,bottom=0;
+        patch_x=layout.width;patch_y=layout.height;
+        const auto bound=[&](const auto &,size_t,size_t x,size_t y,size_t count) {
+            patch_x=std::min(patch_x,x);patch_y=std::min(patch_y,y);
+            right=std::max(right,x+count);bottom=std::max(bottom,y+1);
+        };
+        if (layout.depth_size) {
+            if (layout.depth_bytes==2) visit_runs.template operator()<2>(depth_ranges,bound);
+            else visit_runs.template operator()<4>(depth_ranges,bound);
+        }
+        if (layout.stencil_size) {
+            if (layout.packed) visit_runs.template operator()<4>(stencil_ranges,bound);
+            else visit_runs.template operator()<1>(stencil_ranges,bound);
+        }
+        if (!right || !bottom) return true; // Only guest padding changed.
+        patch_width=right-patch_x;patch_height=bottom-patch_y;
+    }
     const uint32_t kind=layout.depth_bytes==2 ? 0 : layout.packed ? 1 : masked ? 3 : 2;
     const uint32_t depth_bits=kind==0 ? 0xffffu : kind==1 ? 0xffffffu : kind==3 ? 0x7fffffffu : 0xffffffffu;
     // Each guest sample supplies a word and byte write mask, plus a separate
     // stencil value/write flag. Padding never becomes a visible GPU patch.
-    static_assert(sizeof(std::array<uint32_t,4>)==16);
-    std::vector<std::array<uint32_t,4>> patches(size_t(layout.width)*layout.height);
+    using Patch = std::array<uint32_t,4>;
+    static_assert(sizeof(Patch)==16);
+    auto desc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Uint
+        width:patch_width height:patch_height mipmapped:NO];
+    desc.storageMode=MTLStorageModeShared;desc.usage=MTLTextureUsageShaderRead;
+    // Build the patch words directly in linear GPU-visible storage. A regular
+    // texture upload can compress/swizzle these temporary words on the CPU.
+    // Each call owns its buffer: queued patches must never reuse live storage.
+    id<MTLDevice> native=device.native_device();
+    const size_t alignment=[native minimumLinearTextureAlignmentForPixelFormat:desc.pixelFormat];
+    size_t patch_stride=patch_width;
+    id<MTLTexture> input=nil;
+    id<MTLBuffer> backing=nil;
+    if (alignment && alignment%sizeof(Patch)==0) {
+        const size_t row_bytes=(patch_width*sizeof(Patch)+alignment-1)/alignment*alignment;
+        if (row_bytes<=native.maxBufferLength/patch_height) {
+            backing=[native newBufferWithLength:row_bytes*patch_height options:MTLResourceStorageModeShared];
+            if (backing) input=[backing newTextureWithDescriptor:desc offset:0 bytesPerRow:row_bytes];
+            if (input) patch_stride=row_bytes/sizeof(Patch);
+        }
+    }
+    std::vector<Patch> fallback;
+    Patch *patches=nullptr;
+    if (input) {
+        patches=static_cast<Patch *>(backing.contents);
+        // A complete depth image initializes every visible patch below. Avoid
+        // clearing it first; linear-texture row padding is never sampled.
+        if (!full_depth) std::memset(patches,0,patch_stride*patch_height*sizeof(Patch));
+    } else {
+        backing=nil;
+        fallback.resize(patch_width*patch_height);
+        patches=fallback.data();
+    }
     bool patch_depth=false,patch_stencil=false,patch_mask=false;
-    for (uint32_t y=0;y<layout.height;++y) for (uint32_t x=0;x<layout.width;++x) {
-        const size_t address=depth_sample_offset(layout,x,y);
-        auto &patch=patches[size_t(y)*layout.width+x];
-        if (layout.depth_size) {
-            std::memcpy(&patch[0],depth.data()+address*layout.depth_bytes,layout.depth_bytes);
-            for (uint32_t b=0;b<layout.depth_bytes;++b)
-                if (changed(address*layout.depth_bytes+b,depth_ranges,depth_range_index)) patch[1]|=0xffu<<(8*b);
-            if (layout.packed) {
-                patch[2]=patch[0]>>24;
-                patch[3]=bool(patch[1]&0xff000000u);
+    bool needs_depth_snapshot=false;
+    // Visit written words in memory order. A linear row or a tile row maps to
+    // one contiguous patch run, so address division is needed only per run.
+    // Only interval ends need partial-byte masks; untouched samples stay zero.
+    const auto visit=[&]<size_t Bytes>(const auto &ranges,const auto &write) {
+        constexpr uint32_t full_mask=uint32_t((uint64_t(1)<<(Bytes*8))-1);
+        visit_runs.template operator()<Bytes>(ranges,[&](const auto &range,size_t address,size_t x,size_t y,size_t visible) {
+            const size_t end=range.offset+range.size;
+            auto *patch=patches+(y-patch_y)*patch_stride+(x-patch_x);
+            for (size_t i=0;i<visible;++i) {
+                const size_t word=(address+i)*Bytes;
+                uint32_t bits=full_mask;
+                if (word<range.offset) bits&=0xffffffffu<<((range.offset-word)*8);
+                if (end-word<Bytes) bits&=uint32_t((uint64_t(1)<<((end-word)*8))-1);
+                write(patch[i],address+i,bits);
+            }
+        });
+    };
+    uint32_t depth_written=0;
+    const auto write_full_depth=[&]<size_t Bytes, bool Packed>() {
+        constexpr uint32_t bits=uint32_t((uint64_t(1)<<(Bytes*8))-1);
+        for (size_t y=0;y<layout.height;++y) {
+            for (size_t x=0;x<layout.width;) {
+                const size_t address=layout.tiled
+                    ? ((y/32)*(layout.stride/32)+x/32)*1024+(y%32)*32+x%32
+                    : y*layout.stride+x;
+                const size_t count=layout.tiled ? std::min(size_t(32)-x%32,size_t(layout.width)-x)
+                                              : size_t(layout.width)-x;
+                auto *out=patches+y*patch_stride+x;
+                const auto *source=depth.data()+address*Bytes;
+                for (size_t i=0;i<count;++i) {
+                    uint32_t word=0;
+                    std::memcpy(&word,source+i*Bytes,Bytes);
+                    if constexpr (Packed) {
+                        const uint32_t value=layout.stencil_size ? stencil[(address+i)*4+3] : word>>24;
+                        out[i]={word,bits,value,1};
+                    } else {
+                        out[i]={word,bits,0,0};
+                    }
+                }
+                x+=count;
             }
         }
-        if (layout.stencil_size) {
-            const size_t offset=address*(layout.packed ? 4 : 1)+(layout.packed ? 3 : 0);
-            patch[2]=stencil[offset];
-            patch[3]|=changed(offset,stencil_ranges,stencil_range_index);
+        depth_written=bits;
+        patch_stencil=Packed;
+    };
+    const auto write_depth=[&]<size_t Bytes>() {
+        // Interior words are complete; only interval edges can need old bits.
+        // Inspect those edges once instead of adding a reduction to the hot
+        // per-pixel loop. Padding-only edges conservatively retain a snapshot.
+        constexpr uint32_t full_mask=uint32_t((uint64_t(1)<<(Bytes*8))-1);
+        const auto partial=[&](uint32_t bits) {
+            const uint32_t changed=bits&depth_bits;
+            return changed && changed!=depth_bits;
+        };
+        for (const auto &range:depth_ranges) {
+            const size_t end=range.offset+range.size;
+            const uint32_t first=full_mask<<((range.offset%Bytes)*8);
+            const uint32_t last=end%Bytes ? uint32_t((uint64_t(1)<<((end%Bytes)*8))-1) : full_mask;
+            needs_depth_snapshot|=range.offset/Bytes==(end-1)/Bytes
+                ? partial(first&last) : partial(first)||partial(last);
         }
-        patch_depth|=bool(patch[1]&depth_bits);
-        patch_stencil|=bool(patch[3]);
-        patch_mask|=masked && bool(patch[1]&0x80000000u);
+        visit.template operator()<Bytes>(depth_ranges,[&](auto &patch,size_t address,uint32_t bits) {
+            std::memcpy(&patch[0],depth.data()+address*Bytes,Bytes);
+            patch[1]|=bits;
+            depth_written|=bits;
+            if (layout.packed) {
+                // Packed stencil may also be supplied through the stencil
+                // span. Preserve that source's precedence for depth writes.
+                patch[2]=layout.stencil_size ? stencil[address*4+3] : patch[0]>>24;
+                patch[3]|=bool(bits&0xff000000u);
+                patch_stencil|=bool(patch[3]);
+            }
+        });
+    };
+    if (layout.depth_size) {
+        if (full_depth) {
+            if (layout.depth_bytes==2) write_full_depth.template operator()<2,false>();
+            else if (layout.packed) write_full_depth.template operator()<4,true>();
+            else write_full_depth.template operator()<4,false>();
+        } else if (layout.depth_bytes==2) write_depth.template operator()<2>();
+        else write_depth.template operator()<4>();
     }
+    if (layout.stencil_size) {
+        if (layout.packed) {
+            visit.template operator()<4>(stencil_ranges,[&](auto &patch,size_t address,uint32_t bits) {
+                if (!(bits&0xff000000u)) return;
+                patch[2]=stencil[address*4+3];patch[3]=1;patch_stencil=true;
+            });
+        } else {
+            visit.template operator()<1>(stencil_ranges,[&](auto &patch,size_t address,uint32_t) {
+                patch[2]=stencil[address];patch[3]=1;patch_stencil=true;
+            });
+        }
+    }
+    patch_depth=bool(depth_written&depth_bits);
+    patch_mask=masked && bool(depth_written&0x80000000u);
     if (!patch_depth && !patch_stencil && !patch_mask) return true;
-    auto desc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Uint
-        width:layout.width height:layout.height mipmapped:NO];
-    desc.storageMode=MTLStorageModeShared;desc.usage=MTLTextureUsageShaderRead;
-    auto input=[device.native_device() newTextureWithDescriptor:desc];
-    if (!input) throw std::runtime_error("Metal: depth patch staging allocation failed");
-    [input replaceRegion:MTLRegionMake2D(0,0,layout.width,layout.height) mipmapLevel:0
-        withBytes:patches.data() bytesPerRow:size_t(layout.width)*sizeof(patches[0])];
+    if (!input) {
+        input=[native newTextureWithDescriptor:desc];
+        if (!input) throw std::runtime_error("Metal: depth patch staging allocation failed");
+        [input replaceRegion:MTLRegionMake2D(0,0,patch_width,patch_height) mipmapLevel:0
+            withBytes:patches bytesPerRow:patch_width*sizeof(Patch)];
+    }
     const bool submit_here=commands==nil;
     if (submit_here) commands=surface_command_buffer(device,@"Vita3K depth memory patch");
     id<MTLTexture> previous=nil;
-    if (patch_depth) {
+    if (patch_depth && needs_depth_snapshot) {
         // Sampling the render attachment itself is not legal here. Retain its
         // exact native samples before any partial-byte depth writes occur.
         auto copy_desc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:texture.pixelFormat
@@ -4017,11 +4327,13 @@ bool SurfaceCaster::patch_depth_memory(id<MTLTexture> texture,const SceGxmDepthS
     std::string error;
     for (uint32_t aspect=0;aspect<3;++aspect) {
         if (!(aspect==0 ? patch_depth : aspect==1 ? patch_stencil : patch_mask)) continue;
-        auto &pipeline=depth_patch_pipelines[{uint32_t(texture.sampleCount),aspect}];
+        const bool whole_depth=aspect==0 && !needs_depth_snapshot;
+        auto &pipeline=depth_patch_pipelines[{uint32_t(texture.sampleCount),whole_depth?3u:aspect}];
         if (!pipeline) {
             auto pipeline_desc=[MTLRenderPipelineDescriptor new];
             pipeline_desc.vertexFunction=[multisample_library newFunctionWithName:@"seed_vs"];
-            NSString *name=aspect==0 ? (texture.sampleCount>1 ? @"patch_depth_ms" : @"patch_depth")
+            NSString *name=whole_depth ? @"patch_depth_words"
+                : aspect==0 ? (texture.sampleCount>1 ? @"patch_depth_ms" : @"patch_depth")
                 : aspect==1 ? @"patch_stencil" : @"patch_depth_mask";
             pipeline_desc.fragmentFunction=[multisample_library newFunctionWithName:name];
             if (aspect==2) pipeline_desc.colorAttachments[0].pixelFormat=mask.pixelFormat;
@@ -4040,24 +4352,15 @@ bool SurfaceCaster::patch_depth_memory(id<MTLTexture> texture,const SceGxmDepthS
             pass.depthAttachment.loadAction=pass.stencilAttachment.loadAction=MTLLoadActionLoad;
             pass.depthAttachment.storeAction=pass.stencilAttachment.storeAction=MTLStoreActionStore;
         }
-        auto state=[MTLDepthStencilDescriptor new];
-        state.depthCompareFunction=MTLCompareFunctionAlways;state.depthWriteEnabled=aspect==0;
-        if (aspect==1) {
-            auto stencil_state=[MTLStencilDescriptor new];
-            stencil_state.stencilCompareFunction=MTLCompareFunctionAlways;
-            stencil_state.depthStencilPassOperation=MTLStencilOperationReplace;
-            stencil_state.writeMask=0xff;
-            state.frontFaceStencil=state.backFaceStencil=stencil_state;
-        }
-        auto depth_state=[device.native_device() newDepthStencilStateWithDescriptor:state];
-        if (!depth_state) throw std::runtime_error("Metal: depth patch state allocation failed");
+        auto patch_state=depth_state(aspect==0,aspect==1);
         auto encoder=[commands renderCommandEncoderWithDescriptor:pass];
         if (!encoder) throw std::runtime_error("Metal: cannot encode depth memory patch");
-        [encoder setRenderPipelineState:pipeline];[encoder setDepthStencilState:depth_state];
+        [encoder setRenderPipelineState:pipeline];[encoder setDepthStencilState:patch_state];
         [encoder setViewport:MTLViewport{0,0,double(texture.width),double(texture.height),0,1}];
-        if (aspect==0) [encoder setFragmentTexture:previous atIndex:0];
+        if (aspect==0 && needs_depth_snapshot) [encoder setFragmentTexture:previous atIndex:0];
         [encoder setFragmentTexture:input atIndex:1];
-        const uint32_t config[]={uint32_t(texture.sampleCount),uint32_t(texture.width),uint32_t(texture.height),kind};
+        const uint32_t config[]={uint32_t(texture.sampleCount),uint32_t(texture.width),uint32_t(texture.height),kind,
+            layout.width,layout.height,uint32_t(patch_x),uint32_t(patch_y)};
         [encoder setFragmentBytes:config length:sizeof(config) atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [encoder endEncoding];
@@ -4065,6 +4368,7 @@ bool SurfaceCaster::patch_depth_memory(id<MTLTexture> texture,const SceGxmDepthS
     if (submit_here && !device.submit_and_wait(commands,error)) throw std::runtime_error(error);
     if (written) *written={patch_depth,patch_stencil,patch_mask};
     return true;
+    }
 }
 bool SurfaceCaster::copy_depth_stencil_region(id<MTLTexture> source,id<MTLTexture> destination,
     SurfaceRect source_rect,SurfaceRect destination_rect,bool stencil,id<MTLCommandBuffer> commands) {
@@ -4095,18 +4399,7 @@ bool SurfaceCaster::copy_depth_stencil_region(id<MTLTexture> source,id<MTLTextur
         pipeline=device.create_pipeline(desc,error);
         if (!pipeline) throw std::runtime_error(error);
     }
-    auto state=[MTLDepthStencilDescriptor new];
-    state.depthCompareFunction=MTLCompareFunctionAlways;
-    state.depthWriteEnabled=!stencil;
-    if (stencil) {
-        auto descriptor=[MTLStencilDescriptor new];
-        descriptor.stencilCompareFunction=MTLCompareFunctionAlways;
-        descriptor.depthStencilPassOperation=MTLStencilOperationReplace;
-        descriptor.writeMask=0xff;
-        state.frontFaceStencil=state.backFaceStencil=descriptor;
-    }
-    auto depth_state=[device.native_device() newDepthStencilStateWithDescriptor:state];
-    if (!depth_state) throw std::runtime_error("Metal: depth transfer state allocation failed");
+    auto transfer_state=depth_state(!stencil,stencil);
     auto pass=[MTLRenderPassDescriptor renderPassDescriptor];
     pass.depthAttachment.texture=pass.stencilAttachment.texture=destination;
     pass.depthAttachment.loadAction=pass.stencilAttachment.loadAction=MTLLoadActionLoad;
@@ -4115,7 +4408,7 @@ bool SurfaceCaster::copy_depth_stencil_region(id<MTLTexture> source,id<MTLTextur
     if (!encoder) throw std::runtime_error("Metal: cannot encode depth/stencil aspect transfer");
     encoder.label=stencil ? @"Vita3K stencil aspect transfer" : @"Vita3K depth aspect transfer";
     [encoder setRenderPipelineState:pipeline];
-    [encoder setDepthStencilState:depth_state];
+    [encoder setDepthStencilState:transfer_state];
     [encoder setViewport:MTLViewport{0,0,double(destination.width),double(destination.height),0,1}];
     [encoder setScissorRect:MTLScissorRect{destination_rect.x,destination_rect.y,destination_rect.width,destination_rect.height}];
     [encoder setFragmentTexture:input atIndex:0];
@@ -4166,10 +4459,7 @@ bool SurfaceCaster::load_depth_memory(id<MTLTexture> texture,const SceGxmDepthSt
     pass.depthAttachment.loadAction=pass.stencilAttachment.loadAction=MTLLoadActionDontCare;
     pass.depthAttachment.storeAction=pass.stencilAttachment.storeAction=MTLStoreActionStore;
     auto encoder=[commands renderCommandEncoderWithDescriptor:pass];
-    auto state=[MTLDepthStencilDescriptor new];state.depthCompareFunction=MTLCompareFunctionAlways;state.depthWriteEnabled=YES;
-    auto stencil_state=[MTLStencilDescriptor new];stencil_state.stencilCompareFunction=MTLCompareFunctionAlways;
-    stencil_state.depthStencilPassOperation=MTLStencilOperationReplace;state.frontFaceStencil=state.backFaceStencil=stencil_state;
-    [encoder setDepthStencilState:[device.native_device() newDepthStencilStateWithDescriptor:state]];
+    [encoder setDepthStencilState:depth_state(true,true)];
     [encoder setRenderPipelineState:pipeline];[encoder setFragmentTexture:d atIndex:0];[encoder setFragmentTexture:s atIndex:1];
     const uint32_t config[]={uint32_t(texture.sampleCount),uint32_t(texture.width),uint32_t(texture.height),0};
     [encoder setFragmentBytes:config length:sizeof(config) atIndex:0];
@@ -4249,17 +4539,21 @@ bool SurfaceCaster::enqueue_depth_store(id<MTLTexture> texture,const SceGxmDepth
     // readbacks, their tiling conversion, and a second command-buffer wait.
     struct DepthReadback { float depth; uint32_t stencil; };
     static_assert(sizeof(DepthReadback)==8);
-    // A complete 32x32 tile has no guest padding when the stride and height
-    // match the visible extent. Scatter on the GPU, then copy its already
-    // guest-ordered words instead of packing every pixel on the CPU.
-    const bool contiguous=layout.stride==layout.width
-        && (!layout.tiled || ((layout.width%32u)==0 && (layout.height%32u)==0));
-    const bool direct_depth=contiguous && layout.depth_bytes==4
-        && layout.depth_size==size_t(layout.width)*layout.height*4
-        && !layout.stencil_size && !masked
-        && (layout.packed || surface.get_format()==SCE_GXM_DEPTH_STENCIL_FORMAT_DF32
-            || surface.get_format()==SCE_GXM_DEPTH_STENCIL_FORMAT_DF32_S8);
-    const size_t bytes=size_t(layout.width)*layout.height*(direct_depth?sizeof(uint32_t):sizeof(DepthReadback));
+    // Pack guest words on the GPU. With padding, keep a compact linear buffer
+    // and scatter only populated row/tile runs after completion. Without
+    // padding the GPU can produce the guest ordering for one complete copy.
+    const bool contiguous=contiguous_depth_store(layout);
+    const size_t guest_rows=layout.tiled?(size_t(layout.height)+31u)&~size_t(31u):layout.height;
+    const bool direct_format=(layout.depth_bytes==2 && !layout.packed
+            && surface.get_format()==SCE_GXM_DEPTH_STENCIL_FORMAT_D16)
+        || (layout.depth_bytes==4 && (layout.packed
+            || surface.get_format()==SCE_GXM_DEPTH_STENCIL_FORMAT_DF32
+            || surface.get_format()==SCE_GXM_DEPTH_STENCIL_FORMAT_DF32_S8));
+    const bool direct_depth=direct_format
+        && layout.depth_size==size_t(layout.stride)*guest_rows*layout.depth_bytes
+        && (!layout.stencil_size || (layout.packed && layout.stencil_size==layout.depth_size)) && !masked
+        && layout.depth_size;
+    const size_t bytes=size_t(layout.width)*layout.height*(direct_depth?layout.depth_bytes:sizeof(DepthReadback));
     if(bytes>device.native_device().maxBufferLength) return false;
     id<MTLBuffer> buffer=depth_store_buffer;
     if(!buffer || buffer.length<bytes) {
@@ -4282,8 +4576,9 @@ bool SurfaceCaster::enqueue_depth_store(id<MTLTexture> texture,const SceGxmDepth
     if(!view) throw std::runtime_error("Metal: cannot view stencil for guest storage");
     const uint32_t flags=uint32_t(layout.depth_size!=0)
         | (uint32_t(layout.stencil_size || (layout.packed && layout.depth_size))<<1)
-        | (uint32_t(layout.packed)<<2);
-    const uint32_t config[]={layout.width,layout.height,direct_depth && layout.tiled?layout.stride:0,flags};
+        | (uint32_t(layout.packed)<<2)
+        | (uint32_t(layout.depth_bytes==2)<<3);
+    const uint32_t config[]={layout.width,layout.height,direct_depth && contiguous && layout.tiled?layout.stride:0,flags};
     auto encoder=[commands computeCommandEncoder];
     [encoder setComputePipelineState:direct_depth
         ? (texture.sampleCount>1?packed_depth_store_ms_pipeline:packed_depth_store_pipeline)
@@ -4311,7 +4606,34 @@ void SurfaceCaster::finish_depth_store(const DepthStoreReadback &readback,const 
     const DepthMemoryLayout &layout,std::span<uint8_t> depth,std::span<uint8_t> stencil) {
     if(!readback.depth) return;
     if(readback.packed_direct) {
-        std::memcpy(depth.data(),readback.depth.contents,size_t(layout.width)*layout.height*sizeof(uint32_t));
+        const auto *source=static_cast<const uint8_t *>(readback.depth.contents);
+        const bool contiguous=contiguous_depth_store(layout);
+        const size_t word_bytes=layout.depth_bytes;
+        if(contiguous) {
+            std::memcpy(depth.data(),source,size_t(layout.width)*layout.height*word_bytes);
+        } else {
+            // Padding belongs to guest memory. The compact GPU buffer contains
+            // only visible words, so never copy across a row or tile boundary.
+            for(uint32_t y=0;y<layout.height;++y) {
+                for(uint32_t x=0;x<layout.width;) {
+                    const uint32_t count=layout.tiled?std::min(32u,layout.width-x):layout.width;
+                    const size_t address=depth_sample_offset(layout,x,y);
+                    std::memcpy(depth.data()+address*word_bytes,
+                        source+(size_t(y)*layout.width+x)*word_bytes,size_t(count)*word_bytes);
+                    x+=count;
+                }
+            }
+        }
+        // S8D24 already includes the stencil byte. When both guest pointers
+        // name the same allocation, publishing the words updates both aspects.
+        // Separate output snapshots still receive only their stencil bytes.
+        if(layout.stencil_size && stencil.data()!=depth.data()) {
+            for(uint32_t y=0;y<layout.height;++y) for(uint32_t x=0;x<layout.width;++x) {
+                const size_t address=depth_sample_offset(layout,x,y);
+                const size_t input=contiguous?address:size_t(y)*layout.width+x;
+                stencil[address*4+3]=source[input*4+3];
+            }
+        }
         return;
     }
     // The caller has completed the command buffer. Guest rounding, tiling,
@@ -4429,7 +4751,8 @@ id<MTLTexture> SurfaceCaster::stencil_snapshot(id<MTLTexture> source, bool signe
     [encoder setTexture:result atIndex:1];
     if (!guest_width) guest_width=uint32_t(std::ceil(double(result.width)/scale));
     if (!guest_height) guest_height=uint32_t(std::ceil(double(result.height)/scale));
-    const uint32_t config[]={guest_width,guest_height,uint32_t(signed_normalized)};
+    // Metal lays out a constant uint3 as 16 bytes. The fourth word is padding.
+    const uint32_t config[]={guest_width,guest_height,uint32_t(signed_normalized),0};
     if (ms) [encoder setBytes:config length:sizeof(config) atIndex:0];
     else [encoder setBytes:&config[2] length:sizeof(uint32_t) atIndex:0];
     [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1)

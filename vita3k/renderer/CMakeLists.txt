@@ -82,13 +82,19 @@ if(APPLE)
         "${PROJECT_SOURCE_DIR}/external/glslang/SPIRV/*.cpp"
         "${PROJECT_SOURCE_DIR}/external/glslang/SPIRV/*.h"
         "${PROJECT_SOURCE_DIR}/external/glslang/glslang/Include/*.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/metal/*.mm"
         "${CMAKE_CURRENT_SOURCE_DIR}/include/renderer/metal/*.h")
     file(GLOB METAL_CROSS_INPUTS CONFIGURE_DEPENDS
         "${PROJECT_SOURCE_DIR}/external/SPIRV-Cross/*.cpp"
         "${PROJECT_SOURCE_DIR}/external/SPIRV-Cross/*.hpp"
         "${PROJECT_SOURCE_DIR}/external/SPIRV-Cross/*.h")
     list(APPEND METAL_CACHE_INPUTS ${METAL_CROSS_INPUTS})
+    # Keep translation keys, metadata serialization and compilation policy in
+    # the program revision. Texture transfers, upload arenas and presentation
+    # do not translate guest shaders; their edits must not discard valid MSL.
+    list(APPEND METAL_CACHE_INPUTS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/metal/state.mm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/metal/cache.mm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/metal/device.mm")
     list(SORT METAL_CACHE_INPUTS)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${METAL_CACHE_INPUTS})
     set(METAL_CACHE_CONTENT_HASHES "")
@@ -97,8 +103,21 @@ if(APPLE)
         string(APPEND METAL_CACHE_CONTENT_HASHES "${INPUT_HASH}\n")
     endforeach()
     string(SHA256 METAL_CACHE_REVISION "${METAL_CACHE_CONTENT_HASHES}")
+    # Native helper functions can keep their entry names while their source
+    # changes. Retain the conservative full backend revision for archives and
+    # pipeline warmup templates, independently of guest MSL translations.
+    file(GLOB METAL_NATIVE_INPUTS CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/metal/*.mm")
+    list(SORT METAL_NATIVE_INPUTS)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${METAL_NATIVE_INPUTS})
+    set(METAL_NATIVE_CONTENT_HASHES "${METAL_CACHE_REVISION}\n")
+    foreach(INPUT IN LISTS METAL_NATIVE_INPUTS)
+        file(SHA256 "${INPUT}" INPUT_HASH)
+        string(APPEND METAL_NATIVE_CONTENT_HASHES "${INPUT_HASH}\n")
+    endforeach()
+    string(SHA256 METAL_NATIVE_CACHE_REVISION "${METAL_NATIVE_CONTENT_HASHES}")
     file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/cache-generated/metal_cache_revision.h"
-        CONTENT "#pragma once\n#define METAL_CACHE_REVISION \"${METAL_CACHE_REVISION}\"\n")
+        CONTENT "#pragma once\n#define METAL_CACHE_REVISION \"${METAL_CACHE_REVISION}\"\n#define METAL_NATIVE_CACHE_REVISION \"${METAL_NATIVE_CACHE_REVISION}\"\n")
     add_library(renderer-metal-runtime STATIC src/metal/device.mm src/metal/cache.mm)
     target_include_directories(renderer-metal-runtime PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/cache-generated")
 	target_include_directories(renderer-metal-runtime PUBLIC include)
