@@ -18,6 +18,12 @@
 #include "SceGxm.h"
 
 #include <modules/module_parent.h>
+#ifdef __APPLE__
+#include <renderer/metal3/state.h>
+#include <renderer/metal3/integration.h>
+#include <renderer/metal3/vertex_layout.h>
+#include <util/bytes.h>
+#endif
 
 #include <span>
 #include <stack>
@@ -892,7 +898,15 @@ std::string to_debug_str<SceGxmTransferFlags>(const MemState &mem, SceGxmTransfe
     return std::to_string(type);
 }
 
+#ifdef __APPLE__
+static void display_entry_thread_metal3(EmuEnvState &emuenv);
+#endif
 static void display_entry_thread(EmuEnvState &emuenv) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return display_entry_thread_metal3(emuenv);
+#endif
+
     auto &display_queue = emuenv.gxm.display_queue;
     const Address callback_address = emuenv.gxm.params.displayQueueCallback.address();
     const ThreadStatePtr display_thread = emuenv.kernel.get_thread(emuenv.gxm.display_queue_thread);
@@ -988,6 +1002,13 @@ struct SceGxmCommandList {
 // Seems on real vita, this is the maximum size, I got stack corrupt if try to write more
 static_assert(sizeof(SceGxmCommandList) - sizeof(std::stack<CommandListRange>) <= 32);
 
+#ifdef __APPLE__
+void gxm_context_free_command_list_metal3(SceGxmContext &self, SceGxmCommandList *command_list);
+void gxm_context_insert_new_memory_range_metal3(SceGxmContext &self);
+bool gxm_context_make_new_alloc_space_metal3(SceGxmContext &self, KernelState &kern, const MemState &mem, const SceUID thread_id, bool force = false);
+renderer::Command *gxm_context_allocate_new_command_metal3(SceGxmContext &self, KernelState &kern, const MemState &mem, SceUID current_thread_id);
+void gxm_context_free_new_command_metal3(SceGxmContext &self, renderer::Command *cmd);
+#endif
 struct SceGxmContext {
     GxmContextState state;
 
@@ -1030,6 +1051,11 @@ struct SceGxmContext {
     }
 
     void free_command_list(SceGxmCommandList *command_list) {
+#ifdef __APPLE__
+        if (renderer::metal::is_native_context(renderer.get()))
+            return gxm_context_free_command_list_metal3(*this, command_list);
+#endif
+
         assert(command_list->list);
 
         // command list has been overwritten, free the memory
@@ -1079,6 +1105,11 @@ struct SceGxmContext {
 
     // insert new memory range used by a command list
     void insert_new_memory_range() {
+#ifdef __APPLE__
+        if (renderer::metal::is_native_context(renderer.get()))
+            return gxm_context_insert_new_memory_range_metal3(*this);
+#endif
+
         CommandListRange range = {
             alloc_space_start.address(),
             alloc_space.address(),
@@ -1090,6 +1121,11 @@ struct SceGxmContext {
     }
 
     bool make_new_alloc_space(KernelState &kern, const MemState &mem, const SceUID thread_id, bool force = false) {
+#ifdef __APPLE__
+        if (renderer::metal::is_native_context(renderer.get()))
+            return gxm_context_make_new_alloc_space_metal3(*this, kern, mem, thread_id, force);
+#endif
+
         if (alloc_space && (state.type == SCE_GXM_CONTEXT_TYPE_IMMEDIATE)) {
             return false;
         }
@@ -1164,6 +1200,11 @@ struct SceGxmContext {
     }
 
     renderer::Command *allocate_new_command(KernelState &kern, const MemState &mem, SceUID current_thread_id) {
+#ifdef __APPLE__
+        if (renderer::metal::is_native_context(renderer.get()))
+            return gxm_context_allocate_new_command_metal3(*this, kern, mem, current_thread_id);
+#endif
+
         renderer::Command *new_command = nullptr;
 
         if (state.type == SCE_GXM_CONTEXT_TYPE_IMMEDIATE) {
@@ -1187,6 +1228,11 @@ struct SceGxmContext {
     }
 
     void free_new_command(renderer::Command *cmd) {
+#ifdef __APPLE__
+        if (renderer::metal::is_native_context(renderer.get()))
+            return gxm_context_free_new_command_metal3(*this, cmd);
+#endif
+
         if (!(cmd->flags & renderer::Command::FLAG_NO_FREE)) {
             if (cmd->flags & renderer::Command::FLAG_FROM_HOST) {
                 delete cmd;
@@ -1201,7 +1247,15 @@ struct SceGxmContext {
 // the +4 is for alignment reasons
 static_assert(sizeof(SceGxmContext) + 4 <= 2048);
 
+#ifdef __APPLE__
+static void destroy_pending_immediate_commands_metal3(SceGxmContext *context);
+#endif
 static void destroy_pending_immediate_commands(SceGxmContext *context) {
+#ifdef __APPLE__
+    if (context && renderer::metal::is_native_context(context->renderer.get()))
+        return destroy_pending_immediate_commands_metal3(context);
+#endif
+
     renderer::Command *cmd = context->renderer->command_list.first;
     while (cmd) {
         renderer::Command *next = cmd->next;
@@ -1225,7 +1279,15 @@ static void destroy_pending_deferred_command_chain(renderer::CommandList &comman
     renderer::reset_command_list(command_list);
 }
 
+#ifdef __APPLE__
+static void destroy_pending_deferred_commands_metal3(SceGxmContext *context);
+#endif
 static void destroy_pending_deferred_commands(SceGxmContext *context) {
+#ifdef __APPLE__
+    if (context && renderer::metal::is_native_context(context->renderer.get()))
+        return destroy_pending_deferred_commands_metal3(context);
+#endif
+
     if (context->curr_command_list) {
         while (!context->curr_command_list->memory_ranges.empty()) {
             context->command_list_ranges.erase(context->curr_command_list->memory_ranges.top());
@@ -1242,7 +1304,15 @@ static void destroy_pending_deferred_commands(SceGxmContext *context) {
         context->free_command_list(context->command_list_ranges.begin()->command_list);
 }
 
+#ifdef __APPLE__
+static int destroy_gxm_context_metal3(EmuEnvState &emuenv, SceGxmContext *context, const Address context_addr, const bool force_backend_destroy);
+#endif
 static int destroy_gxm_context(EmuEnvState &emuenv, SceGxmContext *context, const Address context_addr, const bool force_backend_destroy) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return destroy_gxm_context_metal3(emuenv, context, context_addr, force_backend_destroy);
+#endif
+
     if (!context) {
         return static_cast<int>(SCE_GXM_ERROR_INVALID_POINTER);
     }
@@ -1307,7 +1377,15 @@ static int destroy_gxm_context(EmuEnvState &emuenv, Ptr<SceGxmContext> context_p
 
 namespace gxm {
 
+#ifdef __APPLE__
+void destroy_all_contexts_metal3(EmuEnvState &emuenv, const bool force_backend_destroy);
+#endif
 void destroy_all_contexts(EmuEnvState &emuenv, const bool force_backend_destroy) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return destroy_all_contexts_metal3(emuenv, force_backend_destroy);
+#endif
+
     for (auto immediate_context = emuenv.gxm.immediate_contexts.begin(); immediate_context != emuenv.gxm.immediate_contexts.end();) {
         // destroy_gxm_context erases this entry on success, so advance the iterator first.
         const auto current_context = immediate_context++;
@@ -1339,7 +1417,15 @@ void invalidate_sync_objects(GxmState &gxm) {
     }
 }
 
+#ifdef __APPLE__
+void shutdown_metal3(EmuEnvState &emuenv);
+#endif
 void shutdown(EmuEnvState &emuenv) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return shutdown_metal3(emuenv);
+#endif
+
     emuenv.display.abort = true;
     emuenv.renderer->notification_ready.notify_all();
     emuenv.gxm.display_queue.abort();
@@ -1361,7 +1447,15 @@ struct SceGxmRenderTarget {
     SceUID driverMemBlock;
 };
 
+#ifdef __APPLE__
+static int destroy_gxm_render_target_metal3(EmuEnvState &emuenv, SceGxmRenderTarget *render_target, const Address render_target_addr, const bool force_backend_destroy);
+#endif
 static int destroy_gxm_render_target(EmuEnvState &emuenv, SceGxmRenderTarget *render_target, const Address render_target_addr, const bool force_backend_destroy) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return destroy_gxm_render_target_metal3(emuenv, render_target, render_target_addr, force_backend_destroy);
+#endif
+
     if (!render_target) {
         return static_cast<int>(SCE_GXM_ERROR_INVALID_POINTER);
     }
@@ -1392,7 +1486,15 @@ static int destroy_gxm_render_target(EmuEnvState &emuenv, Ptr<SceGxmRenderTarget
 
 namespace gxm {
 
+#ifdef __APPLE__
+void destroy_all_render_targets_metal3(EmuEnvState &emuenv, const bool force_backend_destroy);
+#endif
 void destroy_all_render_targets(EmuEnvState &emuenv, const bool force_backend_destroy) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return destroy_all_render_targets_metal3(emuenv, force_backend_destroy);
+#endif
+
     while (!emuenv.gxm.render_targets.empty()) {
         const auto [render_target, render_target_addr] = *emuenv.gxm.render_targets.begin();
         const int result = destroy_gxm_render_target(emuenv, render_target, render_target_addr, force_backend_destroy);
@@ -1616,7 +1718,15 @@ static void gxmContextStateRestore(renderer::State &state, SceGxmContext *contex
     }
 }
 
+#ifdef __APPLE__
+int export_sceGxmBeginCommandList_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *deferredContext);
+#endif
 EXPORT(int, sceGxmBeginCommandList, SceGxmContext *deferredContext) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmBeginCommandList_metal3(emuenv, thread_id, export_name, deferredContext);
+#endif
+
     TRACY_FUNC(sceGxmBeginCommandList, deferredContext);
     if (!deferredContext) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -1781,7 +1891,15 @@ DECL_EXPORT(int, sceGxmTextureSetData, SceGxmTexture *texture, Ptr<const void> d
 DECL_EXPORT(int, sceGxmTextureSetFormat, SceGxmTexture *texture, SceGxmTextureFormat texFormat);
 DECL_EXPORT(int, sceGxmTextureSetGammaMode, SceGxmTexture *texture, SceGxmTextureGammaMode gammaMode);
 
+#ifdef __APPLE__
+void export_sceGxmColorSurfaceGetClip_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, const SceGxmColorSurface *surface, uint32_t *xMin, uint32_t *yMin, uint32_t *xMax, uint32_t *yMax);
+#endif
 EXPORT(void, sceGxmColorSurfaceGetClip, const SceGxmColorSurface *surface, uint32_t *xMin, uint32_t *yMin, uint32_t *xMax, uint32_t *yMax) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmColorSurfaceGetClip_metal3(emuenv, thread_id, export_name, surface, xMin, yMin, xMax, yMax);
+#endif
+
     TRACY_FUNC(sceGxmColorSurfaceGetClip, surface, xMin, yMin, xMax, yMax);
     assert(surface);
     UNIMPLEMENTED();
@@ -1793,7 +1911,15 @@ EXPORT(Ptr<void>, sceGxmColorSurfaceGetData, const SceGxmColorSurface *surface) 
     return surface->data;
 }
 
+#ifdef __APPLE__
+SceGxmColorSurfaceDitherMode export_sceGxmColorSurfaceGetDitherMode_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, const SceGxmColorSurface *surface);
+#endif
 EXPORT(SceGxmColorSurfaceDitherMode, sceGxmColorSurfaceGetDitherMode, const SceGxmColorSurface *surface) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmColorSurfaceGetDitherMode_metal3(emuenv, thread_id, export_name, surface);
+#endif
+
     TRACY_FUNC(sceGxmColorSurfaceGetDitherMode, surface);
     assert(surface);
     STUBBED("SCE_GXM_COLOR_SURFACE_DITHER_DISABLED");
@@ -1830,7 +1956,15 @@ EXPORT(SceGxmColorSurfaceType, sceGxmColorSurfaceGetType, const SceGxmColorSurfa
     return surface->surfaceType;
 }
 
+#ifdef __APPLE__
+int export_sceGxmColorSurfaceInit_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmColorSurface *surface, SceGxmColorFormat colorFormat, SceGxmColorSurfaceType surfaceType, SceGxmColorSurfaceScaleMode scaleMode, SceGxmOutputRegisterSize outputRegisterSize, uint32_t width, uint32_t height, uint32_t strideInPixels, Ptr<void> data);
+#endif
 EXPORT(int, sceGxmColorSurfaceInit, SceGxmColorSurface *surface, SceGxmColorFormat colorFormat, SceGxmColorSurfaceType surfaceType, SceGxmColorSurfaceScaleMode scaleMode, SceGxmOutputRegisterSize outputRegisterSize, uint32_t width, uint32_t height, uint32_t strideInPixels, Ptr<void> data) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmColorSurfaceInit_metal3(emuenv, thread_id, export_name, surface, colorFormat, surfaceType, scaleMode, outputRegisterSize, width, height, strideInPixels, data);
+#endif
+
     TRACY_FUNC(sceGxmColorSurfaceInit, surface, colorFormat, surfaceType, scaleMode, outputRegisterSize, width, height, strideInPixels, data);
     if (!surface || !data)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -1899,7 +2033,15 @@ EXPORT(bool, sceGxmColorSurfaceIsEnabled, const SceGxmColorSurface *surface) {
     return !surface->disabled;
 }
 
+#ifdef __APPLE__
+void export_sceGxmColorSurfaceSetClip_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmColorSurface *surface, uint32_t xMin, uint32_t yMin, uint32_t xMax, uint32_t yMax);
+#endif
 EXPORT(void, sceGxmColorSurfaceSetClip, SceGxmColorSurface *surface, uint32_t xMin, uint32_t yMin, uint32_t xMax, uint32_t yMax) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmColorSurfaceSetClip_metal3(emuenv, thread_id, export_name, surface, xMin, yMin, xMax, yMax);
+#endif
+
     TRACY_FUNC(sceGxmColorSurfaceSetClip, surface, xMin, yMin, xMax, yMax);
     assert(surface);
     UNIMPLEMENTED();
@@ -1919,7 +2061,15 @@ EXPORT(int, sceGxmColorSurfaceSetData, SceGxmColorSurface *surface, Ptr<void> da
     return CALL_EXPORT(sceGxmTextureSetData, &surface->backgroundTex, data);
 }
 
+#ifdef __APPLE__
+int export_sceGxmColorSurfaceSetDitherMode_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmColorSurface *surface, SceGxmColorSurfaceDitherMode ditherMode);
+#endif
 EXPORT(int, sceGxmColorSurfaceSetDitherMode, SceGxmColorSurface *surface, SceGxmColorSurfaceDitherMode ditherMode) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmColorSurfaceSetDitherMode_metal3(emuenv, thread_id, export_name, surface, ditherMode);
+#endif
+
     TRACY_FUNC(sceGxmColorSurfaceSetDitherMode, surface, ditherMode);
     if (!surface) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -1928,7 +2078,15 @@ EXPORT(int, sceGxmColorSurfaceSetDitherMode, SceGxmColorSurface *surface, SceGxm
     return UNIMPLEMENTED();
 }
 
+#ifdef __APPLE__
+int export_sceGxmColorSurfaceSetFormat_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmColorSurface *surface, SceGxmColorFormat format);
+#endif
 EXPORT(int, sceGxmColorSurfaceSetFormat, SceGxmColorSurface *surface, SceGxmColorFormat format) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmColorSurfaceSetFormat_metal3(emuenv, thread_id, export_name, surface, format);
+#endif
+
     TRACY_FUNC(sceGxmColorSurfaceSetFormat, surface, format);
     if (!surface) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -1966,13 +2124,29 @@ EXPORT(int, sceGxmColorSurfaceSetGammaMode, SceGxmColorSurface *surface, SceGxmC
     return CALL_EXPORT(sceGxmTextureSetGammaMode, &surface->backgroundTex, texture_gamma);
 }
 
+#ifdef __APPLE__
+void export_sceGxmColorSurfaceSetScaleMode_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmColorSurface *surface, SceGxmColorSurfaceScaleMode scaleMode);
+#endif
 EXPORT(void, sceGxmColorSurfaceSetScaleMode, SceGxmColorSurface *surface, SceGxmColorSurfaceScaleMode scaleMode) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmColorSurfaceSetScaleMode_metal3(emuenv, thread_id, export_name, surface, scaleMode);
+#endif
+
     TRACY_FUNC(sceGxmColorSurfaceSetScaleMode, surface, scaleMode);
     assert(surface);
     UNIMPLEMENTED();
 }
 
+#ifdef __APPLE__
+int export_sceGxmCreateContext_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, const SceGxmContextParams *params, Ptr<SceGxmContext> *context);
+#endif
 EXPORT(int, sceGxmCreateContext, const SceGxmContextParams *params, Ptr<SceGxmContext> *context) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmCreateContext_metal3(emuenv, thread_id, export_name, params, context);
+#endif
+
     TRACY_FUNC(sceGxmCreateContext, params, context);
     if (!params || !context)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -2025,7 +2199,15 @@ EXPORT(int, sceGxmCreateContext, const SceGxmContextParams *params, Ptr<SceGxmCo
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmCreateDeferredContext_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmDeferredContextParams *params, Ptr<SceGxmContext> *deferredContext);
+#endif
 EXPORT(int, sceGxmCreateDeferredContext, SceGxmDeferredContextParams *params, Ptr<SceGxmContext> *deferredContext) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmCreateDeferredContext_metal3(emuenv, thread_id, export_name, params, deferredContext);
+#endif
+
     TRACY_FUNC(sceGxmCreateDeferredContext, params, deferredContext);
     if (!params || !deferredContext)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -2238,7 +2420,15 @@ EXPORT(int, sceGxmDestroyRenderTarget, Ptr<SceGxmRenderTarget> renderTarget) {
     return destroy_gxm_render_target(emuenv, renderTarget, false);
 }
 
+#ifdef __APPLE__
+int export_sceGxmDisplayQueueAddEntry_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, Ptr<SceGxmSyncObject> oldBuffer, Ptr<SceGxmSyncObject> newBuffer, Ptr<const void> callbackData);
+#endif
 EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<SceGxmSyncObject> newBuffer, Ptr<const void> callbackData) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmDisplayQueueAddEntry_metal3(emuenv, thread_id, export_name, oldBuffer, newBuffer, callbackData);
+#endif
+
     TRACY_FUNC(sceGxmDisplayQueueAddEntry, oldBuffer, newBuffer, callbackData);
     if (!oldBuffer || !newBuffer)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -2296,7 +2486,15 @@ EXPORT(int, sceGxmDisplayQueueFinish) {
     return 0;
 }
 
+#ifdef __APPLE__
+static void gxmSetUniformBuffers_metal3(renderer::State &state, GxmState &gxm, SceGxmContext *context, const SceGxmProgram &program, std::span<UniformBuffer> buffers, const UniformBufferSizes &sizes, const MemState &mem);
+#endif
 static void gxmSetUniformBuffers(renderer::State &state, GxmState &gxm, SceGxmContext *context, const SceGxmProgram &program, std::span<UniformBuffer> buffers, const UniformBufferSizes &sizes, const MemState &mem) {
+#ifdef __APPLE__
+    if (state.current_backend == renderer::Backend::Metal)
+        return gxmSetUniformBuffers_metal3(state, gxm, context, program, buffers, sizes, mem);
+#endif
+
     for (size_t i = 0; i < buffers.size(); i++) {
         if (!buffers[i] || sizes.at(i) == 0) {
             continue;
@@ -2329,7 +2527,15 @@ static void gxmSetUniformBuffers(renderer::State &state, GxmState &gxm, SceGxmCo
     }
 }
 
+#ifdef __APPLE__
+static int gxmDrawElementGeneral_metal3(EmuEnvState &emuenv, const char *export_name, const SceUID thread_id, SceGxmContext *context, SceGxmPrimitiveType primType, SceGxmIndexFormat indexType, Ptr<const void> indexData, uint32_t indexCount, uint32_t instanceCount);
+#endif
 static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, const SceUID thread_id, SceGxmContext *context, SceGxmPrimitiveType primType, SceGxmIndexFormat indexType, Ptr<const void> indexData, uint32_t indexCount, uint32_t instanceCount) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return gxmDrawElementGeneral_metal3(emuenv, export_name, thread_id, context, primType, indexType, indexData, indexCount, instanceCount);
+#endif
+
     if (!context || !indexData)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
@@ -2448,7 +2654,15 @@ EXPORT(int, sceGxmDraw, SceGxmContext *context, SceGxmPrimitiveType primType, Sc
     return gxmDrawElementGeneral(emuenv, export_name, thread_id, context, primType, indexType, indexData, indexCount, 1);
 }
 
+#ifdef __APPLE__
+int export_sceGxmDrawInstanced_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, SceGxmPrimitiveType primType, SceGxmIndexFormat indexType, Ptr<const void> indexData, uint32_t indexCount, uint32_t indexWrap);
+#endif
 EXPORT(int, sceGxmDrawInstanced, SceGxmContext *context, SceGxmPrimitiveType primType, SceGxmIndexFormat indexType, Ptr<const void> indexData, uint32_t indexCount, uint32_t indexWrap) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmDrawInstanced_metal3(emuenv, thread_id, export_name, context, primType, indexType, indexData, indexCount, indexWrap);
+#endif
+
     TRACY_FUNC(sceGxmDrawInstanced, context, primType, indexType, indexData, indexCount, indexWrap);
     if (indexCount % indexWrap != 0) {
         LOG_WARN("Extra vertexes are requested to be drawn (ignored)");
@@ -2457,7 +2671,15 @@ EXPORT(int, sceGxmDrawInstanced, SceGxmContext *context, SceGxmPrimitiveType pri
     return gxmDrawElementGeneral(emuenv, export_name, thread_id, context, primType, indexType, indexData, indexWrap, indexCount / indexWrap);
 }
 
+#ifdef __APPLE__
+int export_sceGxmDrawPrecomputed_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, SceGxmPrecomputedDraw *draw);
+#endif
 EXPORT(int, sceGxmDrawPrecomputed, SceGxmContext *context, SceGxmPrecomputedDraw *draw) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmDrawPrecomputed_metal3(emuenv, thread_id, export_name, context, draw);
+#endif
+
     TRACY_FUNC(sceGxmDrawPrecomputed, context, draw);
     if (!context) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -2585,7 +2807,15 @@ EXPORT(int, sceGxmDrawPrecomputed, SceGxmContext *context, SceGxmPrecomputedDraw
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmEndCommandList_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *deferredContext, SceGxmCommandList *commandList);
+#endif
 EXPORT(int, sceGxmEndCommandList, SceGxmContext *deferredContext, SceGxmCommandList *commandList) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmEndCommandList_metal3(emuenv, thread_id, export_name, deferredContext, commandList);
+#endif
+
     TRACY_FUNC(sceGxmEndCommandList, deferredContext, commandList);
     if (deferredContext->state.type != SCE_GXM_CONTEXT_TYPE_DEFERRED) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
@@ -2617,7 +2847,15 @@ EXPORT(int, sceGxmEndCommandList, SceGxmContext *deferredContext, SceGxmCommandL
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmEndScene_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, SceGxmNotification *vertexNotification, SceGxmNotification *fragmentNotification);
+#endif
 EXPORT(int, sceGxmEndScene, SceGxmContext *context, SceGxmNotification *vertexNotification, SceGxmNotification *fragmentNotification) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmEndScene_metal3(emuenv, thread_id, export_name, context, vertexNotification, fragmentNotification);
+#endif
+
     TRACY_FUNC(sceGxmEndScene, context, vertexNotification, fragmentNotification);
     const MemState &mem = emuenv.mem;
 
@@ -2659,7 +2897,15 @@ EXPORT(int, sceGxmEndScene, SceGxmContext *context, SceGxmNotification *vertexNo
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmExecuteCommandList_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, SceGxmCommandList *commandList);
+#endif
 EXPORT(int, sceGxmExecuteCommandList, SceGxmContext *context, SceGxmCommandList *commandList) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmExecuteCommandList_metal3(emuenv, thread_id, export_name, context, commandList);
+#endif
+
     TRACY_FUNC(sceGxmExecuteCommandList, context, commandList);
     if (!context) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -2694,7 +2940,15 @@ EXPORT(int, sceGxmExecuteCommandList, SceGxmContext *context, SceGxmCommandList 
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmFinish_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context);
+#endif
 EXPORT(int, sceGxmFinish, SceGxmContext *context) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmFinish_metal3(emuenv, thread_id, export_name, context);
+#endif
+
     TRACY_FUNC(sceGxmFinish, context);
 
     if (!context)
@@ -2747,7 +3001,15 @@ EXPORT(int, sceGxmGetContextType, const SceGxmContext *context, SceGxmContextTyp
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmGetDeferredContextFragmentBuffer_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, const SceGxmContext *deferredContext, Ptr<void> *mem);
+#endif
 EXPORT(int, sceGxmGetDeferredContextFragmentBuffer, const SceGxmContext *deferredContext, Ptr<void> *mem) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmGetDeferredContextFragmentBuffer_metal3(emuenv, thread_id, export_name, deferredContext, mem);
+#endif
+
     TRACY_FUNC(sceGxmGetDeferredContextFragmentBuffer, deferredContext, mem);
     if (!deferredContext || !mem) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -2765,7 +3027,15 @@ EXPORT(int, sceGxmGetDeferredContextFragmentBuffer, const SceGxmContext *deferre
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmGetDeferredContextVdmBuffer_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, const SceGxmContext *deferredContext, Ptr<void> *mem);
+#endif
 EXPORT(int, sceGxmGetDeferredContextVdmBuffer, const SceGxmContext *deferredContext, Ptr<void> *mem) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmGetDeferredContextVdmBuffer_metal3(emuenv, thread_id, export_name, deferredContext, mem);
+#endif
+
     TRACY_FUNC(sceGxmGetDeferredContextVdmBuffer, deferredContext, mem);
     if (!deferredContext || !mem) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -2783,7 +3053,15 @@ EXPORT(int, sceGxmGetDeferredContextVdmBuffer, const SceGxmContext *deferredCont
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmGetDeferredContextVertexBuffer_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, const SceGxmContext *deferredContext, Ptr<void> *mem);
+#endif
 EXPORT(int, sceGxmGetDeferredContextVertexBuffer, const SceGxmContext *deferredContext, Ptr<void> *mem) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmGetDeferredContextVertexBuffer_metal3(emuenv, thread_id, export_name, deferredContext, mem);
+#endif
+
     TRACY_FUNC(sceGxmGetDeferredContextVertexBuffer, deferredContext, mem);
     if (!deferredContext || !mem) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -2864,7 +3142,15 @@ EXPORT(int, sceGxmGetRenderTargetMemSize, const SceGxmRenderTargetParams *params
     return STUBBED("64KiB emuenv mem");
 }
 
+#ifdef __APPLE__
+int export_sceGxmInitialize_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, const SceGxmInitializeParams *params);
+#endif
 EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmInitialize_metal3(emuenv, thread_id, export_name, params);
+#endif
+
     TRACY_FUNC(sceGxmInitialize, params);
     if (!params) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -2919,7 +3205,15 @@ EXPORT(int, sceGxmMapFragmentUsseMemory, Ptr<void> base, uint32_t size, uint32_t
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmMapMemory_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, Ptr<void> base, uint32_t size, uint32_t attribs);
+#endif
 EXPORT(int, sceGxmMapMemory, Ptr<void> base, uint32_t size, uint32_t attribs) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmMapMemory_metal3(emuenv, thread_id, export_name, base, size, attribs);
+#endif
+
     TRACY_FUNC(sceGxmMapMemory, base, size, attribs);
     if (!base) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -2971,7 +3265,15 @@ EXPORT(int, sceGxmMapVertexUsseMemory, Ptr<void> base, uint32_t size, uint32_t *
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmMidSceneFlush_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *immediateContext, uint32_t flags, SceGxmSyncObject *vertexSyncObject, const SceGxmNotification *vertexNotification);
+#endif
 EXPORT(int, sceGxmMidSceneFlush, SceGxmContext *immediateContext, uint32_t flags, SceGxmSyncObject *vertexSyncObject, const SceGxmNotification *vertexNotification) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmMidSceneFlush_metal3(emuenv, thread_id, export_name, immediateContext, flags, vertexSyncObject, vertexNotification);
+#endif
+
     TRACY_FUNC(sceGxmMidSceneFlush, immediateContext, flags, vertexSyncObject, vertexNotification);
     if (flags != 0)
         STUBBED("Flags ignored");
@@ -3005,7 +3307,15 @@ EXPORT(int, _sceGxmMidSceneFlush, SceGxmContext *immediateContext, uint32_t flag
     return CALL_EXPORT(sceGxmMidSceneFlush, immediateContext, flags, vertexSyncObject, vertexNotification);
 }
 
+#ifdef __APPLE__
+int export_sceGxmNotificationWait_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, const SceGxmNotification *notification);
+#endif
 EXPORT(int, sceGxmNotificationWait, const SceGxmNotification *notification) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmNotificationWait_metal3(emuenv, thread_id, export_name, notification);
+#endif
+
     TRACY_FUNC(sceGxmNotificationWait, notification);
     if (!notification) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -3040,7 +3350,15 @@ EXPORT(int, sceGxmPopUserMarker) {
     return UNIMPLEMENTED();
 }
 
+#ifdef __APPLE__
+int export_sceGxmPrecomputedDrawInit_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmPrecomputedDraw *state, Ptr<const SceGxmVertexProgram> program, Ptr<void> extra_data);
+#endif
 EXPORT(int, sceGxmPrecomputedDrawInit, SceGxmPrecomputedDraw *state, Ptr<const SceGxmVertexProgram> program, Ptr<void> extra_data) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmPrecomputedDrawInit_metal3(emuenv, thread_id, export_name, state, program, extra_data);
+#endif
+
     TRACY_FUNC(sceGxmPrecomputedDrawInit, state, program, extra_data);
     if (!state || !program || !extra_data) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -3143,7 +3461,15 @@ EXPORT(Ptr<const void>, sceGxmPrecomputedFragmentStateGetDefaultUniformBuffer, c
     return uniform_buffers[SCE_GXM_DEFAULT_UNIFORM_BUFFER_CONTAINER_INDEX];
 }
 
+#ifdef __APPLE__
+int export_sceGxmPrecomputedFragmentStateInit_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmPrecomputedFragmentState *state, Ptr<const SceGxmFragmentProgram> program, Ptr<void> extra_data);
+#endif
 EXPORT(int, sceGxmPrecomputedFragmentStateInit, SceGxmPrecomputedFragmentState *state, Ptr<const SceGxmFragmentProgram> program, Ptr<void> extra_data) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmPrecomputedFragmentStateInit_metal3(emuenv, thread_id, export_name, state, program, extra_data);
+#endif
+
     TRACY_FUNC(sceGxmPrecomputedFragmentStateInit, state, program, extra_data);
     if (!state || !program || !extra_data) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -3264,7 +3590,15 @@ EXPORT(Ptr<const void>, sceGxmPrecomputedVertexStateGetDefaultUniformBuffer, Sce
     return uniform_buffers[SCE_GXM_DEFAULT_UNIFORM_BUFFER_CONTAINER_INDEX];
 }
 
+#ifdef __APPLE__
+int export_sceGxmPrecomputedVertexStateInit_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmPrecomputedVertexState *state, Ptr<const SceGxmVertexProgram> program, Ptr<void> extra_data);
+#endif
 EXPORT(int, sceGxmPrecomputedVertexStateInit, SceGxmPrecomputedVertexState *state, Ptr<const SceGxmVertexProgram> program, Ptr<void> extra_data) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmPrecomputedVertexStateInit_metal3(emuenv, thread_id, export_name, state, program, extra_data);
+#endif
+
     TRACY_FUNC(sceGxmPrecomputedVertexStateInit, state, program, extra_data);
     if (!state || !program || !extra_data) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -3640,7 +3974,15 @@ EXPORT(int, sceGxmRenderTargetGetDriverMemBlock, const SceGxmRenderTarget *rende
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmReserveFragmentDefaultUniformBuffer_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, Ptr<void> *uniformBuffer);
+#endif
 EXPORT(int, sceGxmReserveFragmentDefaultUniformBuffer, SceGxmContext *context, Ptr<void> *uniformBuffer) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmReserveFragmentDefaultUniformBuffer_metal3(emuenv, thread_id, export_name, context, uniformBuffer);
+#endif
+
     TRACY_FUNC(sceGxmReserveFragmentDefaultUniformBuffer, context, uniformBuffer);
     if (!context || !uniformBuffer)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -3685,7 +4027,15 @@ EXPORT(int, sceGxmRenderTargetGetHostMem) {
     return UNIMPLEMENTED();
 }
 
+#ifdef __APPLE__
+int export_sceGxmReserveVertexDefaultUniformBuffer_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, Ptr<void> *uniformBuffer);
+#endif
 EXPORT(int, sceGxmReserveVertexDefaultUniformBuffer, SceGxmContext *context, Ptr<void> *uniformBuffer) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmReserveVertexDefaultUniformBuffer_metal3(emuenv, thread_id, export_name, context, uniformBuffer);
+#endif
+
     TRACY_FUNC(sceGxmReserveVertexDefaultUniformBuffer, context, uniformBuffer);
     if (!context || !uniformBuffer)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -3764,7 +4114,15 @@ EXPORT(void, sceGxmSetBackDepthWriteEnable, SceGxmContext *context, SceGxmDepthW
     }
 }
 
+#ifdef __APPLE__
+void export_sceGxmSetBackFragmentProgramEnable_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, SceGxmFragmentProgramMode enable);
+#endif
 EXPORT(void, sceGxmSetBackFragmentProgramEnable, SceGxmContext *context, SceGxmFragmentProgramMode enable) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmSetBackFragmentProgramEnable_metal3(emuenv, thread_id, export_name, context, enable);
+#endif
+
     TRACY_FUNC(sceGxmSetBackFragmentProgramEnable, context, enable);
     renderer::set_side_fragment_program_enable(*emuenv.renderer, context->renderer.get(), false, enable);
 }
@@ -3830,17 +4188,41 @@ EXPORT(void, sceGxmSetBackStencilRef, SceGxmContext *context, uint8_t sref) {
     }
 }
 
+#ifdef __APPLE__
+void export_sceGxmSetBackVisibilityTestEnable_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, SceGxmVisibilityTestMode enable);
+#endif
 EXPORT(void, sceGxmSetBackVisibilityTestEnable, SceGxmContext *context, SceGxmVisibilityTestMode enable) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmSetBackVisibilityTestEnable_metal3(emuenv, thread_id, export_name, context, enable);
+#endif
+
     TRACY_FUNC(sceGxmSetBackVisibilityTestEnable, context, enable);
     UNIMPLEMENTED();
 }
 
+#ifdef __APPLE__
+void export_sceGxmSetBackVisibilityTestIndex_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, uint32_t index);
+#endif
 EXPORT(void, sceGxmSetBackVisibilityTestIndex, SceGxmContext *context, uint32_t index) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmSetBackVisibilityTestIndex_metal3(emuenv, thread_id, export_name, context, index);
+#endif
+
     TRACY_FUNC(sceGxmSetBackVisibilityTestIndex, context, index);
     UNIMPLEMENTED();
 }
 
+#ifdef __APPLE__
+void export_sceGxmSetBackVisibilityTestOp_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, SceGxmVisibilityTestOp op);
+#endif
 EXPORT(void, sceGxmSetBackVisibilityTestOp, SceGxmContext *context, SceGxmVisibilityTestOp op) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmSetBackVisibilityTestOp_metal3(emuenv, thread_id, export_name, context, op);
+#endif
+
     TRACY_FUNC(sceGxmSetBackVisibilityTestOp, context, op);
     UNIMPLEMENTED();
 }
@@ -3857,7 +4239,15 @@ EXPORT(void, sceGxmSetCullMode, SceGxmContext *context, SceGxmCullMode mode) {
 
 static constexpr std::uint32_t SCE_GXM_DEFERRED_CONTEXT_MINIMUM_BUFFER_SIZE = 1024;
 
+#ifdef __APPLE__
+int export_sceGxmSetDeferredContextFragmentBuffer_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *deferredContext, Ptr<void> mem, uint32_t size);
+#endif
 EXPORT(int, sceGxmSetDeferredContextFragmentBuffer, SceGxmContext *deferredContext, Ptr<void> mem, uint32_t size) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmSetDeferredContextFragmentBuffer_metal3(emuenv, thread_id, export_name, deferredContext, mem, size);
+#endif
+
     TRACY_FUNC(sceGxmSetDeferredContextFragmentBuffer, deferredContext, mem, size);
     if (!deferredContext) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -3886,7 +4276,15 @@ EXPORT(int, sceGxmSetDeferredContextFragmentBuffer, SceGxmContext *deferredConte
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmSetDeferredContextVdmBuffer_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *deferredContext, Ptr<void> mem, uint32_t size);
+#endif
 EXPORT(int, sceGxmSetDeferredContextVdmBuffer, SceGxmContext *deferredContext, Ptr<void> mem, uint32_t size) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmSetDeferredContextVdmBuffer_metal3(emuenv, thread_id, export_name, deferredContext, mem, size);
+#endif
+
     TRACY_FUNC(sceGxmSetDeferredContextVdmBuffer, deferredContext, mem, size);
     if (!deferredContext) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -3910,7 +4308,15 @@ EXPORT(int, sceGxmSetDeferredContextVdmBuffer, SceGxmContext *deferredContext, P
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmSetDeferredContextVertexBuffer_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *deferredContext, Ptr<void> mem, uint32_t size);
+#endif
 EXPORT(int, sceGxmSetDeferredContextVertexBuffer, SceGxmContext *deferredContext, Ptr<void> mem, uint32_t size) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmSetDeferredContextVertexBuffer_metal3(emuenv, thread_id, export_name, deferredContext, mem, size);
+#endif
+
     TRACY_FUNC(sceGxmSetDeferredContextVertexBuffer, deferredContext, mem, size);
     if (!deferredContext) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -3949,7 +4355,15 @@ EXPORT(int, sceGxmSetFragmentDefaultUniformBuffer, SceGxmContext *context, Ptr<c
     return 0;
 }
 
+#ifdef __APPLE__
+void export_sceGxmSetFragmentProgram_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, Ptr<const SceGxmFragmentProgram> fragmentProgram);
+#endif
 EXPORT(void, sceGxmSetFragmentProgram, SceGxmContext *context, Ptr<const SceGxmFragmentProgram> fragmentProgram) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmSetFragmentProgram_metal3(emuenv, thread_id, export_name, context, fragmentProgram);
+#endif
+
     TRACY_FUNC(sceGxmSetFragmentProgram, context, fragmentProgram);
     if (!context || !fragmentProgram)
         return;
@@ -4020,7 +4434,15 @@ EXPORT(void, sceGxmSetFrontDepthWriteEnable, SceGxmContext *context, SceGxmDepth
     }
 }
 
+#ifdef __APPLE__
+void export_sceGxmSetFrontFragmentProgramEnable_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, SceGxmFragmentProgramMode enable);
+#endif
 EXPORT(void, sceGxmSetFrontFragmentProgramEnable, SceGxmContext *context, SceGxmFragmentProgramMode enable) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmSetFrontFragmentProgramEnable_metal3(emuenv, thread_id, export_name, context, enable);
+#endif
+
     TRACY_FUNC(sceGxmSetFrontFragmentProgramEnable, context, enable);
     renderer::set_side_fragment_program_enable(*emuenv.renderer, context->renderer.get(), true, enable);
 }
@@ -4085,7 +4507,15 @@ EXPORT(void, sceGxmSetFrontStencilRef, SceGxmContext *context, uint8_t sref) {
     }
 }
 
+#ifdef __APPLE__
+void export_sceGxmSetFrontVisibilityTestEnable_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, SceGxmVisibilityTestMode enable);
+#endif
 EXPORT(void, sceGxmSetFrontVisibilityTestEnable, SceGxmContext *context, SceGxmVisibilityTestMode enable) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmSetFrontVisibilityTestEnable_metal3(emuenv, thread_id, export_name, context, enable);
+#endif
+
     TRACY_FUNC(sceGxmSetFrontVisibilityTestEnable, context, enable);
 
     if (!emuenv.renderer->features.enable_memory_mapping) {
@@ -4097,7 +4527,15 @@ EXPORT(void, sceGxmSetFrontVisibilityTestEnable, SceGxmContext *context, SceGxmV
     renderer::set_visibility_index(*emuenv.renderer, context->renderer.get(), context->state.visibility_enable, context->state.visibility_index, context->state.visibility_is_increment);
 }
 
+#ifdef __APPLE__
+void export_sceGxmSetFrontVisibilityTestIndex_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, uint32_t index);
+#endif
 EXPORT(void, sceGxmSetFrontVisibilityTestIndex, SceGxmContext *context, uint32_t index) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmSetFrontVisibilityTestIndex_metal3(emuenv, thread_id, export_name, context, index);
+#endif
+
     TRACY_FUNC(sceGxmSetFrontVisibilityTestIndex, context, index);
 
     if (!emuenv.renderer->features.enable_memory_mapping) {
@@ -4109,7 +4547,15 @@ EXPORT(void, sceGxmSetFrontVisibilityTestIndex, SceGxmContext *context, uint32_t
     renderer::set_visibility_index(*emuenv.renderer, context->renderer.get(), context->state.visibility_enable, context->state.visibility_index, context->state.visibility_is_increment);
 }
 
+#ifdef __APPLE__
+void export_sceGxmSetFrontVisibilityTestOp_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, SceGxmVisibilityTestOp op);
+#endif
 EXPORT(void, sceGxmSetFrontVisibilityTestOp, SceGxmContext *context, SceGxmVisibilityTestOp op) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmSetFrontVisibilityTestOp_metal3(emuenv, thread_id, export_name, context, op);
+#endif
+
     TRACY_FUNC(sceGxmSetFrontVisibilityTestOp, context, op);
 
     if (!emuenv.renderer->features.enable_memory_mapping) {
@@ -4184,7 +4630,15 @@ static void convert_uniform_data(std::vector<std::uint8_t> &converted_data, cons
     }
 }
 
+#ifdef __APPLE__
+int export_sceGxmSetUniformDataF_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, void *uniformBuffer, const SceGxmProgramParameter *parameter, uint32_t componentOffset, uint32_t componentCount, const float *sourceData);
+#endif
 EXPORT(int, sceGxmSetUniformDataF, void *uniformBuffer, const SceGxmProgramParameter *parameter, uint32_t componentOffset, uint32_t componentCount, const float *sourceData) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmSetUniformDataF_metal3(emuenv, thread_id, export_name, uniformBuffer, parameter, componentOffset, componentCount, sourceData);
+#endif
+
     TRACY_FUNC(sceGxmSetUniformDataF, uniformBuffer, parameter, componentOffset, componentCount, sourceData);
     assert(parameter);
 
@@ -4333,7 +4787,15 @@ EXPORT(int, sceGxmSetVertexDefaultUniformBuffer, SceGxmContext *context, Ptr<con
     return 0;
 }
 
+#ifdef __APPLE__
+void export_sceGxmSetVertexProgram_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, Ptr<const SceGxmVertexProgram> vertexProgram);
+#endif
 EXPORT(void, sceGxmSetVertexProgram, SceGxmContext *context, Ptr<const SceGxmVertexProgram> vertexProgram) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmSetVertexProgram_metal3(emuenv, thread_id, export_name, context, vertexProgram);
+#endif
+
     TRACY_FUNC(sceGxmSetVertexProgram, context, vertexProgram);
     if (!context || !vertexProgram)
         return;
@@ -4426,7 +4888,15 @@ EXPORT(void, sceGxmSetViewportEnable, SceGxmContext *context, SceGxmViewportMode
     }
 }
 
+#ifdef __APPLE__
+int export_sceGxmSetVisibilityBuffer_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *immediateContext, Ptr<void> bufferBase, uint32_t stridePerCore);
+#endif
 EXPORT(int, sceGxmSetVisibilityBuffer, SceGxmContext *immediateContext, Ptr<void> bufferBase, uint32_t stridePerCore) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmSetVisibilityBuffer_metal3(emuenv, thread_id, export_name, immediateContext, bufferBase, stridePerCore);
+#endif
+
     TRACY_FUNC(sceGxmSetVisibilityBuffer, immediateContext, bufferBase, stridePerCore);
     if (!immediateContext) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -4468,7 +4938,17 @@ EXPORT(int, sceGxmSetWarningEnabled) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceGxmSetYuvProfile) {
+#ifdef __APPLE__
+int export_sceGxmSetYuvProfile_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmContext *context, uint32_t index, SceGxmYuvProfile profile);
+#endif
+DECL_EXPORT(int, sceGxmSetYuvProfile);
+#ifdef __APPLE__
+void import_sceGxmSetYuvProfile_dispatch_metal3(EmuEnvState &, CPUState &, SceUID);
+extern const ImportFn import_sceGxmSetYuvProfile = import_sceGxmSetYuvProfile_dispatch_metal3;
+#else
+extern const ImportFn import_sceGxmSetYuvProfile = make_bridge<&export_sceGxmSetYuvProfile>("sceGxmSetYuvProfile", &export_sceGxmSetYuvProfile);
+#endif
+DECL_EXPORT(int, sceGxmSetYuvProfile) {
     TRACY_FUNC(sceGxmSetYuvProfile);
     return UNIMPLEMENTED();
 }
@@ -4512,7 +4992,15 @@ static void free_callbacked(EmuEnvState &emuenv, SceUID thread_id, SceGxmShaderP
     free_callbacked(emuenv, thread_id, shaderPatcher, data.address());
 }
 
+#ifdef __APPLE__
+int export_sceGxmShaderPatcherAddRefFragmentProgram_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmShaderPatcher *shaderPatcher, SceGxmFragmentProgram *fragmentProgram);
+#endif
 EXPORT(int, sceGxmShaderPatcherAddRefFragmentProgram, SceGxmShaderPatcher *shaderPatcher, SceGxmFragmentProgram *fragmentProgram) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmShaderPatcherAddRefFragmentProgram_metal3(emuenv, thread_id, export_name, shaderPatcher, fragmentProgram);
+#endif
+
     TRACY_FUNC(sceGxmShaderPatcherAddRefFragmentProgram, shaderPatcher, fragmentProgram);
     if (!shaderPatcher || !fragmentProgram)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -4522,7 +5010,15 @@ EXPORT(int, sceGxmShaderPatcherAddRefFragmentProgram, SceGxmShaderPatcher *shade
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmShaderPatcherAddRefVertexProgram_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmShaderPatcher *shaderPatcher, SceGxmVertexProgram *vertexProgram);
+#endif
 EXPORT(int, sceGxmShaderPatcherAddRefVertexProgram, SceGxmShaderPatcher *shaderPatcher, SceGxmVertexProgram *vertexProgram) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmShaderPatcherAddRefVertexProgram_metal3(emuenv, thread_id, export_name, shaderPatcher, vertexProgram);
+#endif
+
     TRACY_FUNC(sceGxmShaderPatcherAddRefVertexProgram, shaderPatcher, vertexProgram);
     if (!shaderPatcher || !vertexProgram)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -4546,7 +5042,15 @@ EXPORT(int, sceGxmShaderPatcherCreate, const SceGxmShaderPatcherParams *params, 
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmShaderPatcherCreateFragmentProgram_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmShaderPatcher *shaderPatcher, const SceGxmRegisteredProgram *programId, SceGxmOutputRegisterFormat outputFormat, SceGxmMultisampleMode multisampleMode, const SceGxmBlendInfo *blendInfo, Ptr<const SceGxmProgram> vertexProgram, Ptr<SceGxmFragmentProgram> *fragmentProgram);
+#endif
 EXPORT(int, sceGxmShaderPatcherCreateFragmentProgram, SceGxmShaderPatcher *shaderPatcher, const SceGxmRegisteredProgram *programId, SceGxmOutputRegisterFormat outputFormat, SceGxmMultisampleMode multisampleMode, const SceGxmBlendInfo *blendInfo, Ptr<const SceGxmProgram> vertexProgram, Ptr<SceGxmFragmentProgram> *fragmentProgram) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmShaderPatcherCreateFragmentProgram_metal3(emuenv, thread_id, export_name, shaderPatcher, programId, outputFormat, multisampleMode, blendInfo, vertexProgram, fragmentProgram);
+#endif
+
     TRACY_FUNC(sceGxmShaderPatcherCreateFragmentProgram, shaderPatcher, programId, outputFormat, multisampleMode, blendInfo, vertexProgram, fragmentProgram);
     MemState &mem = emuenv.mem;
 
@@ -4592,7 +5096,15 @@ EXPORT(int, sceGxmShaderPatcherCreateFragmentProgram, SceGxmShaderPatcher *shade
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmShaderPatcherCreateMaskUpdateFragmentProgram_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmShaderPatcher *shaderPatcher, Ptr<SceGxmFragmentProgram> *fragmentProgram);
+#endif
 EXPORT(int, sceGxmShaderPatcherCreateMaskUpdateFragmentProgram, SceGxmShaderPatcher *shaderPatcher, Ptr<SceGxmFragmentProgram> *fragmentProgram) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmShaderPatcherCreateMaskUpdateFragmentProgram_metal3(emuenv, thread_id, export_name, shaderPatcher, fragmentProgram);
+#endif
+
     TRACY_FUNC(sceGxmShaderPatcherCreateMaskUpdateFragmentProgram, shaderPatcher, fragmentProgram);
     MemState &mem = emuenv.mem;
 
@@ -4617,7 +5129,15 @@ EXPORT(int, sceGxmShaderPatcherCreateMaskUpdateFragmentProgram, SceGxmShaderPatc
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmShaderPatcherCreateVertexProgram_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmShaderPatcher *shaderPatcher, const SceGxmRegisteredProgram *programId, const SceGxmVertexAttribute *attributes, uint32_t attributeCount, const SceGxmVertexStream *streams, uint32_t streamCount, Ptr<SceGxmVertexProgram> *vertexProgram);
+#endif
 EXPORT(int, sceGxmShaderPatcherCreateVertexProgram, SceGxmShaderPatcher *shaderPatcher, const SceGxmRegisteredProgram *programId, const SceGxmVertexAttribute *attributes, uint32_t attributeCount, const SceGxmVertexStream *streams, uint32_t streamCount, Ptr<SceGxmVertexProgram> *vertexProgram) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmShaderPatcherCreateVertexProgram_metal3(emuenv, thread_id, export_name, shaderPatcher, programId, attributes, attributeCount, streams, streamCount, vertexProgram);
+#endif
+
     TRACY_FUNC(sceGxmShaderPatcherCreateVertexProgram, shaderPatcher, programId, attributes, attributeCount, streams, streamCount, vertexProgram);
     MemState &mem = emuenv.mem;
 
@@ -4671,7 +5191,15 @@ EXPORT(int, sceGxmShaderPatcherCreateVertexProgram, SceGxmShaderPatcher *shaderP
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmShaderPatcherDestroy_metal3(EmuEnvState &, SceUID, const char *, Ptr<SceGxmShaderPatcher>);
+#endif
 EXPORT(int, sceGxmShaderPatcherDestroy, Ptr<SceGxmShaderPatcher> shaderPatcher) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmShaderPatcherDestroy_metal3(emuenv, thread_id, export_name, shaderPatcher);
+#endif
+
     TRACY_FUNC(sceGxmShaderPatcherDestroy, shaderPatcher);
     if (!shaderPatcher)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -4681,7 +5209,15 @@ EXPORT(int, sceGxmShaderPatcherDestroy, Ptr<SceGxmShaderPatcher> shaderPatcher) 
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmShaderPatcherForceUnregisterProgram_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmShaderPatcher *shaderPatcher, SceGxmShaderPatcherId programId);
+#endif
 EXPORT(int, sceGxmShaderPatcherForceUnregisterProgram, SceGxmShaderPatcher *shaderPatcher, SceGxmShaderPatcherId programId) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmShaderPatcherForceUnregisterProgram_metal3(emuenv, thread_id, export_name, shaderPatcher, programId);
+#endif
+
     TRACY_FUNC(sceGxmShaderPatcherForceUnregisterProgram, shaderPatcher, programId);
     if (!shaderPatcher || !programId) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -4781,7 +5317,15 @@ EXPORT(uint32_t, sceGxmShaderPatcherGetVertexUsseMemAllocated, const SceGxmShade
     return UNIMPLEMENTED();
 }
 
+#ifdef __APPLE__
+int export_sceGxmShaderPatcherRegisterProgram_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmShaderPatcher *shaderPatcher, Ptr<const SceGxmProgram> programHeader, SceGxmShaderPatcherId *programId);
+#endif
 EXPORT(int, sceGxmShaderPatcherRegisterProgram, SceGxmShaderPatcher *shaderPatcher, Ptr<const SceGxmProgram> programHeader, SceGxmShaderPatcherId *programId) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmShaderPatcherRegisterProgram_metal3(emuenv, thread_id, export_name, shaderPatcher, programHeader, programId);
+#endif
+
     TRACY_FUNC(sceGxmShaderPatcherRegisterProgram, shaderPatcher, programHeader, programId);
     if (!shaderPatcher || !programHeader || !programId)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -4798,7 +5342,15 @@ EXPORT(int, sceGxmShaderPatcherRegisterProgram, SceGxmShaderPatcher *shaderPatch
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmShaderPatcherReleaseFragmentProgram_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmShaderPatcher *shaderPatcher, Ptr<SceGxmFragmentProgram> fragmentProgram);
+#endif
 EXPORT(int, sceGxmShaderPatcherReleaseFragmentProgram, SceGxmShaderPatcher *shaderPatcher, Ptr<SceGxmFragmentProgram> fragmentProgram) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmShaderPatcherReleaseFragmentProgram_metal3(emuenv, thread_id, export_name, shaderPatcher, fragmentProgram);
+#endif
+
     TRACY_FUNC(sceGxmShaderPatcherReleaseFragmentProgram, shaderPatcher, fragmentProgram);
     if (!shaderPatcher || !fragmentProgram)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -4821,7 +5373,15 @@ EXPORT(int, sceGxmShaderPatcherReleaseFragmentProgram, SceGxmShaderPatcher *shad
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmShaderPatcherReleaseVertexProgram_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmShaderPatcher *shaderPatcher, Ptr<SceGxmVertexProgram> vertexProgram);
+#endif
 EXPORT(int, sceGxmShaderPatcherReleaseVertexProgram, SceGxmShaderPatcher *shaderPatcher, Ptr<SceGxmVertexProgram> vertexProgram) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmShaderPatcherReleaseVertexProgram_metal3(emuenv, thread_id, export_name, shaderPatcher, vertexProgram);
+#endif
+
     TRACY_FUNC(sceGxmShaderPatcherReleaseVertexProgram, shaderPatcher, vertexProgram);
     if (!shaderPatcher || !vertexProgram)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -4858,7 +5418,15 @@ EXPORT(int, sceGxmShaderPatcherSetUserData, SceGxmShaderPatcher *shaderPatcher, 
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmShaderPatcherUnregisterProgram_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmShaderPatcher *shaderPatcher, SceGxmShaderPatcherId programId);
+#endif
 EXPORT(int, sceGxmShaderPatcherUnregisterProgram, SceGxmShaderPatcher *shaderPatcher, SceGxmShaderPatcherId programId) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmShaderPatcherUnregisterProgram_metal3(emuenv, thread_id, export_name, shaderPatcher, programId);
+#endif
+
     TRACY_FUNC(sceGxmShaderPatcherUnregisterProgram, shaderPatcher, programId);
     if (!shaderPatcher || !programId)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -4905,7 +5473,15 @@ EXPORT(int, sceGxmSyncObjectDestroy, Ptr<SceGxmSyncObject> syncObject) {
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmTerminate_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name);
+#endif
 EXPORT(int, sceGxmTerminate) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmTerminate_metal3(emuenv, thread_id, export_name);
+#endif
+
     TRACY_FUNC(sceGxmTerminate);
     // Make sure everything is done in SDL side before killing Vita thread
     emuenv.gxm.display_queue.wait_empty();
@@ -4955,7 +5531,15 @@ EXPORT(uint32_t, sceGxmTextureGetLodBias, const SceGxmTexture *texture) {
     return texture->lod_bias;
 }
 
+#ifdef __APPLE__
+uint32_t export_sceGxmTextureGetLodMin_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, const SceGxmTexture *texture);
+#endif
 EXPORT(uint32_t, sceGxmTextureGetLodMin, const SceGxmTexture *texture) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmTextureGetLodMin_metal3(emuenv, thread_id, export_name, texture);
+#endif
+
     TRACY_FUNC(sceGxmTextureGetLodMin, texture);
     if (!texture)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -5107,7 +5691,15 @@ EXPORT(int, sceGxmTextureInitLinear, SceGxmTexture *texture, Ptr<const void> dat
     return result;
 }
 
+#ifdef __APPLE__
+int export_sceGxmTextureInitLinearStrided_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmTexture *texture, Ptr<const void> data, SceGxmTextureFormat texFormat, uint32_t width, uint32_t height, uint32_t byteStride);
+#endif
 EXPORT(int, sceGxmTextureInitLinearStrided, SceGxmTexture *texture, Ptr<const void> data, SceGxmTextureFormat texFormat, uint32_t width, uint32_t height, uint32_t byteStride) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmTextureInitLinearStrided_metal3(emuenv, thread_id, export_name, texture, data, texFormat, width, height, byteStride);
+#endif
+
     TRACY_FUNC(sceGxmTextureInitLinearStrided, texture, data, texFormat, width, height, byteStride);
     if (!texture) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -5218,7 +5810,15 @@ EXPORT(int, sceGxmTextureSetGammaMode, SceGxmTexture *texture, SceGxmTextureGamm
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmTextureSetHeight_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmTexture *texture, uint32_t height);
+#endif
 EXPORT(int, sceGxmTextureSetHeight, SceGxmTexture *texture, uint32_t height) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmTextureSetHeight_metal3(emuenv, thread_id, export_name, texture, height);
+#endif
+
     TRACY_FUNC(sceGxmTextureSetHeight, texture, height);
     if (!texture)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -5270,7 +5870,15 @@ EXPORT(int, sceGxmTextureSetLodBias, SceGxmTexture *texture, uint32_t bias) {
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmTextureSetLodMin_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmTexture *texture, uint32_t lodMin);
+#endif
 EXPORT(int, sceGxmTextureSetLodMin, SceGxmTexture *texture, uint32_t lodMin) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmTextureSetLodMin_metal3(emuenv, thread_id, export_name, texture, lodMin);
+#endif
+
     TRACY_FUNC(sceGxmTextureSetLodMin, texture, lodMin);
     if (!texture) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -5366,7 +5974,15 @@ EXPORT(int, sceGxmTextureSetPalette, SceGxmTexture *texture, Ptr<const void> pal
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmTextureSetStride_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmTexture *texture, uint32_t byteStride);
+#endif
 EXPORT(int, sceGxmTextureSetStride, SceGxmTexture *texture, uint32_t byteStride) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmTextureSetStride_metal3(emuenv, thread_id, export_name, texture, byteStride);
+#endif
+
     TRACY_FUNC(sceGxmTextureSetStride, texture, byteStride);
     if (!texture)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -5410,7 +6026,15 @@ EXPORT(int, sceGxmTextureSetUAddrMode, SceGxmTexture *texture, SceGxmTextureAddr
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmTextureSetUAddrModeSafe_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmTexture *texture, SceGxmTextureAddrMode mode);
+#endif
 EXPORT(int, sceGxmTextureSetUAddrModeSafe, SceGxmTexture *texture, SceGxmTextureAddrMode mode) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmTextureSetUAddrModeSafe_metal3(emuenv, thread_id, export_name, texture, mode);
+#endif
+
     TRACY_FUNC(sceGxmTextureSetUAddrModeSafe, texture, mode);
     if (!texture)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -5434,7 +6058,15 @@ EXPORT(int, sceGxmTextureSetVAddrMode, SceGxmTexture *texture, SceGxmTextureAddr
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmTextureSetVAddrModeSafe_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmTexture *texture, SceGxmTextureAddrMode mode);
+#endif
 EXPORT(int, sceGxmTextureSetVAddrModeSafe, SceGxmTexture *texture, SceGxmTextureAddrMode mode) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmTextureSetVAddrModeSafe_metal3(emuenv, thread_id, export_name, texture, mode);
+#endif
+
     TRACY_FUNC(sceGxmTextureSetVAddrModeSafe, texture, mode);
     if (!texture)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -5446,7 +6078,15 @@ EXPORT(int, sceGxmTextureSetVAddrModeSafe, SceGxmTexture *texture, SceGxmTexture
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmTextureSetWidth_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmTexture *texture, uint32_t width);
+#endif
 EXPORT(int, sceGxmTextureSetWidth, SceGxmTexture *texture, uint32_t width) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmTextureSetWidth_metal3(emuenv, thread_id, export_name, texture, width);
+#endif
+
     TRACY_FUNC(sceGxmTextureSetWidth, texture, width);
     if (!texture) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -5686,7 +6326,15 @@ EXPORT(int, sceGxmUnmapFragmentUsseMemory, void *base) {
     return 0;
 }
 
+#ifdef __APPLE__
+int export_sceGxmUnmapMemory_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, Ptr<void> base);
+#endif
 EXPORT(int, sceGxmUnmapMemory, Ptr<void> base) {
+#ifdef __APPLE__
+    if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal)
+        return export_sceGxmUnmapMemory_metal3(emuenv, thread_id, export_name, base);
+#endif
+
     TRACY_FUNC(sceGxmUnmapMemory, base);
     if (!base) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
@@ -5742,3 +6390,7 @@ EXPORT(int, sceGxmWaitEvent) {
     TRACY_FUNC(sceGxmWaitEvent);
     return UNIMPLEMENTED();
 }
+
+#ifdef __APPLE__
+#include "metal3/SceGxm_metal.inl"
+#endif

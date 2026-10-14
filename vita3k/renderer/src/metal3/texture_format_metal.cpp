@@ -1,0 +1,660 @@
+// Vita3K emulator project
+// Copyright (C) 2026 Vita3K team
+// Copyright (c) 2009 Benjamin Dobell, Glass Echidna
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+
+#include <gxm/types.h>
+#include <renderer/functions.h>
+#include <renderer/pvrt-dec.h>
+#include <util/float_to_half.h>
+#include <util/log.h>
+
+#define BCDEC_STATIC
+#define BCDEC_IMPLEMENTATION
+#include "bcdec.h"
+
+#include <renderer/metal3/texture_formats.h>
+namespace renderer::texture {
+
+bool convert_base_texture_format_to_base_color_format_metal3(SceGxmTextureBaseFormat format, SceGxmColorBaseFormat &color_format) {
+    static const std::map<std::uint32_t, std::uint32_t> TEXTURE_TO_COLOR_FORMAT_MAPPING = {
+        { SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8, SCE_GXM_COLOR_BASE_FORMAT_U8U8U8U8 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8, SCE_GXM_COLOR_BASE_FORMAT_U8U8U8 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_U5U6U5, SCE_GXM_COLOR_BASE_FORMAT_U5U6U5 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_U1U5U5U5, SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_U4U4U4U4, SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_U8U3U3U2, SCE_GXM_COLOR_BASE_FORMAT_U8U3U3U2 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_F16, SCE_GXM_COLOR_BASE_FORMAT_F16 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_F16F16, SCE_GXM_COLOR_BASE_FORMAT_F16F16 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_F32, SCE_GXM_COLOR_BASE_FORMAT_F32 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_S16, SCE_GXM_COLOR_BASE_FORMAT_S16 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_S16S16, SCE_GXM_COLOR_BASE_FORMAT_S16S16 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_U16, SCE_GXM_COLOR_BASE_FORMAT_U16 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_U16U16, SCE_GXM_COLOR_BASE_FORMAT_U16U16 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10, SCE_GXM_COLOR_BASE_FORMAT_U2U10U10U10 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_U8, SCE_GXM_COLOR_BASE_FORMAT_U8 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_S8, SCE_GXM_COLOR_BASE_FORMAT_S8 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_S5S5U6, SCE_GXM_COLOR_BASE_FORMAT_S5S5U6 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_U8U8, SCE_GXM_COLOR_BASE_FORMAT_U8U8 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_S8S8, SCE_GXM_COLOR_BASE_FORMAT_S8S8 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_S8S8S8S8, SCE_GXM_COLOR_BASE_FORMAT_S8S8S8S8 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8, SCE_GXM_COLOR_BASE_FORMAT_U8S8S8U8 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_F16F16F16F16, SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_F32F32, SCE_GXM_COLOR_BASE_FORMAT_F32F32 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_F11F11F10, SCE_GXM_COLOR_BASE_FORMAT_F11F11F10 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_SE5M9M9M9, SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_U2F10F10F10, SCE_GXM_COLOR_BASE_FORMAT_U2F10F10F10 },
+        { SCE_GXM_TEXTURE_BASE_FORMAT_U32U32, SCE_GXM_COLOR_BASE_FORMAT_F32F32 }
+    };
+
+    auto ite = TEXTURE_TO_COLOR_FORMAT_MAPPING.find(format);
+    if (ite == TEXTURE_TO_COLOR_FORMAT_MAPPING.end())
+        return false;
+
+    color_format = static_cast<SceGxmColorBaseFormat>(ite->second);
+    return true;
+    }
+
+SceGxmTextureBaseFormat get_matching_decompressed_format_metal3(SceGxmTextureBaseFormat fmt) {
+    switch (fmt) {
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC6H:
+    case SCE_GXM_TEXTURE_BASE_FORMAT_SBC6H:
+        return SCE_GXM_TEXTURE_BASE_FORMAT_F16F16F16F16;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC4:
+        return SCE_GXM_TEXTURE_BASE_FORMAT_U8;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_SBC4:
+        return SCE_GXM_TEXTURE_BASE_FORMAT_S8;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC5:
+        return SCE_GXM_TEXTURE_BASE_FORMAT_U8U8;
+    case SCE_GXM_TEXTURE_BASE_FORMAT_SBC5:
+        return SCE_GXM_TEXTURE_BASE_FORMAT_S8S8;
+    default:
+        // BC1/2/3
+        return SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8;
+    }
+    }
+
+
+
+
+
+uint32_t decompress_compressed_texture_metal3(SceGxmTextureBaseFormat fmt, void *dest, const void *data, const uint32_t width, const uint32_t height) {
+    if (fmt == SCE_GXM_TEXTURE_BASE_FORMAT_UBC6H || fmt == SCE_GXM_TEXTURE_BASE_FORMAT_SBC6H
+        || fmt == SCE_GXM_TEXTURE_BASE_FORMAT_UBC7) {
+        const auto *blocks = static_cast<const uint8_t *>(data);
+        const bool hdr = fmt != SCE_GXM_TEXTURE_BASE_FORMAT_UBC7;
+        for (uint32_t by = 0; by < (height + 3) / 4; ++by)
+            for (uint32_t bx = 0; bx < (width + 3) / 4; ++bx) {
+                const uint8_t *block = blocks + (size_t(by) * ((width + 3) / 4) + bx) * 16;
+                if (hdr) {
+                    uint16_t decoded[4 * 4 * 3];
+                    bcdec_bc6h_half(block, decoded, 4 * 3, fmt == SCE_GXM_TEXTURE_BASE_FORMAT_SBC6H);
+                    auto *output = static_cast<uint16_t *>(dest);
+                    for (uint32_t y = 0; y < 4 && by * 4 + y < height; ++y)
+                        for (uint32_t x = 0; x < 4 && bx * 4 + x < width; ++x) {
+                            const size_t pixel = (size_t(by * 4 + y) * width + bx * 4 + x) * 4;
+                            for (uint32_t channel = 0; channel < 3; ++channel)
+                                output[pixel + channel] = decoded[(y * 4 + x) * 3 + channel];
+                            output[pixel + 3] = 0x3c00; // BC6H has opaque alpha.
+                        }
+                } else {
+                    uint8_t decoded[4 * 4 * 4];
+                    bcdec_bc7(block, decoded, 4 * 4);
+                    auto *output = static_cast<uint8_t *>(dest);
+                    for (uint32_t y = 0; y < 4 && by * 4 + y < height; ++y)
+                        for (uint32_t x = 0; x < 4 && bx * 4 + x < width; ++x)
+                            std::memcpy(output + (size_t(by * 4 + y) * width + bx * 4 + x) * 4,
+                                decoded + (y * 4 + x) * 4, 4);
+                }
+            }
+        return get_compressed_size(fmt, width, height);
+    }
+    uint8_t format_id = 0;
+
+    switch (fmt) {
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC1:
+        format_id = 1;
+        break;
+
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC2:
+        format_id = 2;
+        break;
+
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC3:
+        format_id = 3;
+        break;
+
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC4:
+        format_id = 4;
+        break;
+
+    case SCE_GXM_TEXTURE_BASE_FORMAT_SBC4:
+        format_id = 5;
+        break;
+
+    case SCE_GXM_TEXTURE_BASE_FORMAT_UBC5:
+        format_id = 6;
+        break;
+
+    case SCE_GXM_TEXTURE_BASE_FORMAT_SBC5:
+        format_id = 7;
+        break;
+
+    default:
+        break;
+    }
+
+    if (format_id) {
+        decompress_bc_image(width, height, static_cast<const uint8_t *>(data),
+            static_cast<uint32_t *>(dest), format_id);
+        return (((width + 3) / 4) * ((height + 3) / 4) * ((format_id != 1 && format_id != 4 && format_id != 5) ? 16 : 8));
+    } else if ((fmt >= SCE_GXM_TEXTURE_BASE_FORMAT_PVRT2BPP) && (fmt <= SCE_GXM_TEXTURE_BASE_FORMAT_PVRTII4BPP)) {
+        pvr::PVRTDecompressPVRTC(data, (fmt == SCE_GXM_TEXTURE_BASE_FORMAT_PVRT2BPP) || (fmt == SCE_GXM_TEXTURE_BASE_FORMAT_PVRTII2BPP), width, height,
+            (fmt == SCE_GXM_TEXTURE_BASE_FORMAT_PVRTII2BPP) || (fmt == SCE_GXM_TEXTURE_BASE_FORMAT_PVRTII4BPP), static_cast<uint8_t *>(dest));
+
+        const bool is_2bpp = (fmt == SCE_GXM_TEXTURE_BASE_FORMAT_PVRT2BPP) || (fmt == SCE_GXM_TEXTURE_BASE_FORMAT_PVRTII2BPP);
+
+        const uint32_t num_xword = (width + (is_2bpp ? 7 : 3)) / (is_2bpp ? 8 : 4);
+        const uint32_t num_yword = (height + 3) / 4;
+
+        return num_xword * num_yword * 8;
+    } else {
+        LOG_ERROR("Trying to decompress and unswizzle unknown format {}", log_hex(fmt));
+    }
+
+    return 0;
+    }
+
+
+
+
+
+
+
+
+
+void convert_s5s5u6_to_f16f16f16f16(void *dest, const void *data, uint32_t width, uint32_t height,
+    SceGxmTextureFormat format) {
+    const uint32_t mode=(uint32_t(format)&SCE_GXM_TEXTURE_SWIZZLE_MASK)>>12;
+    auto *output=static_cast<uint16_t *>(dest);
+    const auto *input=static_cast<const uint8_t *>(data);
+    for (size_t pixel=0;pixel<size_t(width)*height;++pixel) {
+        const uint16_t word=uint16_t(input[pixel*2]) | (uint16_t(input[pixel*2+1])<<8);
+        const uint32_t red=mode==0 ? word&31 : (word>>11)&31;
+        const uint32_t green=(word>>(mode==0 ? 5 : 6))&31;
+        const uint32_t blue=mode==0 ? (word>>10)&63 : word&63;
+        const auto signed5=[](uint32_t bits) { return int(bits<16 ? bits : bits-32); };
+        output[pixel*4+0]=util::encode_flt16(float(std::max(signed5(red),-15))/15.f);
+        output[pixel*4+1]=util::encode_flt16(float(std::max(signed5(green),-15))/15.f);
+        output[pixel*4+2]=util::encode_flt16(float(blue)/63.f);
+        output[pixel*4+3]=0x3c00;
+    }
+}
+
+void convert_x8s8s8u8_to_f16f16f16f16(void *dest, const void *data, uint32_t width, uint32_t height,
+    SceGxmTextureFormat format) {
+    const uint32_t mode = (uint32_t(format) & SCE_GXM_TEXTURE_SWIZZLE_MASK) >> 12;
+    if (mode > 1)
+        throw std::invalid_argument("Unsupported X8S8S8U8 texture channel order");
+    auto *output = static_cast<uint16_t *>(dest);
+    const auto *input = static_cast<const uint8_t *>(data);
+    for (size_t pixel = 0; pixel < size_t(width) * height; ++pixel) {
+        const auto *bytes = input + pixel * 4;
+        const uint8_t red = bytes[mode == 0 ? 0 : 2];
+        const auto signed_byte = [](uint8_t byte) { return byte < 128 ? int(byte) : int(byte) - 256; };
+        const int green = signed_byte(bytes[1]);
+        const int blue = signed_byte(bytes[mode == 0 ? 2 : 0]);
+        output[pixel * 4 + 0] = util::encode_flt16(float(red) / 255.f);
+        output[pixel * 4 + 1] = util::encode_flt16(float(std::max(green, -127)) / 127.f);
+        output[pixel * 4 + 2] = util::encode_flt16(float(std::max(blue, -127)) / 127.f);
+        output[pixel * 4 + 3] = 0x3c00;
+    }
+}
+
+
+
+static uint16_t f10_to_f16(const uint16_t f10) {
+    // f16 has a 10 bit mantissa and a 5 bit exponent
+    // f10 has a 5 bit mantissa and a 5 bit exponent
+    // so we just need to put the exponent in the right location, add zeros to the mantissa
+    // and it should work
+    // Note: I don't think this works for subnormal numbers
+    const uint16_t exponent = (f10 >> 5) & 0b11111;
+    const uint16_t mantissa = f10 & 0b11111;
+    const uint16_t f16 = (exponent << 10) | (mantissa << 5);
+    return f16;
+}
+
+
+
+// Based on this: http://xen.firefly.nu/up/rearrange.c.html
+// https://fgiesen.wordpress.com/2009/12/13/decoding-morton-codes/
+// Thanks daniel from GXTConvert finding this out first
+
+// Inverse of Part1By1 - "delete" all odd-indexed bits
+static uint32_t compact_one_by_one(uint32_t x) {
+    x &= 0x55555555; // x = -f-e -d-c -b-a -9-8 -7-6 -5-4 -3-2 -1-0
+    x = (x ^ (x >> 1)) & 0x33333333; // x = --fe --dc --ba --98 --76 --54 --32 --10
+    x = (x ^ (x >> 2)) & 0x0f0f0f0f; // x = ---- fedc ---- ba98 ---- 7654 ---- 3210
+    x = (x ^ (x >> 4)) & 0x00ff00ff; // x = ---- ---- fedc ba98 ---- ---- 7654 3210
+    x = (x ^ (x >> 8)) & 0x0000ffff; // x = ---- ---- ---- ---- fedc ba98 7654 3210
+    return x;
+}
+
+
+
+
+
+static uint32_t Part1By1(uint32_t x) {
+    x &= 0x0000ffff; // x = ---- ---- ---- ---- fedc ba98 7654 3210
+    x = (x ^ (x << 8)) & 0x00ff00ff; // x = ---- ---- fedc ba98 ---- ---- 7654 3210
+    x = (x ^ (x << 4)) & 0x0f0f0f0f; // x = ---- fedc ---- ba98 ---- 7654 ---- 3210
+    x = (x ^ (x << 2)) & 0x33333333; // x = --fe --dc --ba --98 --76 --54 --32 --10
+    x = (x ^ (x << 1)) & 0x55555555; // x = -f-e -d-c -b-a -9-8 -7-6 -5-4 -3-2 -1-0
+    return x;
+}
+
+
+
+
+
+
+
+
+
+// =========================== COMPRESSION ============================
+// Some texture has block compression, when uncompressed will have swizzled layout. Since on some backend, no
+// option is provided to make the GPU driver not try to translate the layout to linear, we have to do uncompress
+// and unswizzled on the CPU.
+
+// This BC decompression code is based on code from AMD GPUOpen's Compressonator
+
+/**
+ * \brief Decompresses one block of a BC1 texture and stores the resulting pixels at the appropriate offset in 'image'.
+ *
+ * \param block_storage     pointer to the block to decompress.
+ * \param image             pointer to image where the decompressed pixel data should be stored.
+ **/
+static void decompress_block_bc1(const uint8_t *block_storage, uint32_t *image) {
+    std::uint16_t n0 = static_cast<std::uint16_t>((block_storage[1] << 8) | block_storage[0]);
+    std::uint16_t n1 = static_cast<std::uint16_t>((block_storage[3] << 8) | block_storage[2]);
+
+    block_storage += 4;
+
+    std::uint8_t r0 = (n0 & 0xF800) >> 8;
+    std::uint8_t g0 = (n0 & 0x07E0) >> 3;
+    std::uint8_t b0 = (n0 & 0x001F) << 3;
+
+    std::uint8_t r1 = (n1 & 0xF800) >> 8;
+    std::uint8_t g1 = (n1 & 0x07E0) >> 3;
+    std::uint8_t b1 = (n1 & 0x001F) << 3;
+
+    r0 |= r0 >> 5;
+    r1 |= r1 >> 5;
+    g0 |= g0 >> 6;
+    g1 |= g1 >> 6;
+    b0 |= b0 >> 5;
+    b1 |= b1 >> 5;
+
+    std::uint32_t c0 = 0xFF000000 | (b0 << 16) | (g0 << 8) | r0;
+    std::uint32_t c1 = 0xFF000000 | (b1 << 16) | (g1 << 8) | r1;
+
+    if (n0 > n1) {
+        std::uint8_t r2 = static_cast<uint8_t>((2 * r0 + r1 + 1) / 3);
+        std::uint8_t r3 = static_cast<uint8_t>((2 * r1 + r0 + 1) / 3);
+        std::uint8_t g2 = static_cast<uint8_t>((2 * g0 + g1 + 1) / 3);
+        std::uint8_t g3 = static_cast<uint8_t>((2 * g1 + g0 + 1) / 3);
+        std::uint8_t b2 = static_cast<uint8_t>((2 * b0 + b1 + 1) / 3);
+        std::uint8_t b3 = static_cast<uint8_t>((2 * b1 + b0 + 1) / 3);
+
+        std::uint32_t c2 = 0xFF000000 | (b2 << 16) | (g2 << 8) | r2;
+        std::uint32_t c3 = 0xFF000000 | (b3 << 16) | (g3 << 8) | r3;
+
+        for (int i = 0; i < 16; ++i) {
+            int index = (block_storage[i / 4] >> (i % 4 * 2)) & 0x03;
+            switch (index) {
+            case 0:
+                image[i] = c0;
+                break;
+            case 1:
+                image[i] = c1;
+                break;
+            case 2:
+                image[i] = c2;
+                break;
+            case 3:
+                image[i] = c3;
+                break;
+            }
+        }
+    } else {
+        // Transparent decode
+        std::uint8_t r2 = static_cast<uint8_t>((r0 + r1) / 2);
+        std::uint8_t g2 = static_cast<uint8_t>((g0 + g1) / 2);
+        std::uint8_t b2 = static_cast<uint8_t>((b0 + b1) / 2);
+
+        std::uint32_t c2 = 0xFF000000 | (b2 << 16) | (g2 << 8) | r2;
+
+        for (int i = 0; i < 16; ++i) {
+            int index = (block_storage[i / 4] >> (i % 4 * 2)) & 0x03;
+            switch (index) {
+            case 0:
+                image[i] = c0;
+                break;
+            case 1:
+                image[i] = c1;
+                break;
+            case 2:
+                image[i] = c2;
+                break;
+            case 3:
+                image[i] = 0x00000000;
+                break;
+            }
+        }
+    }
+}
+
+/**
+ * \brief Decompresses one block of a alpha texture and stores the resulting pixels at the appropriate offset in 'image'.
+ *
+ * \param block_storage     pointer to the block to decompress.
+ * \param image             pointer to image where the decompressed pixel data should be stored.
+ * \param offset            offset to where data should be written.
+ * \param stride            stride between bytes to where data should be written.
+ **/
+static void decompress_block_alpha(const uint8_t *block_storage, uint8_t *image, const uint32_t offset, const uint32_t stride) {
+    uint8_t alpha[8];
+
+    alpha[0] = block_storage[0];
+    alpha[1] = block_storage[1];
+
+    if (alpha[0] > alpha[1]) {
+        // 8-alpha block:  derive the other six alphas.
+        // Bit code 000 = alpha_0, 001 = alpha_1, others are interpolated.
+        alpha[2] = static_cast<uint8_t>((6 * alpha[0] + 1 * alpha[1] + 3) / 7); // bit code 010
+        alpha[3] = static_cast<uint8_t>((5 * alpha[0] + 2 * alpha[1] + 3) / 7); // bit code 011
+        alpha[4] = static_cast<uint8_t>((4 * alpha[0] + 3 * alpha[1] + 3) / 7); // bit code 100
+        alpha[5] = static_cast<uint8_t>((3 * alpha[0] + 4 * alpha[1] + 3) / 7); // bit code 101
+        alpha[6] = static_cast<uint8_t>((2 * alpha[0] + 5 * alpha[1] + 3) / 7); // bit code 110
+        alpha[7] = static_cast<uint8_t>((1 * alpha[0] + 6 * alpha[1] + 3) / 7); // bit code 111
+    } else {
+        // 6-alpha block.
+        // Bit code 000 = alpha_0, 001 = alpha_1, others are interpolated.
+        alpha[2] = static_cast<uint8_t>((4 * alpha[0] + 1 * alpha[1] + 2) / 5); // Bit code 010
+        alpha[3] = static_cast<uint8_t>((3 * alpha[0] + 2 * alpha[1] + 2) / 5); // Bit code 011
+        alpha[4] = static_cast<uint8_t>((2 * alpha[0] + 3 * alpha[1] + 2) / 5); // Bit code 100
+        alpha[5] = static_cast<uint8_t>((1 * alpha[0] + 4 * alpha[1] + 2) / 5); // Bit code 101
+        alpha[6] = 0; // Bit code 110
+        alpha[7] = 255; // Bit code 111
+    }
+
+    image += offset;
+
+    image[stride * 0] = alpha[block_storage[2] & 0x07];
+    image[stride * 1] = alpha[(block_storage[2] >> 3) & 0x07];
+    image[stride * 2] = alpha[((block_storage[3] << 2) & 0x04) | ((block_storage[2] >> 6) & 0x03)];
+    image[stride * 3] = alpha[(block_storage[3] >> 1) & 0x07];
+    image[stride * 4] = alpha[(block_storage[3] >> 4) & 0x07];
+    image[stride * 5] = alpha[((block_storage[4] << 1) & 0x06) | ((block_storage[3] >> 7) & 0x01)];
+    image[stride * 6] = alpha[(block_storage[4] >> 2) & 0x07];
+    image[stride * 7] = alpha[(block_storage[4] >> 5) & 0x07];
+    image[stride * 8] = alpha[block_storage[5] & 0x07];
+    image[stride * 9] = alpha[(block_storage[5] >> 3) & 0x07];
+    image[stride * 10] = alpha[((block_storage[6] << 2) & 0x04) | ((block_storage[5] >> 6) & 0x03)];
+    image[stride * 11] = alpha[(block_storage[6] >> 1) & 0x07];
+    image[stride * 12] = alpha[(block_storage[6] >> 4) & 0x07];
+    image[stride * 13] = alpha[((block_storage[7] << 1) & 0x06) | ((block_storage[6] >> 7) & 0x01)];
+    image[stride * 14] = alpha[(block_storage[7] >> 2) & 0x07];
+    image[stride * 15] = alpha[(block_storage[7] >> 5) & 0x07];
+}
+
+/**
+ * \brief Decompresses one block of a signed alpha texture and stores the resulting pixels at the appropriate offset in 'image'.
+ *
+ * \param block_storage     pointer to the block to decompress.
+ * \param image             pointer to image where the decompressed pixel data should be stored.
+ * \param offset            offset to where data should be written.
+ * \param stride            stride between bytes to where data should be written.
+ **/
+static void decompress_block_alpha_signed(const uint8_t *block_storage, uint8_t *image, const uint32_t offset, const uint32_t stride) {
+    int8_t alpha[8];
+
+    alpha[0] = static_cast<int8_t>(block_storage[0]);
+    alpha[1] = static_cast<int8_t>(block_storage[1]);
+
+    if (alpha[0] > alpha[1]) {
+        // 8-alpha block:  derive the other six alphas.
+        // Bit code 000 = alpha_0, 001 = alpha_1, others are interpolated.
+        alpha[2] = static_cast<int8_t>((6 * alpha[0] + 1 * alpha[1] + 3) / 7); // bit code 010
+        alpha[3] = static_cast<int8_t>((5 * alpha[0] + 2 * alpha[1] + 3) / 7); // bit code 011
+        alpha[4] = static_cast<int8_t>((4 * alpha[0] + 3 * alpha[1] + 3) / 7); // bit code 100
+        alpha[5] = static_cast<int8_t>((3 * alpha[0] + 4 * alpha[1] + 3) / 7); // bit code 101
+        alpha[6] = static_cast<int8_t>((2 * alpha[0] + 5 * alpha[1] + 3) / 7); // bit code 110
+        alpha[7] = static_cast<int8_t>((1 * alpha[0] + 6 * alpha[1] + 3) / 7); // bit code 111
+    } else {
+        // 6-alpha block.
+        // Bit code 000 = alpha_0, 001 = alpha_1, others are interpolated.
+        alpha[2] = static_cast<int8_t>((4 * alpha[0] + 1 * alpha[1] + 2) / 5); // Bit code 010
+        alpha[3] = static_cast<int8_t>((3 * alpha[0] + 2 * alpha[1] + 2) / 5); // Bit code 011
+        alpha[4] = static_cast<int8_t>((2 * alpha[0] + 3 * alpha[1] + 2) / 5); // Bit code 100
+        alpha[5] = static_cast<int8_t>((1 * alpha[0] + 4 * alpha[1] + 2) / 5); // Bit code 101
+        alpha[6] = -128; // Bit code 110
+        alpha[7] = 127; // Bit code 111
+    }
+
+    image += offset;
+
+    image[stride * 0] = static_cast<uint8_t>(alpha[block_storage[2] & 0x07]);
+    image[stride * 1] = static_cast<uint8_t>(alpha[(block_storage[2] >> 3) & 0x07]);
+    image[stride * 2] = static_cast<uint8_t>(alpha[((block_storage[3] << 2) & 0x04) | ((block_storage[2] >> 6) & 0x03)]);
+    image[stride * 3] = static_cast<uint8_t>(alpha[(block_storage[3] >> 1) & 0x07]);
+    image[stride * 4] = static_cast<uint8_t>(alpha[(block_storage[3] >> 4) & 0x07]);
+    image[stride * 5] = static_cast<uint8_t>(alpha[((block_storage[4] << 1) & 0x06) | ((block_storage[3] >> 7) & 0x01)]);
+    image[stride * 6] = static_cast<uint8_t>(alpha[(block_storage[4] >> 2) & 0x07]);
+    image[stride * 7] = static_cast<uint8_t>(alpha[(block_storage[4] >> 5) & 0x07]);
+    image[stride * 8] = static_cast<uint8_t>(alpha[block_storage[5] & 0x07]);
+    image[stride * 9] = static_cast<uint8_t>(alpha[(block_storage[5] >> 3) & 0x07]);
+    image[stride * 10] = static_cast<uint8_t>(alpha[((block_storage[6] << 2) & 0x04) | ((block_storage[5] >> 6) & 0x03)]);
+    image[stride * 11] = static_cast<uint8_t>(alpha[(block_storage[6] >> 1) & 0x07]);
+    image[stride * 12] = static_cast<uint8_t>(alpha[(block_storage[6] >> 4) & 0x07]);
+    image[stride * 13] = static_cast<uint8_t>(alpha[((block_storage[7] << 1) & 0x06) | ((block_storage[6] >> 7) & 0x01)]);
+    image[stride * 14] = static_cast<uint8_t>(alpha[(block_storage[7] >> 2) & 0x07]);
+    image[stride * 15] = static_cast<uint8_t>(alpha[(block_storage[7] >> 5) & 0x07]);
+}
+
+/**
+ * \brief Decompresses one block of a BC2 texture and stores the resulting pixels at the appropriate offset in 'image'.
+ *
+ * \param block_storage     pointer to the block to decompress.
+ * \param image             pointer to image where the decompressed pixel data should be stored.
+ **/
+static void decompress_block_bc2(const uint8_t *block_storage, uint32_t *image) {
+    decompress_block_bc1(block_storage + 8, image);
+
+    for (int i = 0; i < 8; i++) {
+        image[2 * i] = (((block_storage[i] & 0x0F) | ((block_storage[i] & 0x0F) << 4)) << 24) | (image[2 * i] & 0x00FFFFFF);
+        image[2 * i + 1] = (((block_storage[i] & 0xF0) | ((block_storage[i] & 0xF0) >> 4)) << 24) | (image[2 * i + 1] & 0x00FFFFFF);
+    }
+}
+
+/**
+ * \brief Decompresses one block of a BC3 texture and stores the resulting pixels at the appropriate offset in 'image'.
+ *
+ * \param block_storage     pointer to the block to decompress.
+ * \param image             pointer to image where the decompressed pixel data should be stored.
+ **/
+static void decompress_block_bc3(const uint8_t *block_storage, uint32_t *image) {
+    decompress_block_bc1(block_storage + 8, image);
+    decompress_block_alpha(block_storage, reinterpret_cast<std::uint8_t *>(image), 3, 4);
+}
+
+/**
+ * \brief Decompresses one block of a BC4U texture and stores the resulting pixels at the appropriate offset in 'image'.
+ *
+ * \param block_storage     pointer to the block to decompress.
+ * \param image             pointer to image where the decompressed pixel data should be stored.
+ **/
+static void decompress_block_bc4u(const uint8_t *block_storage, uint8_t *image) {
+    for (int i = 0; i < 16; i++)
+        image[i] = 0x00;
+    decompress_block_alpha(block_storage, image, 0, 1);
+}
+
+/**
+ * \brief Decompresses one block of a BC4S texture and stores the resulting pixels at the appropriate offset in 'image'.
+ *
+ * \param block_storage     pointer to the block to decompress.
+ * \param image             pointer to image where the decompressed pixel data should be stored.
+ **/
+static void decompress_block_bc4s(const uint8_t *block_storage, uint8_t *image) {
+    for (int i = 0; i < 16; i++)
+        image[i] = 0x00;
+    decompress_block_alpha_signed(block_storage, image, 0, 1);
+}
+
+/**
+ * \brief Decompresses one block of a BC5U texture and stores the resulting pixels at the appropriate offset in 'image'.
+ *
+ * \param block_storage     pointer to the block to decompress.
+ * \param image             pointer to image where the decompressed pixel data should be stored.
+ **/
+static void decompress_block_bc5u(const uint8_t *block_storage, uint16_t *image) {
+    for (int i = 0; i < 16; i++)
+        image[i] = 0x0000;
+    decompress_block_alpha(block_storage, reinterpret_cast<uint8_t *>(image), 0, 2);
+    decompress_block_alpha(block_storage + 8, reinterpret_cast<uint8_t *>(image), 1, 2);
+}
+
+/**
+ * \brief Decompresses one block of a BC5S texture and stores the resulting pixels at the appropriate offset in 'image'.
+ *
+ * \param block_storage     pointer to the block to decompress.
+ * \param image             pointer to image where the decompressed pixel data should be stored.
+ **/
+static void decompress_block_bc5s(const uint8_t *block_storage, uint16_t *image) {
+    for (int i = 0; i < 16; i++)
+        image[i] = 0x0000;
+    decompress_block_alpha_signed(block_storage, reinterpret_cast<uint8_t *>(image), 0, 2);
+    decompress_block_alpha_signed(block_storage + 8, reinterpret_cast<uint8_t *>(image), 1, 2);
+}
+
+
+
+/**
+ * \brief Solves Z-order on all the blocks of a block compressed texture and stores the resulting pixels in 'dest'.
+ *
+ * Output results is in format RGBA, with each channel being 8 bits.
+ *
+ * \param width     Texture width.
+ * \param height    Texture height.
+ * \param src       Pointer to compressed blocks.
+ * \param dest      Pointer to the image where the decompressed pixels will be stored.
+ */
+
+
+} // namespace renderer::texture
+
+namespace gxm {
+bool convert_color_format_to_texture_format_metal3(SceGxmColorFormat format, SceGxmTextureFormat &dest_format) {
+    static const std::map<std::uint32_t, std::uint32_t> COLOR_FORMAT_TO_TEXTURE_MAPPING = {
+        { SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR },
+        { SCE_GXM_COLOR_FORMAT_U8U8U8U8_ARGB, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ARGB },
+        { SCE_GXM_COLOR_FORMAT_U8U8U8U8_RGBA, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_RGBA },
+        { SCE_GXM_COLOR_FORMAT_U8U8U8U8_BGRA, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_BGRA },
+        { SCE_GXM_COLOR_FORMAT_U8U8U8_BGR, SCE_GXM_TEXTURE_FORMAT_U8U8U8_BGR },
+        { SCE_GXM_COLOR_FORMAT_U8U8U8_RGB, SCE_GXM_TEXTURE_FORMAT_U8U8U8_RGB },
+        { SCE_GXM_COLOR_FORMAT_U5U6U5_BGR, SCE_GXM_TEXTURE_FORMAT_U5U6U5_BGR },
+        { SCE_GXM_COLOR_FORMAT_U5U6U5_RGB, SCE_GXM_TEXTURE_FORMAT_U5U6U5_RGB },
+        { SCE_GXM_COLOR_FORMAT_U1U5U5U5_ABGR, SCE_GXM_TEXTURE_FORMAT_U1U5U5U5_ABGR },
+        { SCE_GXM_COLOR_FORMAT_U1U5U5U5_ARGB, SCE_GXM_TEXTURE_FORMAT_U1U5U5U5_ARGB },
+        { SCE_GXM_COLOR_FORMAT_U5U5U5U1_RGBA, SCE_GXM_TEXTURE_FORMAT_U5U5U5U1_RGBA },
+        { SCE_GXM_COLOR_FORMAT_U5U5U5U1_BGRA, SCE_GXM_TEXTURE_FORMAT_U5U5U5U1_BGRA },
+        { SCE_GXM_COLOR_FORMAT_U4U4U4U4_ABGR, SCE_GXM_TEXTURE_FORMAT_U4U4U4U4_ABGR },
+        { SCE_GXM_COLOR_FORMAT_U4U4U4U4_ARGB, SCE_GXM_TEXTURE_FORMAT_U4U4U4U4_ARGB },
+        { SCE_GXM_COLOR_FORMAT_U4U4U4U4_RGBA, SCE_GXM_TEXTURE_FORMAT_U4U4U4U4_RGBA },
+        { SCE_GXM_COLOR_FORMAT_U4U4U4U4_BGRA, SCE_GXM_TEXTURE_FORMAT_U4U4U4U4_BGRA },
+        { SCE_GXM_COLOR_BASE_FORMAT_U8U3U3U2, SCE_GXM_TEXTURE_FORMAT_U8U3U3U2_ARGB },
+        { SCE_GXM_COLOR_FORMAT_F16_R, SCE_GXM_TEXTURE_FORMAT_F16_R },
+        // G-only surfaces keep their single guest word in texture R storage.
+        { SCE_GXM_COLOR_FORMAT_F16_G, SCE_GXM_TEXTURE_FORMAT_F16_R },
+        { SCE_GXM_COLOR_FORMAT_F16F16_GR, SCE_GXM_TEXTURE_FORMAT_F16F16_GR },
+        { SCE_GXM_COLOR_FORMAT_F16F16_RG, SCE_GXM_TEXTURE_FORMAT_F16F16_GR },
+        { SCE_GXM_COLOR_FORMAT_F32_R, SCE_GXM_TEXTURE_FORMAT_F32_R },
+        { SCE_GXM_COLOR_FORMAT_S16_R, SCE_GXM_TEXTURE_FORMAT_S16_R },
+        { SCE_GXM_COLOR_FORMAT_S16_G, SCE_GXM_TEXTURE_FORMAT_S16_R },
+        { SCE_GXM_COLOR_FORMAT_S16S16_GR, SCE_GXM_TEXTURE_FORMAT_S16S16_GR },
+        { SCE_GXM_COLOR_FORMAT_S16S16_RG, SCE_GXM_TEXTURE_FORMAT_S16S16_GR },
+        { SCE_GXM_COLOR_FORMAT_U16_R, SCE_GXM_TEXTURE_FORMAT_U16_R },
+        { SCE_GXM_COLOR_FORMAT_U16_G, SCE_GXM_TEXTURE_FORMAT_U16_R },
+        { SCE_GXM_COLOR_FORMAT_U16U16_GR, SCE_GXM_TEXTURE_FORMAT_U16U16_GR },
+        { SCE_GXM_COLOR_FORMAT_U16U16_RG, SCE_GXM_TEXTURE_FORMAT_U16U16_GR },
+        { SCE_GXM_COLOR_FORMAT_U2U10U10U10_ABGR, SCE_GXM_TEXTURE_FORMAT_U2U10U10U10_ABGR },
+        { SCE_GXM_COLOR_FORMAT_U2U10U10U10_ARGB, SCE_GXM_TEXTURE_FORMAT_U2U10U10U10_ARGB },
+        { SCE_GXM_COLOR_FORMAT_U10U10U10U2_RGBA, SCE_GXM_TEXTURE_FORMAT_U10U10U10U2_RGBA },
+        { SCE_GXM_COLOR_FORMAT_U10U10U10U2_BGRA, SCE_GXM_TEXTURE_FORMAT_U10U10U10U2_BGRA },
+        { SCE_GXM_COLOR_FORMAT_U8_R, SCE_GXM_TEXTURE_FORMAT_U8_R },
+        { SCE_GXM_COLOR_FORMAT_U8_A, SCE_GXM_TEXTURE_FORMAT_A8 },
+        { SCE_GXM_COLOR_FORMAT_S8_R, SCE_GXM_TEXTURE_FORMAT_S8_R },
+        { SCE_GXM_COLOR_FORMAT_S8_A, SCE_GXM_TEXTURE_FORMAT_S8_R000 },
+        { SCE_GXM_COLOR_FORMAT_U6S5S5_BGR, SCE_GXM_TEXTURE_FORMAT_U6S5S5_BGR },
+        { SCE_GXM_COLOR_FORMAT_S5S5U6_RGB, SCE_GXM_TEXTURE_FORMAT_S5S5U6_RGB },
+        { SCE_GXM_COLOR_FORMAT_U8U8_GR, SCE_GXM_TEXTURE_FORMAT_U8U8_GR },
+        { SCE_GXM_COLOR_FORMAT_U8U8_RG, SCE_GXM_TEXTURE_FORMAT_U8U8_GR },
+        { SCE_GXM_COLOR_FORMAT_U8U8_RA, SCE_GXM_TEXTURE_FORMAT_U8U8_GRRR },
+        { SCE_GXM_COLOR_FORMAT_U8U8_AR, SCE_GXM_TEXTURE_FORMAT_U8U8_RGGG },
+        { SCE_GXM_COLOR_FORMAT_S8S8_GR, SCE_GXM_TEXTURE_FORMAT_S8S8_GR },
+        { SCE_GXM_COLOR_FORMAT_S8S8_RG, SCE_GXM_TEXTURE_FORMAT_S8S8_GR },
+        { SCE_GXM_COLOR_FORMAT_S8S8_RA, SCE_GXM_TEXTURE_FORMAT_S8S8_GRRR },
+        { SCE_GXM_COLOR_FORMAT_S8S8_AR, SCE_GXM_TEXTURE_FORMAT_S8S8_RGGG },
+        { SCE_GXM_COLOR_FORMAT_S8S8S8S8_BGRA, SCE_GXM_TEXTURE_FORMAT_S8S8S8S8_BGRA },
+        { SCE_GXM_COLOR_FORMAT_S8S8S8S8_RGBA, SCE_GXM_TEXTURE_FORMAT_S8S8S8S8_RGBA },
+        { SCE_GXM_COLOR_FORMAT_S8S8S8S8_ABGR, SCE_GXM_TEXTURE_FORMAT_S8S8S8S8_ABGR },
+        { SCE_GXM_COLOR_FORMAT_S8S8S8S8_ARGB, SCE_GXM_TEXTURE_FORMAT_S8S8S8S8_ARGB },
+        // These X8 views preserve the mixed unsigned R / signed G,B bytes.
+        // The texture format specifies constant-one alpha.
+        { SCE_GXM_COLOR_FORMAT_U8S8S8U8_ABGR, SCE_GXM_TEXTURE_FORMAT_X8S8S8U8_1BGR },
+        { SCE_GXM_COLOR_FORMAT_U8U8S8S8_ARGB, SCE_GXM_TEXTURE_FORMAT_X8U8S8S8_1RGB },
+        { SCE_GXM_COLOR_FORMAT_F16F16F16F16_ABGR, SCE_GXM_TEXTURE_FORMAT_F16F16F16F16_ABGR },
+        { SCE_GXM_COLOR_FORMAT_F16F16F16F16_ARGB, SCE_GXM_TEXTURE_FORMAT_F16F16F16F16_ARGB },
+        { SCE_GXM_COLOR_FORMAT_F16F16F16F16_RGBA, SCE_GXM_TEXTURE_FORMAT_F16F16F16F16_RGBA },
+        { SCE_GXM_COLOR_FORMAT_F16F16F16F16_BGRA, SCE_GXM_TEXTURE_FORMAT_F16F16F16F16_BGRA },
+        { SCE_GXM_COLOR_FORMAT_F32F32_GR, SCE_GXM_TEXTURE_FORMAT_F32F32_GR },
+        { SCE_GXM_COLOR_FORMAT_F32F32_RG, SCE_GXM_TEXTURE_FORMAT_F32F32_GR },
+        { SCE_GXM_COLOR_FORMAT_F11F11F10_RGB, SCE_GXM_TEXTURE_FORMAT_F11F11F10_RGB },
+        { SCE_GXM_COLOR_FORMAT_F10F11F11_BGR, SCE_GXM_TEXTURE_FORMAT_F10F11F11_BGR },
+        { SCE_GXM_COLOR_FORMAT_SE5M9M9M9_BGR, SCE_GXM_TEXTURE_FORMAT_SE5M9M9M9_BGR },
+        { SCE_GXM_COLOR_FORMAT_SE5M9M9M9_RGB, SCE_GXM_TEXTURE_FORMAT_SE5M9M9M9_RGB },
+        { SCE_GXM_COLOR_FORMAT_U2F10F10F10_ABGR, SCE_GXM_TEXTURE_FORMAT_U2F10F10F10_ABGR },
+        { SCE_GXM_COLOR_FORMAT_U2F10F10F10_ARGB, SCE_GXM_TEXTURE_FORMAT_U2F10F10F10_ARGB },
+        { SCE_GXM_COLOR_FORMAT_F10F10F10U2_RGBA, SCE_GXM_TEXTURE_FORMAT_F10F10F10U2_RGBA },
+        { SCE_GXM_COLOR_FORMAT_F10F10F10U2_BGRA, SCE_GXM_TEXTURE_FORMAT_F10F10F10U2_BGRA }
+    };
+
+    auto ite = COLOR_FORMAT_TO_TEXTURE_MAPPING.find(format);
+    if (ite == COLOR_FORMAT_TO_TEXTURE_MAPPING.end())
+        return false;
+
+    dest_format = static_cast<SceGxmTextureFormat>(ite->second);
+    return true;
+    }
+}

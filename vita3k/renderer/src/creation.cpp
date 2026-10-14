@@ -32,6 +32,10 @@
 #include <util/log.h>
 #include <util/tracy.h>
 
+#ifdef __APPLE__
+#include <renderer/metal3/integration.h>
+#endif
+
 namespace renderer {
 
 static void layout_ssbo_offset_from_uniform_buffer_sizes(UniformBufferSizes &sizes, UniformBufferSizes &offsets, std::size_t &total_hold) {
@@ -51,6 +55,11 @@ static void layout_ssbo_offset_from_uniform_buffer_sizes(UniformBufferSizes &siz
 }
 
 COMMAND(handle_create_context) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_handle_create_context_metal3(renderer, mem, config, helper, features, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS(handle_create_context);
     std::unique_ptr<Context> *ctx = helper.pop<std::unique_ptr<Context> *>();
     bool result = false;
@@ -86,6 +95,11 @@ COMMAND(handle_create_context) {
 }
 
 COMMAND(handle_destroy_context) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_handle_destroy_context_metal3(renderer, mem, config, helper, features, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS(handle_destroy_context);
     std::unique_ptr<Context> *ctx = helper.pop<std::unique_ptr<Context> *>();
 
@@ -97,6 +111,11 @@ COMMAND(handle_destroy_context) {
 }
 
 COMMAND(handle_create_render_target) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_handle_create_render_target_metal3(renderer, mem, config, helper, features, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS(handle_create_render_target);
     std::unique_ptr<RenderTarget> *render_target = helper.pop<std::unique_ptr<RenderTarget> *>();
     SceGxmRenderTargetParams *params = helper.pop<SceGxmRenderTargetParams *>();
@@ -132,6 +151,11 @@ COMMAND(handle_create_render_target) {
 }
 
 COMMAND(handle_destroy_render_target) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_handle_destroy_render_target_metal3(renderer, mem, config, helper, features, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS(handle_destroy_render_target);
     std::unique_ptr<RenderTarget> *render_target = helper.pop<std::unique_ptr<RenderTarget> *>();
 
@@ -154,6 +178,11 @@ COMMAND(handle_destroy_render_target) {
 }
 
 COMMAND(handle_memory_map) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_handle_memory_map_metal3(renderer, mem, config, helper, features, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS(handle_memory_map);
     const Ptr<void> addr = helper.pop<Ptr<void>>();
     const uint32_t size = helper.pop<uint32_t>();
@@ -166,6 +195,11 @@ COMMAND(handle_memory_map) {
 }
 
 COMMAND(handle_memory_unmap) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_handle_memory_unmap_metal3(renderer, mem, config, helper, features, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS(handle_memory_unmap);
 
     const Ptr<void> addr = helper.pop<Ptr<void>>();
@@ -179,6 +213,11 @@ COMMAND(handle_memory_unmap) {
 
 // Client
 bool create(std::unique_ptr<FragmentProgram> &fp, State &state, const SceGxmProgram &program, const SceGxmBlendInfo *blend, GXPPtrMap &gxp_ptr_map) {
+#ifdef __APPLE__
+    if (state.current_backend == Backend::Metal)
+        return create_metal3(fp, state, program, blend, gxp_ptr_map);
+#endif
+
     switch (state.current_backend) {
     case Backend::OpenGL:
         gl::create(fp, dynamic_cast<gl::GLState &>(state), program, blend);
@@ -206,6 +245,11 @@ bool create(std::unique_ptr<FragmentProgram> &fp, State &state, const SceGxmProg
 }
 
 bool create(std::unique_ptr<VertexProgram> &vp, State &state, const SceGxmProgram &program, GXPPtrMap &gxp_ptr_map, const std::vector<SceGxmVertexAttribute> &attributes) {
+#ifdef __APPLE__
+    if (state.current_backend == Backend::Metal)
+        return create_metal3(vp, state, program, gxp_ptr_map, attributes);
+#endif
+
     switch (state.current_backend) {
     case Backend::OpenGL:
         gl::create(vp, dynamic_cast<gl::GLState &>(state), program);
@@ -255,6 +299,11 @@ void destroy(SceGxmSyncObject *sync, State &state) {
 }
 
 bool init(FrameHost &frame, std::unique_ptr<State> &state, Backend backend, const Config &config, const Root &root_paths) {
+#ifdef __APPLE__
+    if (backend == Backend::Metal)
+        return init_metal3(frame, state, backend, config, root_paths);
+#endif
+
     switch (backend) {
     case Backend::OpenGL:
         state = std::make_unique<gl::GLState>();

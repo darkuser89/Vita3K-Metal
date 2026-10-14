@@ -152,11 +152,11 @@ public:
 
     virtual void configure_sampler(size_t index, const SceGxmTexture &texture, bool no_linear) {}
 
-    void upload_texture(const SceGxmTexture &gxm_texture, MemState &mem);
-    void cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemState &mem);
+    virtual void upload_texture(const SceGxmTexture &gxm_texture, MemState &mem);
+    virtual void cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemState &mem);
 
     // is called by cache_and_bind_texture if use_sampler_cache is set to true
-    int cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool is_depth = false);
+    virtual int cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool is_depth = false);
 
     // look at the texture folder and update the available imported / exported hashes
     void refresh_available_textures();
@@ -167,9 +167,9 @@ public:
     void export_done();
 
     // return false if there was an issue with the replacement texture
-    bool import_configure_texture();
+    virtual bool import_configure_texture();
     virtual void import_configure_impl(SceGxmTextureBaseFormat base_format, uint32_t width, uint32_t height, bool is_srgb, uint16_t nb_components, uint16_t mipcount, bool swap_rb) = 0;
-    void import_upload_texture();
+    virtual void import_upload_texture();
     void import_done();
 
     virtual ~TextureCache();

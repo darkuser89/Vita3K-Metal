@@ -17,6 +17,7 @@
 
 #include <mem/functions.h>
 #include <mem/state.h>
+#include <mem/metal3.h>
 
 #include <util/align.h>
 #include <util/log.h>
@@ -149,6 +150,9 @@ bool is_valid_addr(const MemState &state, Address addr) {
 }
 
 bool is_valid_addr_range(const MemState &state, Address start, Address end) {
+    if (state.native_metal)
+        return is_valid_addr_range_metal3(state, start, end);
+
     const uint32_t start_page = start / STANDARD_PAGE_SIZE;
     const uint32_t end_page = (end + STANDARD_PAGE_SIZE - 1) / STANDARD_PAGE_SIZE;
     return state.allocator.free_slot_count(start_page, end_page) == 0;
@@ -198,6 +202,9 @@ static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_c
 }
 
 Address alloc_aligned(MemState &state, uint32_t size, const char *name, unsigned int alignment, Address start_addr) {
+    if (state.native_metal)
+        return alloc_aligned_metal3(state, size, name, alignment, start_addr);
+
     if (alignment == 0)
         return alloc(state, size, name, start_addr);
     const std::lock_guard<std::mutex> lock(state.generation_mutex);
@@ -269,6 +276,9 @@ void protect_inner(MemState &state, Address addr, uint32_t size, const MemPerm p
 }
 
 bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcept {
+    if (state.native_metal)
+        return handle_access_violation_metal3(state, addr, write);
+
     const uintptr_t memory_addr = reinterpret_cast<uintptr_t>(state.memory.get());
     const uintptr_t fault_addr = reinterpret_cast<uintptr_t>(addr);
 
@@ -326,6 +336,9 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
 }
 
 bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPerm perm, const ProtectCallback &callback) {
+    if (state.native_metal)
+        return add_protect_metal3(state, addr, size, perm, callback);
+
     const std::lock_guard<std::mutex> lock(state.protect_mutex);
     ProtectSegmentInfo protect(size, perm);
     align_to_page(state, addr, protect.size);
@@ -367,6 +380,9 @@ bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPe
 }
 
 bool is_protecting(MemState &state, Address addr, MemPerm *perm) {
+    if (state.native_metal)
+        return is_protecting_metal3(state, addr, perm);
+
     const std::lock_guard<std::mutex> lock(state.protect_mutex);
     auto ite = state.protect_tree.lower_bound(addr);
 
@@ -483,6 +499,9 @@ Block alloc_block(MemState &mem, uint32_t size, const char *name, Address start_
 }
 
 void free(MemState &state, Address address) {
+    if (state.native_metal)
+        return free_metal3(state, address);
+
     const std::lock_guard<std::mutex> lock(state.generation_mutex);
     const uint32_t page_num = address / STANDARD_PAGE_SIZE;
     assert(page_num >= 0);

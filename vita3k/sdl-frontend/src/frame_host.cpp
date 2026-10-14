@@ -29,13 +29,14 @@
 
 namespace sdl_frontend {
 
-FrameHost::FrameHost(SDL_Window *window, SDL_GLContext *gl_context)
+FrameHost::FrameHost(SDL_Window *window, SDL_GLContext *gl_context, renderer::DisplayHandle display_handle)
     : window(window)
-    , gl_context(gl_context) {
+    , gl_context(gl_context)
+    , display_handle(std::move(display_handle)) {
 }
 
 renderer::DisplayHandle FrameHost::handle() const {
-    return {};
+    return display_handle;
 }
 
 const renderer::VulkanSurfaceProvider *FrameHost::vulkan_surface_provider() const {

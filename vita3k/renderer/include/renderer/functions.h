@@ -19,6 +19,9 @@
 
 #include <renderer/commands.h>
 #include <renderer/types.h>
+#ifdef __APPLE__
+#include <renderer/metal3/commands.h>
+#endif
 
 #include <string>
 
@@ -113,6 +116,11 @@ void destroy_command_payload(Command &cmd);
 
 template <typename... Args>
 bool add_command(Context *ctx, const CommandOpcode opcode, int *status, Args... arguments) {
+#ifdef __APPLE__
+    if (metal::is_native_context(ctx))
+        return metal::add_command_metal3(ctx, opcode, status, arguments...);
+#endif
+
     if (!ctx) {
         return false;
     }
@@ -140,6 +148,11 @@ bool add_state_set_command(Context *ctx, const GXMState state, Args... arguments
 
 template <typename... Args>
 int send_single_command(State &state, Context *ctx, const CommandOpcode opcode, bool wait, Args... arguments) {
+#ifdef __APPLE__
+    if (metal::is_native_state(state))
+        return metal::send_single_command_metal3(state, ctx, opcode, wait, arguments...);
+#endif
+
     // Make a temporary command list
     int status = CommandErrorCodePending; // Pending.
     auto cmd = make_command(ctx ? ctx->alloc_func : generic_command_allocate, ctx ? ctx->free_func : generic_command_free,

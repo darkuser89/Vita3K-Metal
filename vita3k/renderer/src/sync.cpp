@@ -32,6 +32,10 @@
 #include <renderer/functions.h>
 #include <util/tracy.h>
 
+#ifdef __APPLE__
+#include <renderer/metal3/integration.h>
+#endif
+
 namespace renderer {
 COMMAND(handle_nop) {
     TRACY_FUNC_COMMANDS(handle_nop);
@@ -75,6 +79,11 @@ COMMAND(handle_notification) {
 }
 
 COMMAND(handle_set_screen_filter) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_handle_set_screen_filter_metal3(renderer, mem, config, helper, features, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS(handle_set_screen_filter);
     std::unique_ptr<std::string> filter(helper.pop<std::string *>());
 
@@ -90,6 +99,11 @@ COMMAND(handle_set_screen_filter) {
 }
 
 COMMAND(new_frame) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_new_frame_metal3(renderer, mem, config, helper, features, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS(new_frame);
     DisplayFrameInfo *next_frame = helper.pop<DisplayFrameInfo *>();
     DisplayState *display = helper.pop<DisplayState *>();
@@ -178,6 +192,11 @@ void subject_done(SceGxmSyncObject *sync_object, const uint32_t timestamp) {
 }
 
 void submit_command_list(State &state, renderer::Context *context, CommandList &command_list) {
+#ifdef __APPLE__
+    if (state.current_backend == Backend::Metal)
+        return submit_command_list_metal3(state, context, command_list);
+#endif
+
     command_list.context = context;
     state.command_buffer_queue.push(std::move(command_list));
 }

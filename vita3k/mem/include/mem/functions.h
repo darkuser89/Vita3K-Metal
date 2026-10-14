@@ -54,6 +54,10 @@ Address alloc_aligned(MemState &state, uint32_t size, const char *name, unsigned
 void protect_inner(MemState &state, Address addr, uint32_t size, const MemPerm perm);
 void unprotect_inner(MemState &state, Address addr, uint32_t size);
 bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPerm perm, const ProtectCallback &callback);
+// Opt-in write observation for Metal surface ownership. Host-page-aligned
+// arena ranges survive merged read faults; a write consumes them like
+// add_protect. External page-table mappings are not supported by this API.
+bool add_write_watch(MemState &state, Address addr, uint32_t size, const ProtectCallback &callback);
 void open_access_parent_protect_segment(MemState &state, Address addr);
 void close_access_parent_protect_segment(MemState &state, Address addr);
 void add_external_mapping(MemState &mem, Address addr, uint32_t size, uint8_t *addr_ptr);
@@ -62,6 +66,9 @@ bool is_protecting(MemState &state, Address addr, MemPerm *perm = nullptr);
 bool is_valid_addr(const MemState &state, Address addr);
 bool is_valid_addr_range(const MemState &state, Address start, Address end);
 bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcept;
+// Opt-in host transfer path for write-watch-only segments of a validated arena
+// range. Legacy/guest fault handlers and external mappings keep fault handling.
+bool prepare_host_write(MemState &state, Address address, size_t size);
 Block alloc_block(MemState &mem, uint32_t size, const char *name, Address start_addr = user_main_memory_start);
 Address alloc_at(MemState &state, Address address, uint32_t size, const char *name);
 Address try_alloc_at(MemState &state, Address address, uint32_t size, const char *name);

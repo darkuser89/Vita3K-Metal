@@ -84,13 +84,16 @@ enum class CommandOpcode : std::uint8_t {
     NewFrame,
 
     DestroyRenderTarget,
-    DestroyContext
+    DestroyContext,
+    SyncGuestRange
 };
 
 enum CommandErrorCode {
     CommandErrorCodeNone = 0,
     CommandErrorCodePending = -1,
-    CommandErrorArgumentsTooLarge = -2
+    CommandErrorArgumentsTooLarge = -2,
+    CommandErrorMemoryMapFailed = -3,
+    CommandErrorSurfaceSyncFailed = -4
 };
 
 constexpr std::size_t MAX_COMMAND_DATA_SIZE = 0x20;
@@ -98,7 +101,10 @@ constexpr std::size_t MAX_COMMAND_DATA_SIZE = 0x20;
 struct Command {
     enum {
         FLAG_FROM_HOST = 1 << 0,
-        FLAG_NO_FREE = 1 << 1
+        FLAG_NO_FREE = 1 << 1,
+        FLAG_METAL_PROGRAM_BINDING = 1 << 2,
+        FLAG_METAL_STATUS_OWNER = 1 << 3,
+        FLAG_METAL_RAW_PAYLOAD = 1 << 4
     };
 
     CommandOpcode opcode;

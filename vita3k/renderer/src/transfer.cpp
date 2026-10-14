@@ -34,6 +34,10 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#ifdef __APPLE__
+#include <renderer/metal3/integration.h>
+#endif
+
 namespace renderer {
 
 template <typename T, SceGxmTransferColorKeyMode mode, SceGxmTransferType src_type, SceGxmTransferType dst_type>
@@ -132,6 +136,11 @@ static void perform_transfer_copy_mode(MemState &mem, const SceGxmTransferImage 
 }
 
 COMMAND(handle_transfer_copy) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_handle_transfer_copy_metal3(renderer, mem, config, helper, features, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS(handle_transfer_copy);
     const uint32_t colorKeyValue = helper.pop<uint32_t>();
     const uint32_t colorKeyMask = helper.pop<uint32_t>();
@@ -194,6 +203,11 @@ COMMAND(handle_transfer_copy) {
 }
 
 COMMAND(handle_transfer_downscale) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_handle_transfer_downscale_metal3(renderer, mem, config, helper, features, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS(handle_transfer_downscale);
     SceGxmTransferImage *src = helper.pop<SceGxmTransferImage *>();
     SceGxmTransferImage *dst = helper.pop<SceGxmTransferImage *>();
@@ -286,6 +300,11 @@ COMMAND(handle_transfer_downscale) {
 }
 
 COMMAND(handle_transfer_fill) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_handle_transfer_fill_metal3(renderer, mem, config, helper, features, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS(handle_transfer_fill);
     const uint32_t fill_color = helper.pop<uint32_t>();
     const SceGxmTransferImage *dest = helper.pop<SceGxmTransferImage *>();

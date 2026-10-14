@@ -26,6 +26,7 @@
 #include <emuenv/state.h>
 #include <gui-qt/gui_language.h>
 #include <gui-qt/gui_settings.h>
+#include <gui-qt/metal_filters.h>
 #include <gui-qt/qt_utils.h>
 #include <gui-qt/settings_dialog.h>
 #include <gui-qt/settings_dialog_tooltips.h>
@@ -291,11 +292,14 @@ void SettingsDialog::load_config() {
 
     m_ui->backend_renderer_box->clear();
 #ifndef __APPLE__
-    m_ui->backend_renderer_box->addItem(QStringLiteral("OpenGL"));
+    m_ui->backend_renderer_box->addItem(QStringLiteral("OpenGL"), QStringLiteral("OpenGL"));
 #endif
-    m_ui->backend_renderer_box->addItem(QStringLiteral("Vulkan"));
+    m_ui->backend_renderer_box->addItem(QStringLiteral("Vulkan"), QStringLiteral("Vulkan"));
+#ifdef __APPLE__
+    m_ui->backend_renderer_box->addItem(QStringLiteral("Metal 3"), QStringLiteral("Metal"));
+#endif
     {
-        const int idx = m_ui->backend_renderer_box->findText(
+        const int idx = m_ui->backend_renderer_box->findData(
             QString::fromStdString(m_config.backend_renderer));
         if (idx >= 0)
             m_ui->backend_renderer_box->setCurrentIndex(idx);
@@ -608,7 +612,7 @@ void SettingsDialog::build_desired_config(Config &desired) const {
     }
 
     current.cpu_opt = m_ui->cpu_opt->isChecked();
-    current.backend_renderer = m_ui->backend_renderer_box->currentText().toStdString();
+    current.backend_renderer = m_ui->backend_renderer_box->currentData().toString().toStdString();
     current.high_accuracy = m_ui->renderer_accuracy_box->currentIndex() == 1;
     current.v_sync = m_ui->vsync->isChecked();
     current.disable_surface_sync = m_ui->disable_surface_sync->isChecked();
@@ -1455,15 +1459,16 @@ void SettingsDialog::setup_dirty_tracking() {
 }
 
 void SettingsDialog::update_gpu_visibility() {
-    const bool is_vulkan = m_ui->backend_renderer_box->currentText() == QStringLiteral("Vulkan");
+    const bool is_vulkan = m_ui->backend_renderer_box->currentData().toString() == QStringLiteral("Vulkan");
+    const bool is_metal = m_ui->backend_renderer_box->currentData().toString() == QStringLiteral("Metal");
 
     const int gpu_idx = m_ui->gpu_device_box->currentIndex();
     const int mask = app::get_supported_memory_mapping_mask(emuenv, gpu_idx);
     const bool has_mapping = is_vulkan && (mask > 1);
 
-    // Vulkan-only widgets
+    // Renderer accuracy is supported by Vulkan and native Metal.
     m_ui->gb_gpu_device->setVisible(is_vulkan);
-    m_ui->gb_renderer_accuracy->setVisible(is_vulkan);
+    m_ui->gb_renderer_accuracy->setVisible(is_vulkan || is_metal);
     m_ui->gb_vulkan_options->setVisible(is_vulkan);
     m_ui->spirv_shader->setVisible(is_vulkan);
 
@@ -1471,7 +1476,7 @@ void SettingsDialog::update_gpu_visibility() {
     m_ui->memory_mapping_box->setVisible(has_mapping);
 
     // OpenGL-only widgets
-    m_ui->gb_opengl_options->setVisible(!is_vulkan);
+    m_ui->gb_opengl_options->setVisible(!is_vulkan && !is_metal);
 
     {
         const QString previous = m_ui->screen_filter_box->currentText().isEmpty()
@@ -1479,7 +1484,9 @@ void SettingsDialog::update_gpu_visibility() {
             : m_ui->screen_filter_box->currentText();
 
         m_ui->screen_filter_box->clear();
-        if (is_vulkan) {
+        if (is_metal) {
+            m_ui->screen_filter_box->addItems(gui::metal_screen_filters());
+        } else if (is_vulkan) {
             m_ui->screen_filter_box->addItems({ QStringLiteral("Nearest"), QStringLiteral("Bilinear"),
                 QStringLiteral("Bicubic"), QStringLiteral("FXAA"), QStringLiteral("FSR") });
         } else {
