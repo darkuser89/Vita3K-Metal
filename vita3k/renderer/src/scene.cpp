@@ -38,8 +38,17 @@
 #include <stb_image_write.h>
 #endif
 
+#ifdef __APPLE__
+#include <renderer/metal3/integration.h>
+#endif
+
 namespace renderer {
 void destroy_command_payload(Command &cmd) {
+#ifdef __APPLE__
+    if (cmd.flags & (Command::FLAG_METAL_PROGRAM_BINDING | Command::FLAG_METAL_RAW_PAYLOAD))
+        return destroy_command_payload_metal3(cmd);
+#endif
+
     switch (cmd.opcode) {
     case CommandOpcode::SetContext: {
         auto *color_surface = reinterpret_cast<SceGxmColorSurface **>(&cmd.data[sizeof(RenderTarget *)]);
@@ -55,6 +64,11 @@ void destroy_command_payload(Command &cmd) {
 }
 
 COMMAND(handle_set_context) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_handle_set_context_metal3(renderer, mem, config, helper, features, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS(handle_set_context);
     RenderTarget *rt = helper.pop<RenderTarget *>();
     const SceGxmColorSurface *color_surface = helper.pop<SceGxmColorSurface *>();
@@ -94,6 +108,11 @@ COMMAND(handle_set_context) {
 }
 
 COMMAND(handle_sync_surface_data) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_handle_sync_surface_data_metal3(renderer, mem, config, helper, features, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS(handle_sync_surface_data);
 
     const SceGxmNotification vertex_notification = helper.pop<SceGxmNotification>();
@@ -204,6 +223,11 @@ COMMAND(handle_sync_surface_data) {
 }
 
 COMMAND(handle_mid_scene_flush) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_handle_mid_scene_flush_metal3(renderer, mem, config, helper, features, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS(handle_mid_scene_flush);
 
     if (!renderer.features.enable_memory_mapping) {
@@ -219,6 +243,11 @@ COMMAND(handle_mid_scene_flush) {
 }
 
 COMMAND(handle_draw) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_handle_draw_metal3(renderer, mem, config, helper, features, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS(handle_draw);
     SceGxmPrimitiveType type = helper.pop<SceGxmPrimitiveType>();
     SceGxmIndexFormat format = helper.pop<SceGxmIndexFormat>();

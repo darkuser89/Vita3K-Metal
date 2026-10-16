@@ -19,6 +19,10 @@
 
 #include <codec/state.h>
 #include <codec/types.h>
+#include <renderer/functions.h>
+#include <renderer/state.h>
+
+#include <limits>
 
 #include <util/tracy.h>
 TRACY_MODULE_NAME(SceJpegEncUser);
@@ -51,6 +55,9 @@ static int sceJpegEncoderInitImpl(SceJpegEncoderContext *context, int32_t inWidt
 
 EXPORT(int, sceJpegEncoderCsc, SceJpegEncoderContext *context, Ptr<uint8_t> outBuffer, Ptr<uint8_t> inBuffer, int32_t inPitch, int32_t inPixelFormat) {
     TRACY_FUNC(sceJpegEncoderCsc, context, outBuffer, inBuffer, inPitch, inPixelFormat);
+    const bool sync_metal = emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal;
+    if (sync_metal && (!context || !inBuffer.valid(emuenv.mem) || !outBuffer.valid(emuenv.mem)))
+        return RET_ERROR(SCE_JPEGENC_ERROR_INVALID_POINTER);
     auto inBufferData = inBuffer.get(emuenv.mem);
     auto outBufferData = outBuffer.get(emuenv.mem);
 
@@ -79,6 +86,24 @@ EXPORT(int, sceJpegEncoderCsc, SceJpegEncoderContext *context, Ptr<uint8_t> outB
         return SCE_JPEGENC_ERROR_INVALID_PIXELFORMAT;
     }
 
+    if (sync_metal) {
+        if (context->inWidth <= 0 || context->inHeight <= 0 || inPitch < context->inWidth
+            || inPitch > std::numeric_limits<int32_t>::max() / 4)
+            return RET_ERROR(SCE_JPEGENC_ERROR_IMAGE_SIZE);
+        // The converter's pitch is in RGBA pixels. Include every accessed row,
+        // but do not require padding after the final row to be allocated.
+        const uint64_t bytes = uint64_t(inPitch) * 4 * uint32_t(context->inHeight - 1)
+            + uint64_t(context->inWidth) * 4;
+        const uint64_t end = uint64_t(inBuffer.address()) + bytes;
+        if (end > uint64_t(UINT32_MAX) - 4095
+            || !is_valid_addr_range(emuenv.mem, inBuffer.address(), Address(end)))
+            return RET_ERROR(SCE_JPEGENC_ERROR_INVALID_POINTER);
+        const int synced = renderer::sync_guest_range(*emuenv.renderer, inBuffer.address(), uint32_t(bytes));
+        if (synced < 0) {
+            LOG_ERROR("Metal: JPEG input synchronization failed ({})", synced);
+            return synced;
+        }
+    }
     convert_rgb_to_yuv(inBufferData, outBufferData, context->inWidth, context->inHeight, color_space, is_bgra, inPitch);
 
     return 0;

@@ -171,7 +171,8 @@ static void set_backend_renderer(EmuEnvState &emuenv, const std::string &backend
         ? renderer::Backend::OpenGL
         : renderer::Backend::Vulkan;
 #else
-    emuenv.backend_renderer = renderer::Backend::Vulkan;
+    emuenv.backend_renderer = string_utils::toupper(backend_renderer) == "METAL"
+        ? renderer::Backend::Metal : renderer::Backend::Vulkan;
 #endif
 }
 
@@ -556,6 +557,7 @@ void reset_app_state(EmuEnvState &state) {
 bool late_init(EmuEnvState &state) {
     // note: mem is not initialized yet but that's not an issue
     // the renderer is not using it yet, just storing it for later uses
+    state.mem.native_metal = state.renderer->current_backend == renderer::Backend::Metal;
     state.renderer->late_init(state.cfg, state.app_path, state.mem);
 
     const bool need_page_table = state.renderer->mapping_method == MappingMethod::PageTable || state.renderer->mapping_method == MappingMethod::NativeBuffer;

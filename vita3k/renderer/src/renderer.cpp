@@ -34,6 +34,10 @@
 #include <gxm/functions.h>
 #include <util/log.h>
 
+#ifdef __APPLE__
+#include <renderer/metal3/integration.h>
+#endif
+
 namespace renderer {
 
 // The higher on this list the higher the priority of input
@@ -211,6 +215,11 @@ void set_stencil_ref(State &state, Context *ctx, bool is_front, unsigned char sr
 }
 
 void set_program(State &state, Context *ctx, Ptr<const void> program, const bool is_fragment) {
+#ifdef __APPLE__
+    if (state.current_backend == Backend::Metal)
+        return set_program_metal3(state, ctx, program, is_fragment, {});
+#endif
+
     renderer::add_state_set_command(ctx, renderer::GXMState::Program, program, is_fragment);
 }
 
@@ -244,10 +253,20 @@ void set_side_fragment_program_enable(State &state, Context *ctx, const bool is_
 }
 
 void set_context(State &state, Context *ctx, RenderTarget *target, SceGxmColorSurface *color_surface, SceGxmDepthStencilSurface *depth_stencil_surface) {
+#ifdef __APPLE__
+    if (state.current_backend == Backend::Metal)
+        return set_context_metal3(state, ctx, target, color_surface, depth_stencil_surface);
+#endif
+
     renderer::add_command(ctx, renderer::CommandOpcode::SetContext, nullptr, target, color_surface, depth_stencil_surface);
 }
 
 void set_vertex_stream(State &state, Context *ctx, const std::size_t index, const std::size_t data_len, const Ptr<const void> stream) {
+#ifdef __APPLE__
+    if (state.current_backend == Backend::Metal)
+        return set_vertex_stream_metal3(state, ctx, index, data_len, stream);
+#endif
+
     renderer::add_state_set_command(ctx, renderer::GXMState::VertexStream, stream, index, data_len);
 }
 
@@ -280,6 +299,11 @@ void destroy_context(State &state, std::unique_ptr<Context> &context) {
 }
 
 void destroy_context_during_shutdown(State &state, std::unique_ptr<Context> &context) {
+#ifdef __APPLE__
+    if (state.current_backend == Backend::Metal)
+        return destroy_context_during_shutdown_metal3(state, context);
+#endif
+
     assert(!state.render_thread);
 
     if (state.current_backend == Backend::OpenGL) {
@@ -302,6 +326,11 @@ void destroy_render_target(State &state, std::unique_ptr<RenderTarget> &rt) {
 }
 
 void destroy_render_target_during_shutdown(State &state, std::unique_ptr<RenderTarget> &rt) {
+#ifdef __APPLE__
+    if (state.current_backend == Backend::Metal)
+        return destroy_render_target_during_shutdown_metal3(state, rt);
+#endif
+
     assert(!state.render_thread);
     if (!rt)
         return;
@@ -320,6 +349,11 @@ void destroy_render_target_during_shutdown(State &state, std::unique_ptr<RenderT
 }
 
 void set_uniform_buffer(State &state, Context *ctx, const bool is_vertex_uniform, const int block_number, const std::uint16_t block_size, const Ptr<const void> buffer) {
+#ifdef __APPLE__
+    if (state.current_backend == Backend::Metal)
+        return set_uniform_buffer_metal3(state, ctx, is_vertex_uniform, block_number, block_size, buffer);
+#endif
+
     // Calculate the number of bytes
     std::uint32_t bytes_to_copy_and_pad = ((block_size + 15) / 16) * 16;
 

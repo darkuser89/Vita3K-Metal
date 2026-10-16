@@ -33,10 +33,14 @@
 #include <util/string_utils.h>
 
 #include <SDL3/SDL.h>
+#ifdef __APPLE__
+#include <SDL3/SDL_metal.h>
+#endif
 
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <utility>
 
 namespace sdl_frontend {
 
@@ -156,6 +160,9 @@ int run(EmuEnvState &emuenv, app::AppSessionController &session, AppLaunchReques
 
         SDL_Window *window = nullptr;
         SDL_GLContext gl_context = nullptr;
+#ifdef __APPLE__
+        SDL_MetalView metal_view = nullptr;
+#endif
         FrameHost frame_host(nullptr, &gl_context);
         std::optional<AppLaunchRequest> pending_launch_request;
 
@@ -167,6 +174,13 @@ int run(EmuEnvState &emuenv, app::AppSessionController &session, AppLaunchReques
 
             if (hooks.on_window)
                 hooks.on_window(nullptr);
+#ifdef __APPLE__
+            // Stop the renderer before releasing the view and its drawable layer.
+            if (metal_view) {
+                SDL_Metal_DestroyView(metal_view);
+                metal_view = nullptr;
+            }
+#endif
             if (window) {
                 SDL_DestroyWindow(window);
                 window = nullptr;
@@ -211,6 +225,10 @@ int run(EmuEnvState &emuenv, app::AppSessionController &session, AppLaunchReques
             }
         } else if (emuenv.backend_renderer == renderer::Backend::Vulkan) {
             window_flags |= SDL_WINDOW_VULKAN;
+#ifdef __APPLE__
+        } else if (emuenv.backend_renderer == renderer::Backend::Metal) {
+            window_flags |= SDL_WINDOW_METAL;
+#endif
         }
 
         SDL_PropertiesID window_props = SDL_CreateProperties();
@@ -238,7 +256,20 @@ int run(EmuEnvState &emuenv, app::AppSessionController &session, AppLaunchReques
         }
         if (hooks.on_window)
             hooks.on_window(window);
-        frame_host = FrameHost(window, &gl_context);
+        renderer::DisplayHandle display_handle;
+#ifdef __APPLE__
+        if (emuenv.backend_renderer == renderer::Backend::Metal) {
+            metal_view = SDL_Metal_CreateView(window);
+            if (!metal_view) {
+                LOG_ERROR("Failed to create Metal view: {}", SDL_GetError());
+                exit_code = -1;
+                cleanup_launch(app::AppSessionStopReason::LaunchFailure);
+                break;
+            }
+            display_handle = renderer::MacOSDisplayHandle{ metal_view };
+        }
+#endif
+        frame_host = FrameHost(window, &gl_context, std::move(display_handle));
 
         if (emuenv.backend_renderer == renderer::Backend::OpenGL) {
             gl_context = SDL_GL_CreateContext(window);

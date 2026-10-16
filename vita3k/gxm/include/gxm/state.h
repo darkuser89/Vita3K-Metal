@@ -22,6 +22,7 @@
 #include <threads/queue.h>
 
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -54,7 +55,10 @@ struct MemoryMapInfo {
     std::uint32_t perm;
 };
 
+namespace gxm::metal3 { struct Bookkeeping; }
+
 struct GxmState {
+    std::shared_ptr<gxm::metal3::Bookkeeping> metal_state;
     SceGxmInitializeParams params;
 
     Queue<DisplayCallback> display_queue;
@@ -98,5 +102,6 @@ struct GxmState {
         last_immediate_context = 0;
         deferred_contexts.clear();
         render_targets.clear();
+        metal_state.reset();
     }
 };

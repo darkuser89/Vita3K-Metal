@@ -34,6 +34,7 @@
 #include <gui-qt/live_area_widget.h>
 #include <gui-qt/log_widget.h>
 #include <gui-qt/main_window.h>
+#include <gui-qt/metal_filters.h>
 #include <gui-qt/persistent_settings.h>
 #include <gui-qt/pkg_install_dialog.h>
 #include <gui-qt/qt_utils.h>
@@ -1799,7 +1800,11 @@ void MainWindow::setup_status_bar() {
         Config desired;
         copy_config_for_edit(desired, emuenv.cfg);
         auto &cc = desired.current_config;
+#ifdef __APPLE__
+        cc.backend_renderer = (cc.backend_renderer == "Vulkan") ? "Metal" : "Vulkan";
+#else
         cc.backend_renderer = (cc.backend_renderer == "Vulkan") ? "OpenGL" : "Vulkan";
+#endif
         desired.backend_renderer = cc.backend_renderer;
         save_config(desired);
         update_renderer_button();
@@ -1810,6 +1815,9 @@ void MainWindow::setup_status_bar() {
         QMenu menu(this);
         auto *vulkan_action = menu.addAction(QStringLiteral("Vulkan"));
         auto *opengl_action = menu.addAction(QStringLiteral("OpenGL"));
+#ifdef __APPLE__
+        auto *metal_action = menu.addAction(QStringLiteral("Metal 3"));
+#endif
         QAction *chosen = menu.exec(m_renderer_button->mapToGlobal(pos));
         if (!chosen)
             return;
@@ -1820,6 +1828,10 @@ void MainWindow::setup_status_bar() {
             cc.backend_renderer = "Vulkan";
         } else if (chosen == opengl_action) {
             cc.backend_renderer = "OpenGL";
+#ifdef __APPLE__
+        } else if (chosen == metal_action) {
+            cc.backend_renderer = "Metal";
+#endif
         }
         desired.backend_renderer = cc.backend_renderer;
         save_config(desired);
@@ -1857,6 +1869,8 @@ void MainWindow::setup_status_bar() {
     sb->addWidget(m_accuracy_button);
 
     auto get_filter_names = [this]() -> QStringList {
+        if (emuenv.cfg.current_config.backend_renderer == "Metal")
+            return gui::metal_screen_filters();
         if (emuenv.cfg.current_config.backend_renderer == "Vulkan")
             return { QStringLiteral("Nearest"), QStringLiteral("Bilinear"),
                 QStringLiteral("Bicubic"), QStringLiteral("FXAA"), QStringLiteral("FSR") };
@@ -2014,6 +2028,9 @@ void MainWindow::update_renderer_button() {
     if (renderer == "Vulkan") {
         m_renderer_button->setText(QStringLiteral("VULKAN"));
         update_status_button_accent(m_renderer_button, QStringLiteral("renderer_vulkan"));
+    } else if (renderer == "Metal") {
+        m_renderer_button->setText(QStringLiteral("Metal 3"));
+        update_status_button_accent(m_renderer_button, QStringLiteral("neutral"));
     } else {
         m_renderer_button->setText(QStringLiteral("OPENGL"));
         update_status_button_accent(m_renderer_button, QStringLiteral("renderer_opengl"));
@@ -2022,8 +2039,8 @@ void MainWindow::update_renderer_button() {
 
 void MainWindow::update_accuracy_button() {
     const bool high = emuenv.cfg.current_config.high_accuracy;
-    const bool is_vulkan = emuenv.cfg.current_config.backend_renderer == "Vulkan";
-    m_accuracy_button->setVisible(is_vulkan);
+    const auto &renderer = emuenv.cfg.current_config.backend_renderer;
+    m_accuracy_button->setVisible(renderer == "Vulkan" || renderer == "Metal");
     if (high) {
         m_accuracy_button->setText(tr("HIGH"));
         update_status_button_accent(m_accuracy_button, QStringLiteral("high"));
@@ -2035,7 +2052,9 @@ void MainWindow::update_accuracy_button() {
 
 void MainWindow::update_screen_filter_button() {
     auto &cc = emuenv.cfg.current_config;
-    const QStringList valid = (cc.backend_renderer == "Vulkan")
+    const QStringList valid = (cc.backend_renderer == "Metal")
+        ? gui::metal_screen_filters()
+        : (cc.backend_renderer == "Vulkan")
         ? QStringList{ QStringLiteral("Nearest"), QStringLiteral("Bilinear"),
               QStringLiteral("Bicubic"), QStringLiteral("FXAA"), QStringLiteral("FSR") }
         : QStringList{ QStringLiteral("Nearest"), QStringLiteral("Bilinear"),

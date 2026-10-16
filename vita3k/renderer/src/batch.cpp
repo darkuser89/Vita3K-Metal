@@ -39,12 +39,21 @@
 
 struct FeatureState;
 
+#ifdef __APPLE__
+#include <renderer/metal3/integration.h>
+#endif
+
 namespace renderer {
 Command *generic_command_allocate() {
     return new Command;
 }
 
 void generic_command_free(Command *cmd) {
+#ifdef __APPLE__
+    if (cmd->flags & (Command::FLAG_METAL_PROGRAM_BINDING | Command::FLAG_METAL_STATUS_OWNER | Command::FLAG_METAL_RAW_PAYLOAD))
+        return generic_command_free_metal3(cmd);
+#endif
+
     delete cmd;
 }
 
@@ -76,6 +85,11 @@ static renderer::SyncWaitResult wait_cmd(MemState &mem, CommandList &command_lis
 }
 
 static void process_batch(renderer::State &state, const FeatureState &features, MemState &mem, Config &config, CommandList &command_list) {
+#ifdef __APPLE__
+    if (state.current_backend == Backend::Metal)
+        return process_batch_metal3(state, features, mem, config, command_list);
+#endif
+
     using CommandHandlerFunc = decltype(cmd_handle_set_context);
 
     const static std::map<CommandOpcode, CommandHandlerFunc *> handlers = {
@@ -132,6 +146,11 @@ static void process_batch(renderer::State &state, const FeatureState &features, 
 }
 
 void process_batches(renderer::State &state, const FeatureState &features, MemState &mem, Config &config, int64_t max_wait_ms) {
+#ifdef __APPLE__
+    if (state.current_backend == Backend::Metal)
+        return process_batches_metal3(state, features, mem, config, max_wait_ms);
+#endif
+
     auto max_time = duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() + max_wait_ms;
 
     while (!state.should_display) {
@@ -185,6 +204,11 @@ void reset_command_list(CommandList &command_list) {
 }
 
 static void render_loop(renderer::State &state, DisplayState &display, GxmState &gxm, MemState &mem, Config &config) {
+#ifdef __APPLE__
+    if (state.current_backend == Backend::Metal)
+        return render_loop_metal3(state, display, gxm, mem, config);
+#endif
+
     if (state.precompile_requested) {
         auto progress_overlay = state.overlay_manager
             ? state.overlay_manager->create<overlay::shader_precompile_progress>()
@@ -292,6 +316,11 @@ void start_render_thread(State &state, DisplayState &display, GxmState &gxm, Mem
 }
 
 void stop_render_thread(State &state) {
+#ifdef __APPLE__
+    if (state.current_backend == Backend::Metal)
+        return stop_render_thread_metal3(state);
+#endif
+
     state.render_abort = true;
     state.command_buffer_queue.abort();
     if (state.render_thread && state.render_thread->joinable())

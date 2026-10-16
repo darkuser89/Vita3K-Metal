@@ -25,14 +25,14 @@ jobs:
       matrix:
         include:
           - platform: linux-x64
-            runs_on: ubuntu-26.04
+            runs_on: ubuntu-latest
             arch: x86_64
             cmake_preset: ci-linux-clang-appimage
             cache_path: ''
             qt_install_deps: 'true'
 
           - platform: linux-arm64
-            runs_on: ubuntu-26.04-arm
+            runs_on: ubuntu-24.04-arm
             arch: aarch64
             cmake_preset: ci-linux-clang-appimage
             cache_path: ''
@@ -272,7 +272,7 @@ jobs:
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           bash ./.ci/setup-android.sh
 
-      - uses: hendrikmuhs/ccache-action@v1.2.24
+      - uses: hendrikmuhs/ccache-action@v1.2.23
 
       - name: Decode Android keystore
         env:

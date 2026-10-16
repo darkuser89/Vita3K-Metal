@@ -27,6 +27,7 @@
 #include <array>
 #include <bitset>
 #include <map>
+#include <memory>
 #include <vector>
 
 static constexpr auto DEFAULT_RES_WIDTH = 960;
@@ -37,6 +38,7 @@ struct SceGxmProgram;
 using UniformBufferSizes = std::array<std::uint32_t, 15>;
 
 namespace renderer {
+namespace metal { struct ProgramBinding; }
 
 // State types
 typedef std::map<Sha256Hash, const SceGxmProgram *> GXPPtrMap;
@@ -48,7 +50,8 @@ struct UniformSetRequest {
 
 enum class Backend : uint32_t {
     OpenGL,
-    Vulkan
+    Vulkan,
+    Metal
 };
 
 enum class GXMState : std::uint16_t {
@@ -70,7 +73,10 @@ enum class GXMState : std::uint16_t {
     FragmentProgramEnable,
     VisibilityBuffer,
     VisibilityIndex,
-    TotalState
+    TotalState,
+    YuvProfile,
+    VisibilityBackIndex,
+    MetalTotalState
 };
 
 struct RenderTarget;
@@ -178,6 +184,9 @@ struct Context {
 typedef std::bitset<SCE_GXM_MAX_TEXTURE_UNITS> TextureInfo;
 
 struct ShaderProgram {
+    // Populated only by Metal. The queued binding owns independent metadata
+    // and GXP bytes, so guest program destruction cannot invalidate a draw.
+    std::shared_ptr<const metal::ProgramBinding> metal_binding;
     Sha256Hash hash;
     UniformBufferSizes uniform_buffer_sizes; // Size of the buffer in 4-bytes unit
     UniformBufferSizes uniform_buffer_data_offsets; // Offset of the buffer in 4-bytes unit

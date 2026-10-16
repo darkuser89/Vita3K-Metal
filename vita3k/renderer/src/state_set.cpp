@@ -35,8 +35,17 @@
 
 #include <config/state.h>
 
+#ifdef __APPLE__
+#include <renderer/metal3/integration.h>
+#endif
+
 namespace renderer {
 COMMAND_SET_STATE(region_clip) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_region_clip_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(region_clip);
     render_context->record.region_clip_mode = helper.pop<SceGxmRegionClipMode>();
 
@@ -76,6 +85,11 @@ COMMAND_SET_STATE(region_clip) {
 }
 
 COMMAND_SET_STATE(program) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_program_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(program);
     const Ptr<void> program = helper.pop<Ptr<void>>();
     const bool is_fragment = helper.pop<bool>();
@@ -110,6 +124,11 @@ COMMAND_SET_STATE(program) {
 }
 
 COMMAND_SET_STATE(uniform_buffer) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_uniform_buffer_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(uniform_buffer);
     const Ptr<uint8_t> data = helper.pop<const Ptr<uint8_t>>();
     const bool is_vertex = helper.pop<bool>();
@@ -143,6 +162,11 @@ COMMAND_SET_STATE(uniform_buffer) {
 }
 
 COMMAND_SET_STATE(viewport) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_viewport_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(viewport);
     const bool flat = helper.pop<bool>();
     render_context->record.viewport_flat = flat;
@@ -233,6 +257,11 @@ COMMAND_SET_STATE(viewport) {
 }
 
 COMMAND_SET_STATE(depth_bias) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_depth_bias_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(depth_bias);
     const bool is_front = helper.pop<bool>();
     const int factor = helper.pop<int>();
@@ -259,6 +288,11 @@ COMMAND_SET_STATE(depth_bias) {
 }
 
 COMMAND_SET_STATE(depth_func) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_depth_func_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(depth_func);
     const bool is_front = helper.pop<bool>();
     const SceGxmDepthFunc depth_func = helper.pop<SceGxmDepthFunc>();
@@ -285,6 +319,11 @@ COMMAND_SET_STATE(depth_func) {
 }
 
 COMMAND_SET_STATE(depth_write_enable) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_depth_write_enable_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(depth_write_enable);
     const bool is_front = helper.pop<bool>();
     const SceGxmDepthWriteMode mode = helper.pop<SceGxmDepthWriteMode>();
@@ -310,6 +349,11 @@ COMMAND_SET_STATE(depth_write_enable) {
 }
 
 COMMAND_SET_STATE(polygon_mode) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_polygon_mode_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(polygon_mode);
     const bool is_front = helper.pop<bool>();
     const SceGxmPolygonMode mode = helper.pop<SceGxmPolygonMode>();
@@ -334,6 +378,11 @@ COMMAND_SET_STATE(polygon_mode) {
 }
 
 COMMAND_SET_STATE(point_line_width) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_point_line_width_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(point_line_width);
     const bool is_front = helper.pop<bool>();
     const std::uint32_t width = helper.pop<std::uint32_t>();
@@ -356,6 +405,11 @@ COMMAND_SET_STATE(point_line_width) {
 }
 
 COMMAND_SET_STATE(stencil_func) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_stencil_func_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(stencil_func);
     // Is this the pain that driver guys have to suffer?
     const bool is_front = helper.pop<bool>();
@@ -397,6 +451,11 @@ COMMAND_SET_STATE(stencil_func) {
 }
 
 COMMAND_SET_STATE(stencil_ref) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_stencil_ref_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(stencil_ref);
     const bool is_front = helper.pop<bool>();
     const uint8_t sref = helper.pop<const unsigned char>();
@@ -422,6 +481,11 @@ COMMAND_SET_STATE(stencil_ref) {
 }
 
 COMMAND_SET_STATE(texture) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_texture_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(texture);
     const std::uint32_t texture_index = helper.pop<std::uint32_t>();
     SceGxmTexture texture = helper.pop<SceGxmTexture>();
@@ -444,6 +508,11 @@ COMMAND_SET_STATE(texture) {
 }
 
 COMMAND_SET_STATE(two_sided) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_two_sided_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(two_sided);
     const SceGxmTwoSidedMode two_sided = helper.pop<SceGxmTwoSidedMode>();
     render_context->record.two_sided = two_sided;
@@ -467,6 +536,11 @@ COMMAND_SET_STATE(two_sided) {
 }
 
 COMMAND_SET_STATE(cull_mode) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_cull_mode_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(cull_mode);
     render_context->record.cull_mode = helper.pop<SceGxmCullMode>();
 
@@ -486,6 +560,11 @@ COMMAND_SET_STATE(cull_mode) {
 }
 
 COMMAND_SET_STATE(vertex_stream) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_vertex_stream_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(vertex_stream);
     const Ptr<const uint8_t> stream_data = helper.pop<Ptr<const uint8_t>>();
     const std::size_t stream_index = helper.pop<std::size_t>();
@@ -512,6 +591,11 @@ COMMAND_SET_STATE(fragment_program_enable) {
 }
 
 COMMAND_SET_STATE(visibility_buffer) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_visibility_buffer_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(visibility_buffer);
     const Ptr<uint32_t> buffer = helper.pop<Ptr<uint32_t>>();
     const uint32_t stride = helper.pop<uint32_t>();
@@ -522,6 +606,11 @@ COMMAND_SET_STATE(visibility_buffer) {
 }
 
 COMMAND_SET_STATE(visibility_index) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_set_state_visibility_index_metal3(renderer, mem, config, helper, render_context);
+#endif
+
     TRACY_FUNC_COMMANDS_SET_STATE(visibility_index);
     const uint32_t index = helper.pop<uint32_t>();
     const bool enable = helper.pop<bool>();
@@ -533,6 +622,11 @@ COMMAND_SET_STATE(visibility_index) {
 }
 
 COMMAND(handle_set_state) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return cmd_handle_set_state_metal3(renderer, mem, config, helper, features, render_context);
+#endif
+
     // TRACY_FUNC_COMMANDS(handle_set_state); All set state commands have tracy so kinda redundant
     renderer::GXMState gxm_state_to_set = helper.pop<renderer::GXMState>();
     using StateChangeHandlerFunc = decltype(cmd_set_state_region_clip);

@@ -25,10 +25,10 @@
 
 namespace sdl_frontend {
 
-// Lets the renderer draw in an SDL window: Vulkan surfaces from SDL, or its OpenGL context
+// Lets the renderer draw in an SDL window using Vulkan, OpenGL, or a native display handle.
 class FrameHost final : public renderer::FrameHost, public renderer::VulkanSurfaceProvider {
 public:
-    FrameHost(SDL_Window *window, SDL_GLContext *gl_context);
+    FrameHost(SDL_Window *window, SDL_GLContext *gl_context, renderer::DisplayHandle display_handle = {});
 
     renderer::DisplayHandle handle() const override;
     const renderer::VulkanSurfaceProvider *vulkan_surface_provider() const override;
@@ -52,6 +52,7 @@ private:
 
     SDL_Window *window = nullptr;
     SDL_GLContext *gl_context = nullptr;
+    renderer::DisplayHandle display_handle;
 };
 
 } // namespace sdl_frontend

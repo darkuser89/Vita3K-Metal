@@ -29,9 +29,18 @@
 #include <string>
 #include <vector>
 
+#ifdef __APPLE__
+#include <renderer/metal3/integration.h>
+#endif
+
 namespace renderer {
 
 bool get_shaders_cache_hashs(State &renderer) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return get_shaders_cache_hashs_metal3(renderer);
+#endif
+
     const std::string hash_file_name = fmt::format("hashs-{}.dat", (renderer.current_backend == Backend::OpenGL) ? "gl" : "vk");
 
     fs::ifstream shaders_hashs(renderer.shaders_path / hash_file_name, std::ios::in | std::ios::binary);
@@ -87,6 +96,11 @@ bool get_shaders_cache_hashs(State &renderer) {
 }
 
 void save_shaders_cache_hashs(State &renderer, std::vector<ShadersHash> &shaders_cache_hashs) {
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal)
+        return save_shaders_cache_hashs_metal3(renderer, shaders_cache_hashs);
+#endif
+
     fs::create_directories(renderer.shaders_path);
     std::string hash_file_name = fmt::format("hashs-{}.dat", (renderer.current_backend == Backend::OpenGL) ? "gl" : "vk");
     fs::ofstream shaders_hashs(renderer.shaders_path / hash_file_name, std::ios::out | std::ios::binary);
