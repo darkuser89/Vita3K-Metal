@@ -220,8 +220,7 @@ struct OverlayRenderer::Impl {
     }
 
 
-        [encoder setVertexBytes:&pc length:sizeof(pc) atIndex:0];
-        [encoder setFragmentBytes:&pc length:sizeof(pc) atIndex:0];
+        [encoder setVertexAndFragmentBytes:&pc length:sizeof(pc) atIndex:0];
         std::vector<overlay::vertex> converted;
         const auto *vertices = &draw_cmd.verts;
         MTLPrimitiveType type = MTLPrimitiveTypeTriangleStrip;

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace {
 constexpr MTLStages graphics_stages = MTLStageVertex | MTLStageFragment;
@@ -72,6 +73,7 @@ void check_index(NSUInteger index, NSUInteger count) {
     id<MTL4CommandAllocator> _allocator;
     id<MTLResidencySet> _residency;
     NSMutableSet *_resources;
+    std::unordered_set<const void *> _residentResources;
     NSMutableArray *_handlers;
     NSCondition *_completion;
     MTLCommandBufferStatus _status;
@@ -110,7 +112,9 @@ void check_index(NSUInteger index, NSUInteger count) {
 - (CFTimeInterval)GPUEndTime { [_completion lock]; auto value = _GPUEndTime; [_completion unlock]; return value; }
 - (void)retainObject:(id)object { if (object) [_resources addObject:object]; }
 - (void)retainResource:(id<MTLResource>)resource {
-    if (!resource) return;
+    // Retention alone does not imply residency. Track registration separately,
+    // by identity, for this submission and visit each view's backing only once.
+    if (!resource || !_residentResources.insert((__bridge const void *)resource).second) return;
     [self retainObject:resource];
     [_residency addAllocation:resource];
     // Views can refer to a backing texture or buffer not directly bound.
@@ -209,6 +213,7 @@ void check_index(NSUInteger index, NSUInteger count) {
         [_queue recycleAllocator:_allocator];
         _allocator = nil;
         [_resources removeAllObjects];
+        _residentResources.clear();
         _inlineBuffer = nil;
         [_residency removeAllAllocations];
         [_residency commit];
@@ -233,6 +238,7 @@ void check_index(NSUInteger index, NSUInteger count) {
     id<MTL4RenderCommandEncoder> _native;
     V3KMetal4Commands *_commands;
     id<MTL4ArgumentTable> _vertex, _fragment;
+    bool _argumentsBound;
 }
 - (instancetype)initWithNative:(id<MTL4RenderCommandEncoder>)encoder commands:(V3KMetal4Commands *)commands {
     if ((self = [super init])) {
@@ -256,6 +262,12 @@ void check_index(NSUInteger index, NSUInteger count) {
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index {
     check_index(index, 31); [_fragment setAddress:[_commands copyBytes:bytes length:length] atIndex:index];
 }
+- (void)setVertexAndFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index {
+    check_index(index, 31);
+    const auto address = [_commands copyBytes:bytes length:length];
+    [_vertex setAddress:address atIndex:index];
+    [_fragment setAddress:address atIndex:index];
+}
 - (void)setVertexTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index {
     check_index(index, 128); [_commands retainResource:texture]; [_vertex setTexture:texture ? texture.gpuResourceID : MTLResourceID{} atIndex:index];
 }
@@ -270,8 +282,11 @@ void check_index(NSUInteger index, NSUInteger count) {
 }
 - (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages { [_commands retainResource:resource]; }
 - (void)bindArguments {
+    // Draws snapshot table contents; association is needed only on the first
+    // draw. Clear-only passes need no bindings, and PSO changes preserve them.
     [_native setArgumentTable:_vertex atStages:MTLRenderStageVertex];
     [_native setArgumentTable:_fragment atStages:MTLRenderStageFragment];
+    _argumentsBound = true;
 }
 - (void)endEncoding {
     [_native barrierAfterStages:graphics_stages beforeQueueStages:all_stages visibilityOptions:MTL4VisibilityOptionDevice];
@@ -319,19 +334,19 @@ void check_index(NSUInteger index, NSUInteger count) {
     [_native setVisibilityResultMode:mode offset:offset];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)primitiveType vertexStart:(NSUInteger)vertexStart vertexCount:(NSUInteger)vertexCount {
-    [self bindArguments];
+    if (!_argumentsBound) [self bindArguments];
     [_native drawPrimitives:primitiveType vertexStart:vertexStart vertexCount:vertexCount];
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)primitiveType indexCount:(NSUInteger)indexCount indexType:(MTLIndexType)indexType indexBuffer:(id <MTLBuffer>)indexBuffer indexBufferOffset:(NSUInteger)indexBufferOffset instanceCount:(NSUInteger)instanceCount {
     if (!indexBuffer || indexBufferOffset > indexBuffer.length) throw std::out_of_range("Metal 4 index buffer offset");
     [_commands retainResource:indexBuffer];
-    [self bindArguments];
+    if (!_argumentsBound) [self bindArguments];
     [_native drawIndexedPrimitives:primitiveType indexCount:indexCount indexType:indexType indexBuffer:indexBuffer.gpuAddress + indexBufferOffset indexBufferLength:indexBuffer.length - indexBufferOffset instanceCount:instanceCount];
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)primitiveType indexCount:(NSUInteger)indexCount indexType:(MTLIndexType)indexType indexBuffer:(id <MTLBuffer>)indexBuffer indexBufferOffset:(NSUInteger)indexBufferOffset instanceCount:(NSUInteger)instanceCount baseVertex:(NSInteger)baseVertex baseInstance:(NSUInteger)baseInstance {
     if (!indexBuffer || indexBufferOffset > indexBuffer.length) throw std::out_of_range("Metal 4 index buffer offset");
     [_commands retainResource:indexBuffer];
-    [self bindArguments];
+    if (!_argumentsBound) [self bindArguments];
     [_native drawIndexedPrimitives:primitiveType indexCount:indexCount indexType:indexType indexBuffer:indexBuffer.gpuAddress + indexBufferOffset indexBufferLength:indexBuffer.length - indexBufferOffset instanceCount:instanceCount baseVertex:baseVertex baseInstance:baseInstance];
 }
 @end
@@ -340,9 +355,13 @@ void check_index(NSUInteger index, NSUInteger count) {
     id<MTL4ComputeCommandEncoder> _native;
     V3KMetal4Commands *_commands;
     id<MTL4ArgumentTable> _arguments;
+    bool _hasWork, _argumentsBound;
 }
 - (instancetype)initWithNative:(id<MTL4ComputeCommandEncoder>)encoder commands:(V3KMetal4Commands *)commands {
-    if ((self = [super init])) { _native = encoder; _commands = commands; _arguments = make_table(commands.native.device); [commands retainObject:_arguments]; }
+    if ((self = [super init])) {
+        _native = encoder; _commands = commands;
+        _arguments = make_table(commands.native.device); [commands retainObject:_arguments];
+    }
     return self;
 }
 - (NSString *)label { return _native.label; }
@@ -359,9 +378,16 @@ void check_index(NSUInteger index, NSUInteger count) {
 - (void)setSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index {
     check_index(index, 16); [_commands retainObject:sampler]; [_arguments setSamplerState:sampler ? sampler.gpuResourceID : MTLResourceID{} atIndex:index];
 }
-- (void)bindArguments {
-    [_native barrierAfterEncoderStages:compute_stages beforeEncoderStages:compute_stages visibilityOptions:MTL4VisibilityOptionDevice];
-    [_native setArgumentTable:_arguments];
+- (void)prepareCommand:(BOOL)usesArguments {
+    // The queue barrier already covers earlier encoders. An intra-pass
+    // dependency only exists after this encoder has issued its first command.
+    if (_hasWork)
+        [_native barrierAfterEncoderStages:compute_stages beforeEncoderStages:compute_stages visibilityOptions:MTL4VisibilityOptionDevice];
+    _hasWork = true;
+    if (usesArguments && !_argumentsBound) {
+        [_native setArgumentTable:_arguments];
+        _argumentsBound = true;
+    }
 }
 - (void)endEncoding {
     [_native barrierAfterStages:compute_stages beforeQueueStages:all_stages visibilityOptions:MTL4VisibilityOptionDevice];
@@ -372,69 +398,69 @@ void check_index(NSUInteger index, NSUInteger count) {
     [_native setComputePipelineState:state];
 }
 - (void)dispatchThreadgroups:(MTLSize)threadgroupsPerGrid threadsPerThreadgroup:(MTLSize)threadsPerThreadgroup {
-    [self bindArguments];
+    [self prepareCommand:YES];
     [_native dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
 }
 - (void)dispatchThreads:(MTLSize)threadsPerGrid threadsPerThreadgroup:(MTLSize)threadsPerThreadgroup {
-    [self bindArguments];
+    [self prepareCommand:YES];
     [_native dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
 }
 - (void)copyFromTexture:(id<MTLTexture>)sourceTexture sourceSlice:(NSUInteger)sourceSlice sourceLevel:(NSUInteger)sourceLevel sourceOrigin:(MTLOrigin)sourceOrigin sourceSize:(MTLSize)sourceSize toTexture:(id<MTLTexture>)destinationTexture destinationSlice:(NSUInteger)destinationSlice destinationLevel:(NSUInteger)destinationLevel destinationOrigin:(MTLOrigin)destinationOrigin {
     [_commands retainResource:sourceTexture];
     [_commands retainResource:destinationTexture];
-    [_native barrierAfterEncoderStages:compute_stages beforeEncoderStages:compute_stages visibilityOptions:MTL4VisibilityOptionDevice];
+    [self prepareCommand:NO];
     [_native copyFromTexture:sourceTexture sourceSlice:sourceSlice sourceLevel:sourceLevel sourceOrigin:sourceOrigin sourceSize:sourceSize toTexture:destinationTexture destinationSlice:destinationSlice destinationLevel:destinationLevel destinationOrigin:destinationOrigin];
 }
 - (void)copyFromBuffer:(id<MTLBuffer>)sourceBuffer sourceOffset:(NSUInteger)sourceOffset sourceBytesPerRow:(NSUInteger)sourceBytesPerRow sourceBytesPerImage:(NSUInteger)sourceBytesPerImage sourceSize:(MTLSize)sourceSize toTexture:(id<MTLTexture>)destinationTexture destinationSlice:(NSUInteger)destinationSlice destinationLevel:(NSUInteger)destinationLevel destinationOrigin:(MTLOrigin)destinationOrigin {
     [_commands retainResource:sourceBuffer];
     [_commands retainResource:destinationTexture];
-    [_native barrierAfterEncoderStages:compute_stages beforeEncoderStages:compute_stages visibilityOptions:MTL4VisibilityOptionDevice];
+    [self prepareCommand:NO];
     [_native copyFromBuffer:sourceBuffer sourceOffset:sourceOffset sourceBytesPerRow:sourceBytesPerRow sourceBytesPerImage:sourceBytesPerImage sourceSize:sourceSize toTexture:destinationTexture destinationSlice:destinationSlice destinationLevel:destinationLevel destinationOrigin:destinationOrigin];
 }
 - (void)copyFromBuffer:(id<MTLBuffer>)sourceBuffer sourceOffset:(NSUInteger)sourceOffset sourceBytesPerRow:(NSUInteger)sourceBytesPerRow sourceBytesPerImage:(NSUInteger)sourceBytesPerImage sourceSize:(MTLSize)sourceSize toTexture:(id<MTLTexture>)destinationTexture destinationSlice:(NSUInteger)destinationSlice destinationLevel:(NSUInteger)destinationLevel destinationOrigin:(MTLOrigin)destinationOrigin options:(MTLBlitOption)options {
     [_commands retainResource:sourceBuffer];
     [_commands retainResource:destinationTexture];
-    [_native barrierAfterEncoderStages:compute_stages beforeEncoderStages:compute_stages visibilityOptions:MTL4VisibilityOptionDevice];
+    [self prepareCommand:NO];
     [_native copyFromBuffer:sourceBuffer sourceOffset:sourceOffset sourceBytesPerRow:sourceBytesPerRow sourceBytesPerImage:sourceBytesPerImage sourceSize:sourceSize toTexture:destinationTexture destinationSlice:destinationSlice destinationLevel:destinationLevel destinationOrigin:destinationOrigin options:options];
 }
 - (void)copyFromTexture:(id<MTLTexture>)sourceTexture sourceSlice:(NSUInteger)sourceSlice sourceLevel:(NSUInteger)sourceLevel sourceOrigin:(MTLOrigin)sourceOrigin sourceSize:(MTLSize)sourceSize toBuffer:(id<MTLBuffer>)destinationBuffer destinationOffset:(NSUInteger)destinationOffset destinationBytesPerRow:(NSUInteger)destinationBytesPerRow destinationBytesPerImage:(NSUInteger)destinationBytesPerImage {
     [_commands retainResource:sourceTexture];
     [_commands retainResource:destinationBuffer];
-    [_native barrierAfterEncoderStages:compute_stages beforeEncoderStages:compute_stages visibilityOptions:MTL4VisibilityOptionDevice];
+    [self prepareCommand:NO];
     [_native copyFromTexture:sourceTexture sourceSlice:sourceSlice sourceLevel:sourceLevel sourceOrigin:sourceOrigin sourceSize:sourceSize toBuffer:destinationBuffer destinationOffset:destinationOffset destinationBytesPerRow:destinationBytesPerRow destinationBytesPerImage:destinationBytesPerImage];
 }
 - (void)copyFromTexture:(id<MTLTexture>)sourceTexture sourceSlice:(NSUInteger)sourceSlice sourceLevel:(NSUInteger)sourceLevel sourceOrigin:(MTLOrigin)sourceOrigin sourceSize:(MTLSize)sourceSize toBuffer:(id<MTLBuffer>)destinationBuffer destinationOffset:(NSUInteger)destinationOffset destinationBytesPerRow:(NSUInteger)destinationBytesPerRow destinationBytesPerImage:(NSUInteger)destinationBytesPerImage options:(MTLBlitOption)options {
     [_commands retainResource:sourceTexture];
     [_commands retainResource:destinationBuffer];
-    [_native barrierAfterEncoderStages:compute_stages beforeEncoderStages:compute_stages visibilityOptions:MTL4VisibilityOptionDevice];
+    [self prepareCommand:NO];
     [_native copyFromTexture:sourceTexture sourceSlice:sourceSlice sourceLevel:sourceLevel sourceOrigin:sourceOrigin sourceSize:sourceSize toBuffer:destinationBuffer destinationOffset:destinationOffset destinationBytesPerRow:destinationBytesPerRow destinationBytesPerImage:destinationBytesPerImage options:options];
 }
 - (void)generateMipmapsForTexture:(id<MTLTexture>)texture {
     [_commands retainResource:texture];
-    [_native barrierAfterEncoderStages:compute_stages beforeEncoderStages:compute_stages visibilityOptions:MTL4VisibilityOptionDevice];
+    [self prepareCommand:NO];
     [_native generateMipmapsForTexture:texture];
 }
 - (void)fillBuffer:(id<MTLBuffer>)buffer range:(NSRange)range value:(uint8_t)value {
     [_commands retainResource:buffer];
-    [_native barrierAfterEncoderStages:compute_stages beforeEncoderStages:compute_stages visibilityOptions:MTL4VisibilityOptionDevice];
+    [self prepareCommand:NO];
     [_native fillBuffer:buffer range:range value:value];
 }
 - (void)copyFromTexture:(id<MTLTexture>)sourceTexture sourceSlice:(NSUInteger)sourceSlice sourceLevel:(NSUInteger)sourceLevel toTexture:(id<MTLTexture>)destinationTexture destinationSlice:(NSUInteger)destinationSlice destinationLevel:(NSUInteger)destinationLevel sliceCount:(NSUInteger)sliceCount levelCount:(NSUInteger)levelCount {
     [_commands retainResource:sourceTexture];
     [_commands retainResource:destinationTexture];
-    [_native barrierAfterEncoderStages:compute_stages beforeEncoderStages:compute_stages visibilityOptions:MTL4VisibilityOptionDevice];
+    [self prepareCommand:NO];
     [_native copyFromTexture:sourceTexture sourceSlice:sourceSlice sourceLevel:sourceLevel toTexture:destinationTexture destinationSlice:destinationSlice destinationLevel:destinationLevel sliceCount:sliceCount levelCount:levelCount];
 }
 - (void)copyFromTexture:(id<MTLTexture>)sourceTexture toTexture:(id<MTLTexture>)destinationTexture {
     [_commands retainResource:sourceTexture];
     [_commands retainResource:destinationTexture];
-    [_native barrierAfterEncoderStages:compute_stages beforeEncoderStages:compute_stages visibilityOptions:MTL4VisibilityOptionDevice];
+    [self prepareCommand:NO];
     [_native copyFromTexture:sourceTexture toTexture:destinationTexture];
 }
 - (void)copyFromBuffer:(id <MTLBuffer>)sourceBuffer sourceOffset:(NSUInteger)sourceOffset toBuffer:(id <MTLBuffer>)destinationBuffer destinationOffset:(NSUInteger)destinationOffset size:(NSUInteger)size {
     [_commands retainResource:sourceBuffer];
     [_commands retainResource:destinationBuffer];
-    [_native barrierAfterEncoderStages:compute_stages beforeEncoderStages:compute_stages visibilityOptions:MTL4VisibilityOptionDevice];
+    [self prepareCommand:NO];
     [_native copyFromBuffer:sourceBuffer sourceOffset:sourceOffset toBuffer:destinationBuffer destinationOffset:destinationOffset size:size];
 }
 @end

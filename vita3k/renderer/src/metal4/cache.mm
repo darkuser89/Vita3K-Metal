@@ -561,7 +561,7 @@ std::vector<CachedVariant> PersistentCache::variants(std::string_view guest_hash
 }
 void PersistentCache::store_render_pipeline_template(std::string_view fragment_hash, std::string_view vertex_hash,
     std::string_view key, std::string_view vertex_key, std::string_view fragment_key,
-    MTLRenderPipelineDescriptor *descriptor) {
+    MTLRenderPipelineDescriptor *descriptor, std::string_view descriptor_key) {
     if (!valid_guest_hash(fragment_hash) || !valid_guest_hash(vertex_hash) || !descriptor
         || key.empty() || key.size()>max_variant_key_bytes
         || vertex_key.empty() || vertex_key.size()>max_variant_key_bytes
@@ -569,7 +569,10 @@ void PersistentCache::store_render_pipeline_template(std::string_view fragment_h
         || vertex_key.substr(0,64)!=vertex_hash
         || (fragment_key.substr(0,64)!=fragment_hash && !fragment_key.starts_with("metal-depth-only"))
         || !key.starts_with(vertex_key) || !key.substr(vertex_key.size()).starts_with(fragment_key)) return;
-    const std::string descriptor_key=render_key(descriptor);
+    // A key returned by create_render_pipeline describes this same, unchanged
+    // descriptor after Device's native format normalization.
+    const std::string serialized = descriptor_key.empty() ? render_key(descriptor) : std::string{};
+    if (descriptor_key.empty()) descriptor_key = serialized;
     const size_t payload=key.size()+vertex_key.size()+fragment_key.size()+descriptor_key.size();
     if (payload+16>max_pipeline_template_bytes) return;
     std::string body;
@@ -647,9 +650,12 @@ id<MTL4Compiler> capture_compiler(Device &device, bool capture, id<MTL4PipelineD
     return device.native_compiler();
 }
 }
-id<MTLRenderPipelineState> PersistentCache::create_render_pipeline(MTLRenderPipelineDescriptor *descriptor, std::string &error) {
+id<MTLRenderPipelineState> PersistentCache::create_render_pipeline(MTLRenderPipelineDescriptor *descriptor, std::string &error,
+    std::string *descriptor_key) {
     error.clear();
-    const auto path = impl->native / (digest(render_key(descriptor)) + ".metalarc");
+    const auto serialized = render_key(descriptor);
+    if (descriptor_key) *descriptor_key = serialized;
+    const auto path = impl->native / (digest(serialized) + ".metalarc");
     id<MTL4Archive> archive;
     bool writable;
     {
@@ -662,8 +668,9 @@ id<MTLRenderPipelineState> PersistentCache::create_render_pipeline(MTLRenderPipe
         writable = impl->counters.archive_writable;
     }
     NSError *native_error = nil;
+    auto native_descriptor = metal4_render_descriptor(descriptor);
     if (archive) {
-        auto cached = [archive newRenderPipelineStateWithDescriptor:metal4_render_descriptor(descriptor) error:&native_error];
+        auto cached = [archive newRenderPipelineStateWithDescriptor:native_descriptor error:&native_error];
         if (cached) {
             std::lock_guard lock(impl->mutex);
             ++impl->counters.pipeline_hits;
@@ -677,7 +684,7 @@ id<MTLRenderPipelineState> PersistentCache::create_render_pipeline(MTLRenderPipe
     }
     id<MTL4PipelineDataSetSerializer> serializer = nil;
     auto compiler = capture_compiler(impl->device, writable, serializer);
-    auto result = metal4_render_pipeline(compiler, descriptor, nil, &native_error);
+    auto result = [compiler newRenderPipelineStateWithDescriptor:native_descriptor compilerTaskOptions:nil error:&native_error];
     if (!result) error = error_text(native_error);
     else if (serializer) {
         {

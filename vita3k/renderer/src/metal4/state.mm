@@ -1400,14 +1400,15 @@ void MetalState::precompile_shader(const ShadersHash &hash) {
                     || impl->warmup_failed_shaders.contains(key)) return;
                 if (warming.size() == 2) retire_shader();
                 Device *device = impl->device.get();
+                const bool retain_capture_source = !impl->dump_draw_dir.empty();
                 try {
                     warming.emplace_back(key, std::async(std::launch::async,
-                        [device, key, stage, gamma]() -> std::unique_ptr<CompiledProgram> {
+                        [device, key, stage, gamma, retain_capture_source]() -> std::unique_ptr<CompiledProgram> {
                             @autoreleasepool {
                                 auto program = device->load_cached_program(key);
                                 if (!program || program->stage != stage) return nullptr;
                                 std::string error;
-                                auto compiled = device->compile(*program, gamma, error);
+                                auto compiled = device->compile(*program, gamma, error, retain_capture_source);
                                 require(bool(compiled), error.empty() ? "compiler returned no shader" : error);
                                 return compiled;
                             }
@@ -4450,7 +4451,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             append(key, ctx.shader_hints.metal_mip_sampling);
             append(key, ctx.shader_hints.metal_float_cube_filter);
             append(key, get_features_mask());
-            append(key, ctx.shader_hints.color_format);
+            // These target properties affect fragment translation only. Keep
+            // one vertex variant when just the fragment attachment changes.
+            if (!vertex) append(key, ctx.shader_hints.color_format);
             if (!vertex) {
                 append(key, ctx.shader_hints.metal_raw_color_attachment);
                 append(key, ctx.shader_hints.metal_raw_color_fetch);
@@ -4470,7 +4473,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     append(key, blend.colorMask);
                 }
             }
-            append(key, ctx.shader_hints.metal_output_register_size);
+            if (!vertex) append(key, ctx.shader_hints.metal_output_register_size);
             if (!vertex) append(key, ctx.shader_hints.metal_output_register_format);
             append(key, vertex ? 1u : ctx.impl->samples);
             append(key, !vertex && record.is_maskupdate);
@@ -4523,7 +4526,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                         if (auto msl = impl->device->load_cached_program(key)) {
                             const auto expected_stage = vertex ? shader::metal::Stage::Vertex : shader::metal::Stage::Fragment;
                             if (msl->stage == expected_stage)
-                                compiled = impl->device->compile(*msl, gamma, error);
+                                compiled = impl->device->compile(*msl, gamma, error, !impl->dump_draw_dir.empty());
                             else
                                 error = "cached shader stage does not match the draw";
                             if (!compiled) LOG_WARN("Metal: cached shader failed to compile; rebuilding: {}", error);
@@ -4535,7 +4538,7 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 if (!compiled) {
                     auto msl = !vertex && fragment_disabled ? depth_only_program(ctx.impl->samples)
                         : shader::metal::convert_gxp(*gxp, hex_string(vertex ? vp->vertex_program->hash : fp->fragment_program->hash), shader_features, ctx.shader_hints, !vertex && record.is_maskupdate);
-                    compiled = impl->device->compile(msl, gamma, error);
+                    compiled = impl->device->compile(msl, gamma, error, !impl->dump_draw_dir.empty());
                     require(bool(compiled), error);
                     try {
                         impl->device->store_cached_program(key, msl,
@@ -5961,16 +5964,14 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                 << " descriptor " << record.depth_stencil_surface.mask
                 << " depth_disabled " << record.depth_stencil_surface.disabled()
                 << " writing " << record.writing_mask << '\n';
-            auto shader_features = features;
-            shader_features.enable_memory_mapping = true;
-            auto msl = shader::metal::convert_gxp(*vp->program(), hex_string(vp->vertex_program->hash), shader_features, ctx.shader_hints, false);
+            require(bool(vs.capture_source) && bool(fs.capture_source),
+                "Metal: draw capture shader source was not retained");
+            const auto &msl = *vs.capture_source;
             dump_bytes("vertex.metal", msl.source.data(), msl.source.size());
             const auto *vertex_gxp = vp->program(), *fragment_gxp = fp->program();
             dump_bytes("vertex.gxp", vertex_gxp, vertex_gxp->size);
             dump_bytes("fragment.gxp", fragment_gxp, fragment_gxp->size);
-            auto fragment_msl = fragment_disabled ? depth_only_program(ctx.impl->samples)
-                : shader::metal::convert_gxp(*fragment_gxp, hex_string(fp->fragment_program->hash),
-                    shader_features, ctx.shader_hints, record.is_maskupdate);
+            const auto &fragment_msl = *fs.capture_source;
             dump_bytes("fragment.metal", fragment_msl.source.data(), fragment_msl.source.size());
             draw_metadata << "entry " << msl.entry_point << '\n';
             for (uint32_t slot=0;slot<SCE_GXM_MAX_TEXTURE_UNITS;++slot)
@@ -6112,10 +6113,11 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             }
             return layout;
         };
-        const auto compile_pipeline_once = [&](const std::string &pipeline_key, MTLRenderPipelineDescriptor *descriptor) -> id<MTLRenderPipelineState> {
+        const auto compile_pipeline_once = [&](const std::string &pipeline_key, MTLRenderPipelineDescriptor *descriptor,
+                                                std::string *descriptor_key = nullptr) -> id<MTLRenderPipelineState> {
             if (impl->failed_pipelines.contains(pipeline_key)) return nil;
             try {
-                auto result = impl->device->create_pipeline(descriptor, error);
+                auto result = impl->device->create_pipeline(descriptor, error, descriptor_key);
                 if (result) return result;
             } catch (const std::exception &failure) {
                 error = failure.what();
@@ -6240,11 +6242,12 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     [device, owned_descriptor, fragment_hash, vertex_hash, key, vertex_key, fragment_key]() -> Impl::PipelineResult {
                         @autoreleasepool {
                             Impl::PipelineResult result;
-                            result.pipeline = device->create_pipeline(owned_descriptor, result.error);
+                            std::string descriptor_key;
+                            result.pipeline = device->create_pipeline(owned_descriptor, result.error, &descriptor_key);
                             if (result.pipeline) {
                                 try {
                                     device->store_cached_pipeline_template(fragment_hash,vertex_hash,
-                                        key,vertex_key,fragment_key,owned_descriptor);
+                                        key,vertex_key,fragment_key,owned_descriptor,descriptor_key);
                                 } catch (const std::exception &failure) {
                                     LOG_WARN("Metal: compiled pipeline could not be cached: {}", failure.what());
                                 }
@@ -6254,11 +6257,12 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     }));
                 return;
             }
-            pipeline = compile_pipeline_once(key, desc);
+            std::string descriptor_key;
+            pipeline = compile_pipeline_once(key, desc, &descriptor_key);
             if (!pipeline) return;
             try {
                 impl->device->store_cached_pipeline_template(hex_string(fp->fragment_program->hash),
-                    hex_string(vp->vertex_program->hash),key,vertex_key,fragment_key,desc);
+                    hex_string(vp->vertex_program->hash),key,vertex_key,fragment_key,desc,descriptor_key);
             } catch (const std::exception &failure) {
                 LOG_WARN("Metal: compiled pipeline could not be cached: {}", failure.what());
             }

@@ -36,8 +36,8 @@ std::vector<CachedVariant> Device::cached_variants(std::string_view guest_hash) 
 }
 void Device::store_cached_pipeline_template(std::string_view fragment_hash, std::string_view vertex_hash,
     std::string_view key, std::string_view vertex_key, std::string_view fragment_key,
-    MTLRenderPipelineDescriptor *descriptor) const {
-    if (cache) cache->store_render_pipeline_template(fragment_hash,vertex_hash,key,vertex_key,fragment_key,descriptor);
+    MTLRenderPipelineDescriptor *descriptor, std::string_view descriptor_key) const {
+    if (cache) cache->store_render_pipeline_template(fragment_hash,vertex_hash,key,vertex_key,fragment_key,descriptor,descriptor_key);
 }
 std::vector<CachedPipeline> Device::cached_pipeline_templates(std::string_view fragment_hash, std::string_view vertex_hash) const {
     return cache ? cache->render_pipeline_templates(fragment_hash,vertex_hash) : std::vector<CachedPipeline>{};
@@ -98,7 +98,7 @@ std::unique_ptr<Device> Device::create(std::string &error) {
 }
 
 std::unique_ptr<CompiledProgram> Device::compile(const shader::metal::Program &program,
-    bool gamma_correction, std::string &error) const {
+    bool gamma_correction, std::string &error, bool retain_capture_source) const {
     error.clear();
     if (program.uses_raster_order_groups && !supports_raster_order_groups()) {
         error = "Metal shader requires raster order groups, which this GPU does not support";
@@ -151,11 +151,13 @@ std::unique_ptr<CompiledProgram> Device::compile(const shader::metal::Program &p
     result->uses_framebuffer_fetch = program.uses_framebuffer_fetch;
     result->writes_guest_memory = program.writes_guest_memory;
     result->cube_texture_mask = program.cube_texture_mask;
+    if (retain_capture_source) result->capture_source = std::make_unique<const shader::metal::Program>(program);
     return result;
 }
 
 id<MTLRenderPipelineState> Device::create_pipeline(MTLRenderPipelineDescriptor *descriptor,
-    std::string &error) const {
+    std::string &error, std::string *descriptor_key) const {
+    if (descriptor_key) descriptor_key->clear();
     for (NSUInteger i = 0; i < 8; ++i) {
         auto *color = descriptor.colorAttachments[i];
         if (color.pixelFormat != MTLPixelFormatRGB9E5Float)
@@ -169,7 +171,7 @@ id<MTLRenderPipelineState> Device::create_pipeline(MTLRenderPipelineDescriptor *
             color.writeMask = MTLColorWriteMaskNone;
     }
     if (cache)
-        return cache->create_render_pipeline(descriptor, error);
+        return cache->create_render_pipeline(descriptor, error, descriptor_key);
     error.clear();
     NSError *native_error = nil;
     id<MTLRenderPipelineState> result = metal4_render_pipeline(compiler, descriptor, nil, &native_error);

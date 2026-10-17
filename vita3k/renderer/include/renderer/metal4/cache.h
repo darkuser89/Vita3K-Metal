@@ -41,9 +41,10 @@ public:
     std::vector<CachedVariant> variants(std::string_view guest_hash);
     void store_render_pipeline_template(std::string_view fragment_hash, std::string_view vertex_hash,
         std::string_view key, std::string_view vertex_key, std::string_view fragment_key,
-        MTLRenderPipelineDescriptor *descriptor);
+        MTLRenderPipelineDescriptor *descriptor, std::string_view descriptor_key = {});
     std::vector<CachedPipeline> render_pipeline_templates(std::string_view fragment_hash, std::string_view vertex_hash);
-    id<MTLRenderPipelineState> create_render_pipeline(MTLRenderPipelineDescriptor *, std::string &error);
+    id<MTLRenderPipelineState> create_render_pipeline(MTLRenderPipelineDescriptor *, std::string &error,
+        std::string *descriptor_key = nullptr);
     id<MTLComputePipelineState> create_compute_pipeline(id<MTLFunction>, std::string &error);
     void flush();
     CacheStats stats() const;

@@ -44,6 +44,7 @@
 - (void)setFragmentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index;
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index;
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index;
+- (void)setVertexAndFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index;
 - (void)setVertexTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index;
 - (void)setFragmentTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index;
 - (void)setVertexSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index;

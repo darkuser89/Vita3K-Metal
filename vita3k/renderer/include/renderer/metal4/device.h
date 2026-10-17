@@ -22,6 +22,8 @@ struct CompiledProgram {
     bool uses_framebuffer_fetch;
     bool writes_guest_memory = true;
     uint32_t cube_texture_mask = 0;
+    // Retained only when draw capture is configured, including cache warmup.
+    std::unique_ptr<const shader::metal::Program> capture_source;
 };
 
 class Device {
@@ -35,7 +37,7 @@ public:
     std::vector<CachedVariant> cached_variants(std::string_view guest_hash) const;
     void store_cached_pipeline_template(std::string_view fragment_hash, std::string_view vertex_hash,
         std::string_view key, std::string_view vertex_key, std::string_view fragment_key,
-        MTLRenderPipelineDescriptor *descriptor) const;
+        MTLRenderPipelineDescriptor *descriptor, std::string_view descriptor_key = {}) const;
     std::vector<CachedPipeline> cached_pipeline_templates(std::string_view fragment_hash, std::string_view vertex_hash) const;
     void flush_cache() const;
     CacheStats cache_stats() const;
@@ -43,9 +45,9 @@ public:
     id<MTLComputePipelineState> create_compute_pipeline(id<MTLFunction>, std::string &error) const;
     id<MTLLibrary> compile_library(NSString *source, MTLCompileOptions *options, NSError **error) const;
     std::unique_ptr<CompiledProgram> compile(const shader::metal::Program &program,
-        bool gamma_correction, std::string &error) const;
+        bool gamma_correction, std::string &error, bool retain_capture_source = false) const;
     id<MTLRenderPipelineState> create_pipeline(MTLRenderPipelineDescriptor *descriptor,
-        std::string &error) const;
+        std::string &error, std::string *descriptor_key = nullptr) const;
     bool submit_and_wait(V3KMetal4Commands * commands, std::string &error) const;
 
     id<MTLDevice> native_device() const { return device; }
