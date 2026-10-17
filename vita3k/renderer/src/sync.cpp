@@ -33,7 +33,7 @@
 #include <util/tracy.h>
 
 #ifdef __APPLE__
-#include <renderer/metal3/integration.h>
+#include <renderer/metal4/integration.h>
 #endif
 
 namespace renderer {

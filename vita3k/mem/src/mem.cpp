@@ -17,7 +17,7 @@
 
 #include <mem/functions.h>
 #include <mem/state.h>
-#include <mem/metal3.h>
+#include <mem/metal4.h>
 
 #include <util/align.h>
 #include <util/log.h>

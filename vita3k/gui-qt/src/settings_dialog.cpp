@@ -296,7 +296,7 @@ void SettingsDialog::load_config() {
 #endif
     m_ui->backend_renderer_box->addItem(QStringLiteral("Vulkan"), QStringLiteral("Vulkan"));
 #ifdef __APPLE__
-    m_ui->backend_renderer_box->addItem(QStringLiteral("Metal 3"), QStringLiteral("Metal"));
+    m_ui->backend_renderer_box->addItem(QStringLiteral("Metal 4"), QStringLiteral("Metal"));
 #endif
     {
         const int idx = m_ui->backend_renderer_box->findData(

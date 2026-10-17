@@ -1,0 +1,377 @@
+// Vita3K emulator project
+// Copyright (C) 2026 Vita3K team
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+#include <gxm/functions.h>
+#include <gxm/types.h>
+#include <display/state.h>
+#include <renderer/commands.h>
+#include <renderer/driver_functions.h>
+#include <renderer/state.h>
+#include <renderer/types.h>
+
+#include <renderer/gl/functions.h>
+#include <renderer/gl/types.h>
+
+#include <renderer/vulkan/functions.h>
+#ifdef __APPLE__
+#include <renderer/metal4/state.h>
+#endif
+
+#include <config/state.h>
+#include <util/log.h>
+#include <util/tracy.h>
+
+#define DEBUG_FRAMEBUFFER 1
+
+#if DEBUG_FRAMEBUFFER
+
+#include <stb_image_write.h>
+#endif
+
+#include <renderer/metal4/integration.h>
+
+namespace renderer {
+void mark_metal_command_payload(Command &cmd) {
+    switch (cmd.opcode) {
+    case CommandOpcode::SetContext:
+    case CommandOpcode::TransferCopy:
+    case CommandOpcode::TransferDownscale:
+    case CommandOpcode::TransferFill:
+    case CommandOpcode::SetScreenFilter:
+    case CommandOpcode::NewFrame:
+        cmd.flags |= Command::FLAG_METAL_RAW_PAYLOAD;
+        break;
+    default:
+        break;
+    }
+}
+
+void mark_metal_command_payload(const State &state, Command &cmd) {
+    if (state.current_backend == Backend::Metal)
+        mark_metal_command_payload(cmd);
+}
+
+void destroy_metal_command_payload(Command &cmd) {
+#ifdef __APPLE__
+    if (cmd.flags & Command::FLAG_METAL_PROGRAM_BINDING) {
+        CommandHelper helper(&cmd);
+        helper.pop<GXMState>();
+        helper.pop<Ptr<const void>>();
+        helper.pop<bool>();
+        delete helper.pop<std::shared_ptr<const metal::ProgramBinding> *>();
+        cmd.flags &= ~Command::FLAG_METAL_PROGRAM_BINDING;
+    }
+#endif
+    if (!(cmd.flags & Command::FLAG_METAL_RAW_PAYLOAD))
+        return;
+    cmd.flags &= ~Command::FLAG_METAL_RAW_PAYLOAD;
+    CommandHelper helper(&cmd);
+    switch (cmd.opcode) {
+    case CommandOpcode::SetContext: {
+        helper.pop<RenderTarget *>();
+        const auto surfaces_at = helper.point;
+        delete helper.pop<SceGxmColorSurface *>();
+        delete helper.pop<SceGxmDepthStencilSurface *>();
+        // Legacy cleanup also recognizes SetContext by opcode. Leave nulls
+        // so repeated cleanup cannot delete already-consumed descriptors.
+        helper.point = surfaces_at;
+        SceGxmColorSurface *color = nullptr;
+        SceGxmDepthStencilSurface *depth = nullptr;
+        helper.push(color);
+        helper.push(depth);
+        break;
+    }
+    case CommandOpcode::TransferCopy:
+        helper.pop<uint32_t>();
+        helper.pop<uint32_t>();
+        helper.pop<SceGxmTransferColorKeyMode>();
+        delete[] helper.pop<const SceGxmTransferImage *>();
+        break;
+    case CommandOpcode::TransferDownscale:
+        delete helper.pop<SceGxmTransferImage *>();
+        delete helper.pop<SceGxmTransferImage *>();
+        break;
+    case CommandOpcode::TransferFill:
+        helper.pop<uint32_t>();
+        delete helper.pop<const SceGxmTransferImage *>();
+        break;
+    case CommandOpcode::SetScreenFilter:
+        delete helper.pop<std::string *>();
+        break;
+    case CommandOpcode::NewFrame:
+        delete helper.pop<DisplayFrameInfo *>();
+        break;
+    default:
+        break;
+    }
+}
+
+void destroy_command_payload_metal3(Command &cmd) {
+    if (cmd.flags & (Command::FLAG_METAL_PROGRAM_BINDING | Command::FLAG_METAL_RAW_PAYLOAD)) {
+        destroy_metal_command_payload(cmd);
+        return;
+    }
+    switch (cmd.opcode) {
+    case CommandOpcode::SetContext: {
+        auto *color_surface = reinterpret_cast<SceGxmColorSurface **>(&cmd.data[sizeof(RenderTarget *)]);
+        auto *depth_stencil_surface = reinterpret_cast<SceGxmDepthStencilSurface **>(&cmd.data[sizeof(RenderTarget *) + sizeof(SceGxmColorSurface *)]);
+        delete *color_surface;
+        delete *depth_stencil_surface;
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
+void cmd_handle_set_context_metal3(renderer::State &renderer, MemState &mem, Config &config, CommandHelper &helper, const FeatureState &features, Context *render_context) {
+    TRACY_FUNC_COMMANDS(handle_set_context);
+    RenderTarget *rt = helper.pop<RenderTarget *>();
+    const SceGxmColorSurface *color_surface = helper.pop<SceGxmColorSurface *>();
+    const SceGxmDepthStencilSurface *depth_stencil_surface = helper.pop<SceGxmDepthStencilSurface *>();
+
+    render_context->current_render_target = rt;
+
+    if (color_surface && !color_surface->disabled) {
+        render_context->record.color_surface = *color_surface;
+    } else {
+        render_context->record.color_surface.data = nullptr;
+        render_context->record.color_surface.downscale = false;
+    }
+
+    if (depth_stencil_surface && !depth_stencil_surface->disabled()) {
+        render_context->record.depth_stencil_surface = *depth_stencil_surface;
+        static_cast<metal::MetalContext &>(*render_context).native_record.has_depth_stencil_surface = true;
+    } else {
+        static_cast<metal::MetalContext &>(*render_context).native_record.has_depth_stencil_surface = false;
+        // Do not retain a previous scene's format when the new scene disables it.
+        render_context->record.depth_stencil_surface = {};
+    }
+
+    destroy_command_payload(*helper.cmd);
+
+    switch (renderer.current_backend) {
+    case Backend::OpenGL:
+        gl::set_context(dynamic_cast<gl::GLState &>(renderer), *reinterpret_cast<gl::GLContext *>(render_context), mem, reinterpret_cast<const gl::GLRenderTarget *>(rt), features);
+        break;
+
+#ifdef __APPLE__
+    case Backend::Metal:
+        static_cast<metal::MetalState &>(renderer).set_context(static_cast<metal::MetalContext &>(*render_context), mem);
+        break;
+#endif
+    case Backend::Vulkan:
+        vulkan::set_context(*reinterpret_cast<vulkan::VKContext *>(render_context), mem, reinterpret_cast<vulkan::VKRenderTarget *>(rt), features);
+        break;
+
+    default:
+        REPORT_MISSING(renderer.current_backend);
+        break;
+    }
+    }
+
+void cmd_handle_sync_surface_data_metal3(renderer::State &renderer, MemState &mem, Config &config, CommandHelper &helper, const FeatureState &features, Context *render_context) {
+    TRACY_FUNC_COMMANDS(handle_sync_surface_data);
+
+    const SceGxmNotification vertex_notification = helper.pop<SceGxmNotification>();
+    const SceGxmNotification fragment_notification = helper.pop<SceGxmNotification>();
+    // with memory mapping, notifications are signaled another way
+    // also don't try to signal if there are no notifications
+    bool were_notifications_signaled = renderer.features.enable_memory_mapping
+        || (!vertex_notification.address && !fragment_notification.address);
+
+    auto signal_notifications = [&]() {
+        if (were_notifications_signaled)
+            return;
+
+        were_notifications_signaled = true;
+        // signal the notification now
+        std::unique_lock<std::mutex> lock(renderer.notification_mutex);
+
+        if (vertex_notification.address)
+            *vertex_notification.address.get(mem) = vertex_notification.value;
+        if (fragment_notification.address)
+            *fragment_notification.address.get(mem) = fragment_notification.value;
+
+        // unlocking before a notify should be faster
+        lock.unlock();
+        renderer.notification_ready.notify_all();
+    };
+
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal) {
+        auto &metal = static_cast<metal::MetalState &>(renderer);
+        bool already_synced = false;
+        if (render_context) {
+            auto &ctx=static_cast<metal::MetalContext &>(*render_context);
+            if(helper.cmd->status) metal.finish(ctx);
+            else already_synced = metal.end_scene(ctx, renderer.disable_surface_sync);
+        }
+        const auto *surface = helper.cmd->status ? helper.pop<SceGxmColorSurface *>()
+            : (render_context ? &render_context->record.color_surface : nullptr);
+        const bool synced = surface && (helper.cmd->status || !renderer.disable_surface_sync)
+            && (already_synced || metal.sync_surface(mem, *surface));
+        signal_notifications();
+        if (helper.cmd->status) complete_command(renderer, helper, synced ? 0 : 1);
+        return;
+    }
+#endif
+
+    if (renderer.disable_surface_sync)
+        // do it as soon as possible
+        signal_notifications();
+
+    if (renderer.current_backend == Backend::Vulkan) {
+        vulkan::VKContext *context = reinterpret_cast<vulkan::VKContext *>(render_context);
+        if (context->is_recording)
+            context->stop_recording(vertex_notification, fragment_notification);
+    }
+
+    SceGxmColorSurface *surface = &render_context->record.color_surface;
+    if (helper.cmd->status) {
+        surface = helper.pop<SceGxmColorSurface *>();
+        if (!surface) {
+            signal_notifications();
+            complete_command(renderer, helper, 1);
+            return;
+        }
+    }
+
+    // additional check to make sure we never try to perform surface sync on OpenGL with a non-integer resolution multiplier
+    if (renderer.current_backend == Backend::OpenGL && static_cast<int>(renderer.res_multiplier * 4.0f) % 4 != 0)
+        renderer.disable_surface_sync = true;
+
+    if (renderer.disable_surface_sync || renderer.current_backend == Backend::Vulkan) {
+        if (helper.cmd->status) {
+            complete_command(renderer, helper, 0);
+        }
+        signal_notifications();
+        return;
+    }
+
+#ifndef __ANDROID__
+
+    const size_t width = surface->width;
+    const size_t height = surface->height;
+    const size_t stride_in_pixels = surface->strideInPixels;
+    const Address data = surface->data.address();
+    uint32_t *const pixels = Ptr<uint32_t>(data).get(mem);
+
+    // We protect the data to track syncing. If this is called then the data is definitely protected somehow.
+    // We just unprotect and reprotect again :D
+    const std::size_t total_size = height * gxm::get_stride_in_bytes(surface->colorFormat, stride_in_pixels);
+
+    switch (renderer.current_backend) {
+    case Backend::OpenGL:
+        if (helper.cmd->status) {
+            gl::lookup_and_get_surface_data(static_cast<gl::GLState &>(renderer), mem, *surface);
+        } else {
+            gl::get_surface_data(static_cast<gl::GLState &>(renderer), *reinterpret_cast<gl::GLContext *>(render_context), pixels, *surface);
+        }
+        break;
+
+    case Backend::Vulkan:
+        break;
+
+    default:
+        REPORT_MISSING(renderer.current_backend);
+        break;
+    }
+
+#if DEBUG_FRAMEBUFFER
+    if (data != 0 && config.color_surface_debug) {
+        const std::string filename = fmt::format("color_surface_0x{:X}.png", data);
+
+        // Assuming output is RGBA
+        const int result = stbi_write_png(filename.c_str(), width, height, 4, pixels, stride_in_pixels * 4);
+
+        if (!result) {
+            LOG_TRACE("Fail to save color surface 0x{:X}", data);
+        }
+    }
+#endif
+#endif
+
+    if (helper.cmd->status) {
+        complete_command(renderer, helper, 0);
+    }
+
+    signal_notifications();
+    }
+
+void cmd_handle_mid_scene_flush_metal3(renderer::State &renderer, MemState &mem, Config &config, CommandHelper &helper, const FeatureState &features, Context *render_context) {
+    TRACY_FUNC_COMMANDS(handle_mid_scene_flush);
+
+#ifdef __APPLE__
+    if (renderer.current_backend == Backend::Metal) {
+        const auto notification = helper.pop<SceGxmNotification>();
+        if (render_context)
+            static_cast<metal::MetalState &>(renderer).mid_scene_flush(
+                *static_cast<metal::MetalContext *>(render_context), bool(notification.address));
+        if (notification.address) {
+            std::unique_lock<std::mutex> lock(renderer.notification_mutex);
+            if (uint32_t *value = notification.address.get(mem))
+                *value = notification.value;
+            lock.unlock();
+            renderer.notification_ready.notify_all();
+        }
+        return;
+    }
+#endif
+    if (!renderer.features.enable_memory_mapping) {
+        // handle it like a simple notification
+        cmd_handle_notification(renderer, mem, config, helper, features, render_context);
+        return;
+    }
+
+    const SceGxmNotification notification = helper.pop<SceGxmNotification>();
+    if (renderer.current_backend == Backend::Vulkan) {
+        vulkan::mid_scene_flush(*reinterpret_cast<vulkan::VKContext *>(render_context), notification);
+    }
+    }
+
+void cmd_handle_draw_metal3(renderer::State &renderer, MemState &mem, Config &config, CommandHelper &helper, const FeatureState &features, Context *render_context) {
+    TRACY_FUNC_COMMANDS(handle_draw);
+    SceGxmPrimitiveType type = helper.pop<SceGxmPrimitiveType>();
+    SceGxmIndexFormat format = helper.pop<SceGxmIndexFormat>();
+    Ptr<const void> indices = helper.pop<Ptr<const void>>();
+    const std::uint32_t count = helper.pop<const std::uint32_t>();
+    const std::uint32_t instance_count = helper.pop<const std::uint32_t>();
+
+    switch (renderer.current_backend) {
+    case Backend::OpenGL:
+        gl::draw(dynamic_cast<gl::GLState &>(renderer), *reinterpret_cast<gl::GLContext *>(render_context),
+            features, type, format, indices.cast<void>().get(mem), count, instance_count, mem, config);
+        break;
+
+#ifdef __APPLE__
+    case Backend::Metal:
+        static_cast<metal::MetalState &>(renderer).draw(static_cast<metal::MetalContext &>(*render_context), mem, type, format, indices.get(mem), count, instance_count);
+        break;
+#endif
+    case Backend::Vulkan:
+        vulkan::draw(*reinterpret_cast<vulkan::VKContext *>(render_context), type, format, indices.cast<void>(),
+            count, instance_count, mem, config);
+        break;
+
+    default:
+        REPORT_MISSING(renderer.current_backend);
+        break;
+    }
+    }
+} // namespace renderer

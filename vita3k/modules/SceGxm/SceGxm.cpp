@@ -19,9 +19,9 @@
 
 #include <modules/module_parent.h>
 #ifdef __APPLE__
-#include <renderer/metal3/state.h>
-#include <renderer/metal3/integration.h>
-#include <renderer/metal3/vertex_layout.h>
+#include <renderer/metal4/state.h>
+#include <renderer/metal4/integration.h>
+#include <renderer/metal4/vertex_layout.h>
 #include <util/bytes.h>
 #endif
 
@@ -6393,5 +6393,5 @@ EXPORT(int, sceGxmWaitEvent) {
 }
 
 #ifdef __APPLE__
-#include "metal3/SceGxm_metal.inl"
+#include "metal4/SceGxm_metal.inl"
 #endif

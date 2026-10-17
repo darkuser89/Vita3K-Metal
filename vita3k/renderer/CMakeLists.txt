@@ -56,21 +56,21 @@ if(ANDROID)
 endif()
 
 if(APPLE)
-    target_link_libraries(renderer PRIVATE shader-metal3)
+    target_link_libraries(renderer PRIVATE shader-metal4)
     target_sources(renderer PRIVATE
-        src/metal3/context_metal.cpp
-        src/metal3/creation_metal.cpp
-        src/metal3/renderer_metal.cpp
-        src/metal3/state_set_metal.cpp
-        src/metal3/scene_metal.cpp
-        src/metal3/transfer_metal.cpp
-        src/metal3/sync_metal.cpp
-        src/metal3/batch_metal.cpp
-        src/metal3/shaders_metal.cpp
-        src/metal3/texture_cache_metal.cpp
-        src/metal3/texture_replacement_metal.cpp
-        src/metal3/texture_yuv_metal.cpp
-        src/metal3/texture_format_metal.cpp
+        src/metal4/context_metal.cpp
+        src/metal4/creation_metal.cpp
+        src/metal4/renderer_metal.cpp
+        src/metal4/state_set_metal.cpp
+        src/metal4/scene_metal.cpp
+        src/metal4/transfer_metal.cpp
+        src/metal4/sync_metal.cpp
+        src/metal4/batch_metal.cpp
+        src/metal4/shaders_metal.cpp
+        src/metal4/texture_cache_metal.cpp
+        src/metal4/texture_replacement_metal.cpp
+        src/metal4/texture_yuv_metal.cpp
+        src/metal4/texture_format_metal.cpp
     )
     # Mac-family Metal 3 devices cannot sample ASTC. Build Arm's scalar
     # decompressor for the CPU upload fallback; native Apple GPUs keep their
@@ -98,7 +98,7 @@ if(APPLE)
         "${PROJECT_SOURCE_DIR}/external/glslang/SPIRV/*.cpp"
         "${PROJECT_SOURCE_DIR}/external/glslang/SPIRV/*.h"
         "${PROJECT_SOURCE_DIR}/external/glslang/glslang/Include/*.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/renderer/metal3/*.h")
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/renderer/metal4/*.h")
     file(GLOB METAL_CROSS_INPUTS CONFIGURE_DEPENDS
         "${PROJECT_SOURCE_DIR}/external/SPIRV-Cross/*.cpp"
         "${PROJECT_SOURCE_DIR}/external/SPIRV-Cross/*.hpp"
@@ -108,9 +108,9 @@ if(APPLE)
     # the program revision. Texture transfers, upload arenas and presentation
     # do not translate guest shaders; their edits must not discard valid MSL.
     list(APPEND METAL_CACHE_INPUTS
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/metal3/state.mm"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/metal3/cache.mm"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/metal3/device.mm")
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/metal4/state.mm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/metal4/cache.mm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/metal4/device.mm")
     list(SORT METAL_CACHE_INPUTS)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${METAL_CACHE_INPUTS})
     set(METAL_CACHE_CONTENT_HASHES "")
@@ -123,7 +123,7 @@ if(APPLE)
     # changes. Retain the conservative full backend revision for archives and
     # pipeline warmup templates, independently of guest MSL translations.
     file(GLOB METAL_NATIVE_INPUTS CONFIGURE_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/metal3/*.mm")
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/metal4/*.mm")
     # Xcode cannot reliably propagate language-specific target options into
     # the mixed C++/Objective-C++ renderer. Native Metal objects must remain
     # alive across autorelease pools, so apply ARC to each native source.
@@ -138,13 +138,13 @@ if(APPLE)
     string(SHA256 METAL_NATIVE_CACHE_REVISION "${METAL_NATIVE_CONTENT_HASHES}")
     file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/cache-generated/metal_cache_revision.h"
         CONTENT "#pragma once\n#define METAL_CACHE_REVISION \"${METAL_CACHE_REVISION}\"\n#define METAL_NATIVE_CACHE_REVISION \"${METAL_NATIVE_CACHE_REVISION}\"\n")
-    add_library(renderer-metal-runtime STATIC src/metal3/device.mm src/metal3/cache.mm)
+    add_library(renderer-metal-runtime STATIC src/metal4/device.mm src/metal4/cache.mm src/metal4/metal4_commands.mm src/metal4/metal4_pipeline.mm)
     target_include_directories(renderer-metal-runtime PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/cache-generated")
 	target_include_directories(renderer-metal-runtime PUBLIC include)
 	target_compile_options(renderer-metal-runtime PUBLIC "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
 	target_link_libraries(renderer-metal-runtime PUBLIC shader "-framework Metal" "-framework Foundation")
 	target_link_libraries(renderer PRIVATE renderer-metal-runtime)
-	target_sources(renderer PRIVATE src/vulkan/metal_layer.mm src/metal3/state.mm src/metal3/overlay.mm src/metal3/screen.mm src/metal3/buffers.mm src/metal3/textures.mm src/metal3/polygon_clip.cpp)
+	target_sources(renderer PRIVATE src/vulkan/metal_layer.mm src/metal4/state.mm src/metal4/overlay.mm src/metal4/screen.mm src/metal4/buffers.mm src/metal4/textures.mm src/metal4/polygon_clip.cpp)
 	target_link_libraries(renderer PRIVATE "-framework QuartzCore" "-framework Cocoa" "-framework MetalFX")
 endif()
 

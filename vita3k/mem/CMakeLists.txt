@@ -11,7 +11,7 @@ add_library(
 	include/mem/util.h
 	src/allocator.cpp
 	src/mem.cpp
-	../renderer/src/metal3/memory_metal.cpp
+	../renderer/src/metal4/memory_metal.cpp
 )
 
 target_include_directories(mem PUBLIC include)

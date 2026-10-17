@@ -20,7 +20,7 @@
 #include <renderer/commands.h>
 #include <renderer/types.h>
 #ifdef __APPLE__
-#include <renderer/metal3/commands.h>
+#include <renderer/metal4/commands.h>
 #endif
 
 #include <string>

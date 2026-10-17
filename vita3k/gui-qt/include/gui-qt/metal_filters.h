@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
-#include <renderer/metal3/capabilities.h>
+#include <renderer/metal4/capabilities.h>
 #include <QStringList>
 
 namespace gui {

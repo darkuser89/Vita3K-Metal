@@ -1816,7 +1816,7 @@ void MainWindow::setup_status_bar() {
         auto *vulkan_action = menu.addAction(QStringLiteral("Vulkan"));
         auto *opengl_action = menu.addAction(QStringLiteral("OpenGL"));
 #ifdef __APPLE__
-        auto *metal_action = menu.addAction(QStringLiteral("Metal 3"));
+        auto *metal_action = menu.addAction(QStringLiteral("Metal 4"));
 #endif
         QAction *chosen = menu.exec(m_renderer_button->mapToGlobal(pos));
         if (!chosen)
@@ -2029,7 +2029,7 @@ void MainWindow::update_renderer_button() {
         m_renderer_button->setText(QStringLiteral("VULKAN"));
         update_status_button_accent(m_renderer_button, QStringLiteral("renderer_vulkan"));
     } else if (renderer == "Metal") {
-        m_renderer_button->setText(QStringLiteral("Metal 3"));
+        m_renderer_button->setText(QStringLiteral("Metal 4"));
         update_status_button_accent(m_renderer_button, QStringLiteral("neutral"));
     } else {
         m_renderer_button->setText(QStringLiteral("OPENGL"));
