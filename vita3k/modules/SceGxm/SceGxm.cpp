@@ -3172,7 +3172,7 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
     emuenv.gxm.display_queue.maxPendingCount_ = max_queue_size;
 
     const ThreadStatePtr main_thread = emuenv.kernel.get_thread(thread_id);
-    const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", Ptr<void>(0), SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, nullptr);
+    const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", Ptr<void>(0), SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, 0, nullptr);
     if (!display_queue_thread) {
         return RET_ERROR(SCE_GXM_ERROR_DRIVER);
     }
@@ -5549,7 +5549,7 @@ EXPORT(uint32_t, sceGxmTextureGetLodMin, const SceGxmTexture *texture) {
         return 0;
     }
 
-    return texture->lod_min0 | (texture->lod_min1 << 2);
+    return texture->true_lod_min();
 }
 
 EXPORT(int, sceGxmTextureGetMagFilter, const SceGxmTexture *texture) {
@@ -5889,8 +5889,8 @@ EXPORT(int, sceGxmTextureSetLodMin, SceGxmTexture *texture, uint32_t lodMin) {
         return RET_ERROR(SCE_GXM_ERROR_UNSUPPORTED);
     }
 
-    texture->lod_min0 = lodMin & 3;
-    texture->lod_min1 = lodMin >> 2;
+    texture->lod_min0 = lodMin >> 2;
+    texture->lod_min1 = lodMin & 3;
 
     return 0;
 }

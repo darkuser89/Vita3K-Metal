@@ -359,6 +359,7 @@ VKState::VKState(int gpu_idx)
 
 bool VKState::init() {
     shader_version = fmt::format("v{}", shader::CURRENT_VERSION);
+    features.use_mask_bit = true;
     return true;
 }
 
@@ -567,6 +568,24 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
         physical_device_memory = physical_device.getMemoryProperties();
         physical_device_queue_families = physical_device.getQueueFamilyProperties();
 
+        const auto rgba4_features = physical_device.getFormatProperties(vk::Format::eR4G4B4A4UnormPack16).optimalTilingFeatures;
+        const auto required_rgba4_features = vk::FormatFeatureFlagBits::eSampledImage | vk::FormatFeatureFlagBits::eSampledImageFilterLinear
+            | vk::FormatFeatureFlagBits::eColorAttachment | vk::FormatFeatureFlagBits::eColorAttachmentBlend
+            | vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eBlitDst;
+        const auto rgba4_usages = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst
+            | vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eInputAttachment;
+        vk::ImageFormatProperties rgba4_properties;
+        const auto rgba4_result = physical_device.getImageFormatProperties(vk::Format::eR4G4B4A4UnormPack16,
+            vk::ImageType::e2D, vk::ImageTiling::eOptimal, rgba4_usages, {}, &rgba4_properties);
+        if (rgba4_result != vk::Result::eSuccess && rgba4_result != vk::Result::eErrorFormatNotSupported) {
+            LOG_ERROR("Failed to query RGBA4444 surface support: {}", vk::to_string(rgba4_result));
+            return false;
+        }
+        support_native_rgba4_surface = rgba4_result == vk::Result::eSuccess
+            && (rgba4_features & required_rgba4_features) == required_rgba4_features;
+        LOG_INFO("Vulkan RGBA4444 optimal tiling features: {}; surface usage query: {}",
+            vk::to_string(rgba4_features), vk::to_string(rgba4_result));
+
 #ifdef __ANDROID__
         if (custom_driver_requested) {
             if (android_driver::is_custom_driver_loaded(
@@ -628,6 +647,7 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
         bool support_buffer_device_address = false;
         bool support_external_memory = false;
         bool support_shader_interlock = false;
+        bool support_image_view_usage = false;
         const std::map<std::string_view, bool *> optional_extensions = {
             { vk::KHRGetMemoryRequirements2ExtensionName, &temp_bool },
             // can be used by vma to improve performance
@@ -636,6 +656,8 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
             { vk::EXTGlobalPriorityExtensionName, &support_global_priority },
             // can be used to specify which format will be used by mutable images
             { vk::KHRImageFormatListExtensionName, &surface_cache.support_image_format_specifier },
+            // allows sRGB views to exclude storage usage inherited from UNORM images
+            { vk::KHRMaintenance2ExtensionName, &support_image_view_usage },
             { vk::KHRExternalMemoryExtensionName, &temp_bool },
             { vk::KHRDeviceGroupExtensionName, &temp_bool },
             // can host memory directly be used for gxm memory
@@ -752,6 +774,10 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
         }
 
         support_shader_interlock &= static_cast<bool>(physical_device_features.fragmentStoresAndAtomics);
+        if (support_shader_interlock && !support_image_view_usage) {
+            LOG_WARN("Shader interlock disabled: VK_KHR_maintenance2 is required for separate sRGB attachment and UNORM storage views");
+            support_shader_interlock = false;
+        }
         if (support_shader_interlock) {
             auto props = physical_device.getFeatures2KHR<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT>();
             support_shader_interlock = static_cast<bool>(props.get<vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT>().fragmentShaderSampleInterlock);
@@ -924,7 +950,7 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
     support_fsr &= screen_renderer.surface_format.format == vk::Format::eR8G8B8A8Unorm;
     support_fsr &= static_cast<bool>(physical_device.getFormatProperties(screen_renderer.surface_format.format).optimalTilingFeatures & vk::FormatFeatureFlagBits::eStorageImage);
 
-    return true;
+    return init();
 }
 
 void VKState::late_init(const Config &cfg, const std::string_view game_id, MemState &mem) {
@@ -940,6 +966,10 @@ void VKState::late_init(const Config &cfg, const std::string_view game_id, MemSt
         features.direct_fragcolor = true;
         features.support_shader_interlock = false;
     }
+
+    LOG_INFO("Vulkan RGBA4444 render surfaces: {}",
+        features.support_shader_interlock ? "RGBA8 fallback (typed storage image required by shader interlock)"
+                                          : (support_native_rgba4_surface ? "native" : "RGBA8 fallback (native surface usages unsupported)"));
 
     // texture viewport is faster but not entirely accurate
     if (support_standard_layout && !use_high_accuracy) {
@@ -1286,7 +1316,7 @@ bool VKState::map_memory(MemState &mem, Ptr<void> address, uint32_t size) {
     assert(features.enable_memory_mapping);
     // the address should be 4K aligned
     assert((address.address() & 4095) == 0);
-    constexpr vk::BufferUsageFlags mapped_memory_flags = vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress | vk::BufferUsageFlagBits::eTransferDst;
+    constexpr vk::BufferUsageFlags mapped_memory_flags = vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc;
 
     auto find_mem_type_with_flag = [&](const vk::MemoryPropertyFlags flags, uint32_t hardware_types) {
         while (hardware_types != 0) {

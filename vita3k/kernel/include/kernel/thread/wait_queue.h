@@ -63,7 +63,7 @@ public:
     // With callbacks, the thread runs its notified callbacks while it waits.
     [[nodiscard]] WaitResult wait_until_ready(std::unique_lock<std::mutex> &lock, const ThreadStatePtr &thread, WaitTarget target, Entry entry, Deadline deadline, bool callbacks, std::predicate<Waiter &> auto ready) {
         Waiter waiter{ .thread = thread, .entry = std::move(entry) };
-        waiter.priority = waiter.thread->priority;
+        waiter.priority = waiter.thread->get_priority();
         push(waiter);
         while (true) {
             lock.unlock();
@@ -111,6 +111,11 @@ public:
     Waiter *find_if(std::predicate<Waiter &> auto pick) {
         const auto it = std::find_if(waiters.begin(), waiters.end(), [&](Waiter *w) { return pick(*w); });
         return it == waiters.end() ? nullptr : *it;
+    }
+
+    // Returns how many waiters pick accepts.
+    std::size_t count_if(std::predicate<const Waiter &> auto pick) const {
+        return std::count_if(waiters.begin(), waiters.end(), [&](const Waiter *w) { return pick(*w); });
     }
 
     // Ends a wait with result and takes the waiter off the queue.
