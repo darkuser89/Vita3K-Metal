@@ -7,6 +7,8 @@
 #include <limits>
 #include <stdexcept>
 #include <cstring>
+#define XXH_INLINE_ALL
+#include <xxhash.h>
 
 namespace renderer::metal {
 bool memory_backed_uniform_slot(uint32_t buffer_flags, uint32_t renderer_slot) {
@@ -83,7 +85,39 @@ UploadBufferSlice UploadBufferArena::allocate(Device &device, size_t length, siz
     blocks.push_back({buffer, length});
     return {buffer, 0};
 }
+ReadonlyBufferUpload UploadBufferArena::copy_readonly(Device &device, std::span<const uint8_t> bytes) {
+    if (bytes.empty() || bytes.size() > device.native_device().maxBufferLength)
+        throw std::invalid_argument("Metal: invalid read-only upload");
+    const auto key = std::pair{bytes.size(), uint64_t(XXH3_64bits(bytes.data(), bytes.size()))};
+    const auto [first, last] = readonly_copies.equal_range(key);
+    for (auto found = first; found != last; ++found) {
+        const auto &slice = found->second;
+        const auto *previous = static_cast<const uint8_t *>(slice.buffer.contents) + slice.offset;
+        // Fingerprints only narrow the candidates. Changed live guest bytes
+        // and hash collisions must never reuse a different input snapshot.
+        if (std::memcmp(previous, bytes.data(), bytes.size()) == 0) return {slice, 0};
+    }
+    const auto slice = allocate(device, bytes.size());
+    std::memcpy(static_cast<uint8_t *>(slice.buffer.contents) + slice.offset, bytes.data(), bytes.size());
+    if (readonly_copies.size() >= 64) readonly_copies.clear();
+    readonly_copies.emplace(key, slice);
+    return {slice, bytes.size()};
+}
+ReadonlyBufferUpload UploadBufferArena::copy_snapshot(Device &device, const OwnedVertexSnapshot &owner) {
+    if (!owner || owner->empty() || owner->size() > device.native_device().maxBufferLength)
+        throw std::invalid_argument("Metal: invalid vertex snapshot upload");
+    if (const auto found = snapshot_copies.find(owner.get()); found != snapshot_copies.end())
+        return {found->second.slice, 0};
+    const auto slice = allocate(device, owner->size());
+    std::memcpy(static_cast<uint8_t *>(slice.buffer.contents) + slice.offset, owner->data(), owner->size());
+    if (snapshot_copies.size() >= 64) snapshot_copies.clear();
+    // Keeping the immutable owner prevents address reuse until eviction/reset.
+    snapshot_copies.emplace(owner.get(), SnapshotCopy{owner, slice});
+    return {slice, owner->size()};
+}
 void UploadBufferArena::reset_after_completion() {
+    readonly_copies.clear();
+    snapshot_copies.clear();
     // Avoid retaining the largest exceptional draw for the entire game.
     size_t retained = 0, keep = 0;
     for (auto &block : blocks) {
@@ -100,26 +134,46 @@ UploadBufferSlice DirectGuestBufferCache::get(Device &device, uintptr_t begin, u
         throw std::invalid_argument("Metal: invalid direct guest buffer range");
     const auto key = std::make_pair(begin, end);
     if (const auto found = buffers.find(key); found != buffers.end())
-        return {found->second, 0};
+        return found->second;
     // Uniform addresses often advance through one large GXM mapping. Reuse a
     // containing resource instead of registering its remaining pages again.
-    for (const auto &[range, buffer] : buffers) {
-        if (range.first > begin) break;
-        if (range.second >= end) return {buffer, begin - range.first};
+    // The first end reaching this binding is also the earliest possible
+    // containing start. Preserve the old owner choice without scanning all
+    // preceding ranges. If its start is too late, every later one is too.
+    if (const auto found = starts_by_end.lower_bound(end);
+        found != starts_by_end.end() && found->second <= begin) {
+        const auto owner = buffers.find({found->second, found->first});
+        return {owner->second.buffer, begin - found->second, owner->second.residency};
     }
     id<MTLBuffer> buffer = [device.native_device() newBufferWithBytesNoCopy:reinterpret_cast<void *>(begin)
         length:end - begin options:MTLResourceStorageModeShared deallocator:nil];
     if (!buffer || !buffer.gpuAddress)
         throw std::runtime_error("Metal: cannot map direct guest buffer");
+    // Large GXM mappings otherwise enter and leave every submission's set.
+    // Keep membership immutable for this exact cached resource; no game,
+    // address or size heuristic changes which guest bytes the GPU can access.
+    auto descriptor = [MTLResidencySetDescriptor new];
+    descriptor.initialCapacity = 1;
+    descriptor.label = @"Vita3K cached guest buffer";
+    NSError *error = nil;
+    auto residency = [device.native_device() newResidencySetWithDescriptor:descriptor error:&error];
+    if (!residency)
+        throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal: guest buffer residency allocation failed");
+    [residency addAllocation:buffer];
+    [residency commit];
     // Already encoded commands retain their resources through useResource.
     // Drop cache ownership of narrower aliases now covered by this buffer.
     for (auto entry = buffers.lower_bound({begin, 0}); entry != buffers.end();) {
         if (entry->first.first >= end) break;
-        if (entry->first.second <= end) entry = buffers.erase(entry);
+        if (entry->first.second <= end) {
+            starts_by_end.erase(entry->first.second);
+            entry = buffers.erase(entry);
+        }
         else ++entry;
     }
-    buffers.emplace(key, buffer);
-    return {buffer, 0};
+    buffers.emplace(key, UploadBufferSlice{buffer, 0, residency});
+    starts_by_end.emplace(end, begin);
+    return {buffer, 0, residency};
 }
 GuestBufferBindings::GuestBufferBindings(Device &device, std::span<const GuestBufferRange> ranges, size_t page_size, bool snapshot,
     UploadBufferArena *arena, DirectGuestBufferCache *direct_cache)
@@ -143,7 +197,7 @@ GuestBufferBindings::GuestBufferBindings(Device &device, std::span<const GuestBu
         if (!mappings.empty() && begin <= mappings.back().end) {
             mappings.back().end = std::max(mappings.back().end, end);
             mappings.back().direct |= direct;
-        } else mappings.push_back({begin, end, nil, 0, direct, direct});
+        } else mappings.push_back({begin, end, nil, 0, nil, direct, direct});
     }
     for (auto &mapping : mappings) {
         // A register-only binding inside mapped guest pages does not shorten
@@ -176,6 +230,7 @@ GuestBufferBindings::GuestBufferBindings(Device &device, std::span<const GuestBu
             const auto slice = direct_cache->get(device, mapping.begin, mapping.end);
             mapping.buffer = slice.buffer;
             mapping.offset = slice.offset;
+            mapping.residency = slice.residency;
         }
         else mapping.buffer = [device.native_device() newBufferWithBytesNoCopy:reinterpret_cast<void *>(mapping.begin)
             length:length options:MTLResourceStorageModeShared deallocator:nil];
@@ -197,7 +252,9 @@ uint64_t GuestBufferBindings::address(const GuestBufferRange &range) const {
     throw std::out_of_range("Metal: uniform buffer is not mapped");
 }
 void GuestBufferBindings::make_resident(V3KMetal4RenderEncoder * encoder) const {
-    for (const auto &mapping : mappings)
-        [encoder useResource:mapping.buffer usage:snapshots && !mapping.direct ? MTLResourceUsageRead : MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageVertex | MTLRenderStageFragment];
+    for (const auto &mapping : mappings) {
+        if (mapping.residency) [encoder useResource:mapping.buffer residencySet:mapping.residency];
+        else [encoder useResource:mapping.buffer usage:snapshots && !mapping.direct ? MTLResourceUsageRead : MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageVertex | MTLRenderStageFragment];
+    }
 }
 }

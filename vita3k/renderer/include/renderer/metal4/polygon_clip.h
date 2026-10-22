@@ -74,4 +74,18 @@ std::vector<RoutedWideLine> route_wide_lines(bool triangles, PolygonTopology top
     bool cull_front, bool cull_back, float viewport_width, float viewport_height,
     float front_width, float back_width);
 
+// Ordinary primitives whose guard + guest clip count exceeds the native
+// eight-plane interface. Existing point-polygon/wide-line routing clips the
+// same expanded capture directly. Keep one output group per source primitive.
+enum class ClipPrimitiveKind { Points, Lines, Triangles };
+struct RoutedClipPrimitive {
+    PolygonFace face = PolygonFace::Front;
+    ClipPrimitiveKind kind = ClipPrimitiveKind::Triangles;
+    std::vector<CapturedVertexOutputs> vertices;
+};
+std::vector<RoutedClipPrimitive> route_clip_overflow(ClipPrimitiveKind kind,
+    PolygonTopology topology, std::span<const uint32_t> indices,
+    std::span<const CapturedVertexOutputs> captured, bool cull_front,
+    bool cull_back, bool wireframe);
+
 } // namespace renderer::metal

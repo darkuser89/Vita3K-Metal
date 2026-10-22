@@ -296,4 +296,53 @@ std::vector<RoutedWideLine> route_wide_lines(bool triangles, PolygonTopology top
     return result;
 }
 
+std::vector<RoutedClipPrimitive> route_clip_overflow(ClipPrimitiveKind kind,
+    PolygonTopology topology, std::span<const uint32_t> indices,
+    std::span<const CapturedVertexOutputs> captured, bool cull_front,
+    bool cull_back, bool wireframe) {
+    std::vector<RoutedClipPrimitive> result;
+    const auto source = [&](uint32_t index) -> const CapturedVertexOutputs & {
+        if (index >= captured.size()) throw std::out_of_range("Clip replay index exceeds captured vertices");
+        return captured[index];
+    };
+    if (kind == ClipPrimitiveKind::Triangles) {
+        for (auto &polygon : route_point_polygons(topology, indices, captured, cull_front, cull_back)) {
+            RoutedClipPrimitive routed;
+            routed.face = polygon.face;
+            routed.kind = wireframe ? ClipPrimitiveKind::Lines : ClipPrimitiveKind::Triangles;
+            const auto &points = polygon.points;
+            if (wireframe && points.size() >= 2) {
+                for (size_t edge = 0; edge < points.size(); ++edge) {
+                    routed.vertices.push_back(points[edge]);
+                    routed.vertices.push_back(points[(edge + 1) % points.size()]);
+                }
+            } else if (!wireframe) {
+                for (size_t corner = 2; corner < points.size(); ++corner) {
+                    routed.vertices.push_back(points[0]);
+                    routed.vertices.push_back(points[corner - 1]);
+                    routed.vertices.push_back(points[corner]);
+                }
+            }
+            if (!routed.vertices.empty()) result.push_back(std::move(routed));
+        }
+    } else if (kind == ClipPrimitiveKind::Lines) {
+        for (size_t at = 0; at + 1 < indices.size(); at += 2) {
+            auto endpoints = clip_line_outputs({source(indices[at]), source(indices[at + 1])}, true);
+            if (endpoints) result.push_back({PolygonFace::Front, kind, {(*endpoints)[0], (*endpoints)[1]}});
+        }
+    } else {
+        // Native point coverage/clipping handles X/Y and point size. Reject
+        // only the captured guards/guest planes here, before their slots are
+        // reduced to the eight native replay outputs.
+        for (auto index : indices) {
+            const auto &point = source(index);
+            bool inside = true;
+            for (size_t plane = 0; plane < shader::metal::CAPTURE_CLIP_COUNT; ++plane)
+                inside &= point[shader::metal::CAPTURE_CLIP_SLOT + plane][0] >= 0;
+            if (inside) result.push_back({PolygonFace::Front, kind, {point}});
+        }
+    }
+    return result;
+}
+
 } // namespace renderer::metal

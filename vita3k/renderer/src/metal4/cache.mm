@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <dispatch/dispatch.h>
 #include <fcntl.h>
@@ -324,11 +325,36 @@ struct PersistentCache::Impl {
         std::lock_guard lock(mutex);
         ++counters.archive_writes;
     }
+    void acquire_write_slot(dispatch_semaphore_t slots, CacheWriteWaitStats CacheStats::*kind) {
+        // The common uncontended path needs no clock read. Keep the bounded
+        // writer and never hold its completion/error mutex during a slot wait.
+        const bool contended = dispatch_semaphore_wait(slots, DISPATCH_TIME_NOW) != 0;
+        uint64_t waited = 0;
+        if (contended) {
+            const auto start = std::chrono::steady_clock::now();
+            dispatch_semaphore_wait(slots, DISPATCH_TIME_FOREVER);
+            waited = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start).count();
+        }
+        try {
+            std::lock_guard lock(mutex);
+            auto &stats = counters.*kind;
+            ++stats.acquisitions;
+            if (contended) {
+                ++stats.contended;
+                stats.total_wait_ns += waited;
+                stats.max_wait_ns = std::max(stats.max_wait_ns, waited);
+            }
+        } catch (...) {
+            dispatch_semaphore_signal(slots);
+            throw;
+        }
+    }
     void save(std::shared_ptr<PipelineArchiveWrite> archive, const std::filesystem::path &path) {
         if (!archive) return;
         // Backpressure bounds retained native archives, even on a slow disk.
         // Never hold the cache mutex while waiting for the writer to progress.
-        dispatch_semaphore_wait(archive_slots, DISPATCH_TIME_FOREVER);
+        acquire_write_slot(archive_slots, &CacheStats::archive_write_slots);
         try {
             const auto destination = path;
             {
@@ -381,7 +407,7 @@ struct PersistentCache::Impl {
         const std::filesystem::path &index_path = {}, std::string index_bytes = {}) {
         // Bound retained MSL payloads independently of native archives. The
         // caller never waits with the cache mutex held.
-        dispatch_semaphore_wait(file_slots, DISPATCH_TIME_FOREVER);
+        acquire_write_slot(file_slots, &CacheStats::file_write_slots);
         std::shared_ptr<const std::string> contents;
         try {
             const auto destination = path;
@@ -480,6 +506,7 @@ std::optional<shader::metal::Program> PersistentCache::load_program(std::string_
     if (program.entry_point.find('\0') != std::string::npos || program.source.find('\0') != std::string::npos)
         return miss(true);
     ++impl->counters.program_hits;
+    if (!pending) ++impl->counters.program_disk_hits;
     return program;
 }
 void PersistentCache::store_program(std::string_view key, const shader::metal::Program &program,
@@ -674,6 +701,7 @@ id<MTLRenderPipelineState> PersistentCache::create_render_pipeline(MTLRenderPipe
         if (cached) {
             std::lock_guard lock(impl->mutex);
             ++impl->counters.pipeline_hits;
+            ++impl->counters.pipeline_disk_hits;
             return cached;
         }
         LOG_WARN("Metal 4 render archive did not contain the requested pipeline: {}", error_text(native_error));
@@ -718,6 +746,7 @@ id<MTLComputePipelineState> PersistentCache::create_compute_pipeline(id<MTLFunct
         if (cached) {
             std::lock_guard lock(impl->mutex);
             ++impl->counters.pipeline_hits;
+            ++impl->counters.pipeline_disk_hits;
             return cached;
         }
     }

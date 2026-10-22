@@ -216,6 +216,10 @@ void cmd_handle_sync_surface_data_metal3(renderer::State &renderer, MemState &me
 #ifdef __APPLE__
     if (renderer.current_backend == Backend::Metal) {
         auto &metal = static_cast<metal::MetalState &>(renderer);
+        if (!helper.cmd->status && render_context
+            && metal.defer_scene_completion(static_cast<metal::MetalContext &>(*render_context), mem,
+                vertex_notification, fragment_notification)) return;
+        metal.drain_guest_publications();
         bool already_synced = false;
         if (render_context) {
             auto &ctx=static_cast<metal::MetalContext &>(*render_context);

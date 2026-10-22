@@ -24,6 +24,7 @@
 #include <shader/metal4/usse_utilities.h>
 
 #include <SPIRV/SpvBuilder.h>
+#include <array>
 #include <map>
 
 struct FeatureState;
@@ -59,6 +60,9 @@ public:
     // extra1 is either lod or ddx, extra2 is ddy
     spv::Id do_fetch_texture(const spv::Id tex, const int texture_index, const int dim, const Coord &coord, const DataType dest_type, const int lod_mode,
         const spv::Id extra1 = spv::NoResult, const spv::Id extra2 = spv::NoResult, const int gather4_comp = -1, const bool gather_uv = false);
+    // Normalized FP32 coordinate body, also used by the inline reference tests.
+    spv::Id emit_fetch_texture(spv::Id tex, int texture_index, int dim, spv::Id coord_id, DataType dest_type,
+        int lod_mode, spv::Id extra1, spv::Id extra2, int gather4_comp, bool gather_uv);
 
     USSETranslatorVisitor() = delete;
     explicit USSETranslatorVisitor(spv::Builder &_b, USSERecompiler &_recompiler, const SceGxmProgram &program, const FeatureState &features,
@@ -845,7 +849,11 @@ public:
         Imm7 src2_n);
     // Instructions end
 private:
-    spv::Id vtst_impl(Instruction inst, ExtPredicate pred, int zero_test, int sign_test, Imm4 load_mask, bool mask, spv::Id *alu_result = nullptr);
+    spv::Id vtst_impl(Instruction inst, ExtPredicate pred, int zero_test, int sign_test, Imm4 load_mask, bool mask, bool test_crcomb_and, spv::Id *alu_result = nullptr, int src1_repeat_offset = 0, int src2_repeat_offset = 0);
+
+    // Builder-local functions. All options not in this key belong to the
+    // visitor's immutable program/features/parameters, never to a draw cache.
+    std::map<std::array<uint32_t, 10>, spv::Function *> texture_helpers;
 
     // SPIR-V emitter
     spv::Builder &m_b;

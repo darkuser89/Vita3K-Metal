@@ -2,10 +2,23 @@
 // Copyright (C) 2026 Vita3K team
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <renderer/metal4/device.h>
+#include <renderer/metal4/library_reuse.h>
+#include <atomic>
+#include <stdexcept>
 #include <util/hash.h>
 #include <util/log.h>
 
 namespace renderer::metal {
+
+struct NativeShaderLibrary {
+    id<MTLLibrary> library;
+    id<MTLFunction> function;
+};
+struct Device::LibraryCache {
+    LibraryReuse<NativeShaderLibrary> reuse;
+    std::atomic<uint64_t> requests = 0, builds = 0, hits = 0;
+};
+Device::Device() : libraries(std::make_unique<LibraryCache>()) {}
 
 static std::string describe_error(NSError *error, const char *fallback) {
     return error.localizedDescription.UTF8String ?: fallback;
@@ -13,6 +26,8 @@ static std::string describe_error(NSError *error, const char *fallback) {
 
 Device::~Device() = default;
 void Device::configure_cache(const std::filesystem::path &root) {
+    libraries->reuse.clear();
+    libraries->requests = libraries->builds = libraries->hits = 0;
     cache.reset();
     if (root.empty())
         return;
@@ -46,7 +61,13 @@ void Device::flush_cache() const {
     if (cache)
         cache->flush();
 }
-CacheStats Device::cache_stats() const { return cache ? cache->stats() : CacheStats{}; }
+CacheStats Device::cache_stats() const {
+    auto stats = cache ? cache->stats() : CacheStats{};
+    stats.library_requests = libraries->requests.load();
+    stats.library_builds = libraries->builds.load();
+    stats.library_reuses = libraries->hits.load();
+    return stats;
+}
 std::filesystem::path Device::cache_directory() const { return cache ? cache->directory() : std::filesystem::path{}; }
 id<MTLComputePipelineState> Device::create_compute_pipeline(id<MTLFunction> function, std::string &error) const {
     if (cache)
@@ -115,38 +136,51 @@ std::unique_ptr<CompiledProgram> Device::compile(const shader::metal::Program &p
     const std::string entry = "vita3k_" + hex_string(sha256(identity.data(), identity.size()));
     NSString *name = [NSString stringWithUTF8String:entry.c_str()];
     options.preprocessorMacros = @{ [NSString stringWithUTF8String:program.entry_point.c_str()] : name };
-    NSError *native_error = nil;
-    auto result = std::make_unique<CompiledProgram>();
-    result->library = compile_library([NSString stringWithUTF8String:program.source.c_str()], options, &native_error);
-    if (!result->library) {
-        error = describe_error(native_error, "Could not compile Metal shader");
-        return nullptr;
-    }
-    result->function = metal4_function(result->library, name);
-    if (result->function) {
-        for (MTLFunctionConstant *constant in result->function.functionConstantsDictionary.allValues) {
-            if (constant.index != 0)
-                continue;
-            if (constant.type != MTLDataTypeBool) {
-                error = "Unexpected type for Metal gamma-correction function constant";
-                return nullptr;
+    ++libraries->requests;
+    bool reused = false;
+    std::shared_ptr<const NativeShaderLibrary> native;
+    try {
+        native = libraries->reuse.get(entry, [&]() -> std::shared_ptr<const NativeShaderLibrary> {
+            ++libraries->builds;
+            NSError *native_error = nil;
+            auto native = std::make_shared<NativeShaderLibrary>();
+            native->library = compile_library([NSString stringWithUTF8String:program.source.c_str()], options, &native_error);
+            if (!native->library) {
+                throw std::runtime_error(describe_error(native_error, "Could not compile Metal shader"));
             }
-            MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
-            [constants setConstantValue:&gamma_correction type:MTLDataTypeBool atIndex:0];
-            result->function = metal4_function(result->library, name, constants, &native_error);
-            break;
-        }
-    }
-    if (!result->function) {
-        error = describe_error(native_error, "Could not create Metal shader entry point");
+            native->function = metal4_function(native->library, name);
+            if (native->function) {
+                for (MTLFunctionConstant *constant in native->function.functionConstantsDictionary.allValues) {
+                    if (constant.index != 0)
+                        continue;
+                    if (constant.type != MTLDataTypeBool) {
+                        throw std::runtime_error("Unexpected type for Metal gamma-correction function constant");
+                    }
+                    MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
+                    [constants setConstantValue:&gamma_correction type:MTLDataTypeBool atIndex:0];
+                    native->function = metal4_function(native->library, name, constants, &native_error);
+                    break;
+                }
+            }
+            if (!native->function) {
+                throw std::runtime_error(describe_error(native_error, "Could not create Metal shader entry point"));
+            }
+            const auto expected_type = program.stage == shader::metal::Stage::Vertex ? MTLFunctionTypeVertex
+                : program.stage == shader::metal::Stage::Fragment ? MTLFunctionTypeFragment : MTLFunctionTypeKernel;
+            if (native->function.functionType != expected_type) {
+                throw std::runtime_error("Metal shader entry point has the wrong stage");
+            }
+            return native;
+        }, reused);
+    } catch (const std::exception &failure) {
+        error = failure.what();
         return nullptr;
     }
-    const auto expected_type = program.stage == shader::metal::Stage::Vertex ? MTLFunctionTypeVertex
-        : program.stage == shader::metal::Stage::Fragment ? MTLFunctionTypeFragment : MTLFunctionTypeKernel;
-    if (result->function.functionType != expected_type) {
-        error = "Metal shader entry point has the wrong stage";
-        return nullptr;
-    }
+    if (reused) ++libraries->hits;
+    auto result = std::make_unique<CompiledProgram>();
+    result->native_owner = native;
+    result->library = native->library;
+    result->function = native->function;
     result->stage = program.stage;
     result->uses_framebuffer_fetch = program.uses_framebuffer_fetch;
     result->writes_guest_memory = program.writes_guest_memory;

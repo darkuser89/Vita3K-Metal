@@ -965,12 +965,12 @@ bool USSETranslatorVisitor::sop2(
 
     if (cop >= sizeof(operations) / sizeof(Opcode)) {
         LOG_ERROR("Invalid color opcode: {}", (int)cop);
-        return true;
+        return false;
     }
 
     if (aop >= sizeof(operations) / sizeof(Opcode)) {
         LOG_ERROR("Invalid alpha opcode: {}", (int)aop);
-        return true;
+        return false;
     }
 
     Opcode color_op = operations[cop];
@@ -979,7 +979,7 @@ bool USSETranslatorVisitor::sop2(
     if (csel1 >= sizeof(color_selector_1) / sizeof(SelectorFunc) || csel2 >= sizeof(color_selector_2) / sizeof(SelectorFunc) || asel1 >= sizeof(alpha_selector_1) / sizeof(SelectorFunc) || asel2 >= sizeof(alpha_selector_2) / sizeof(SelectorFunc)) {
         LOG_ERROR("Unknown color/alpha selector (csel1: {}, csel2: {}, asel1: {}, asel2: {}", csel1, csel2,
             asel1, asel2);
-        return true;
+        return false;
     }
 
     // Lookup color selector
@@ -991,7 +991,7 @@ bool USSETranslatorVisitor::sop2(
     if (!color_selector_1_func || !color_selector_2_func || !alpha_selector_1_func || !alpha_selector_2_func) {
         LOG_ERROR("Unimplemented color/alpha selector (csel1: {}, csel2: {}, asel1: {}, asel2: {}", csel1, csel2,
             asel1, asel2);
-        return true;
+        return false;
     }
 
     auto apply_opcode = [&](Opcode op, spv::Id type, spv::Id lhs, spv::Id rhs) {
@@ -1179,12 +1179,12 @@ bool shader::metal3::usse::USSETranslatorVisitor::sop2m(Imm2 pred,
 
     if (cop >= sizeof(operations) / sizeof(Opcode)) {
         LOG_ERROR("Invalid color opcode: {}", (int)cop);
-        return true;
+        return false;
     }
 
     if (aop >= sizeof(operations) / sizeof(Opcode)) {
         LOG_ERROR("Invalid alpha opcode: {}", (int)aop);
-        return true;
+        return false;
     }
 
     Opcode color_op = operations[cop];
@@ -1196,7 +1196,7 @@ bool shader::metal3::usse::USSETranslatorVisitor::sop2m(Imm2 pred,
 
     if (!operation_1_lhs_selector_func || !operation_2_lhs_selector_func) {
         LOG_ERROR("Unimplemented operation selector (sel1: {}, sel2: {}", sel1, sel2);
-        return true;
+        return false;
     }
 
     auto apply_opcode = [&](Opcode op, spv::Id type, spv::Id lhs, spv::Id rhs) {
@@ -1418,12 +1418,12 @@ bool shader::metal3::usse::USSETranslatorVisitor::sop3(Imm2 pred,
 
     if (cop >= sizeof(operations) / sizeof(Opcode)) {
         LOG_ERROR("Invalid color opcode: {}", (int)cop);
-        return true;
+        return false;
     }
 
     if (aop >= sizeof(operations) / sizeof(Opcode)) {
         LOG_ERROR("Invalid alpha opcode: {}", (int)aop);
-        return true;
+        return false;
     }
 
     Opcode color_op = operations[cop];
@@ -1432,7 +1432,7 @@ bool shader::metal3::usse::USSETranslatorVisitor::sop3(Imm2 pred,
     if (csel1 >= sizeof(color_selector) / sizeof(SelectorFunc) || csel2 >= sizeof(color_selector) / sizeof(SelectorFunc) || asel1 >= sizeof(alpha_selector_1) / sizeof(SelectorFunc)) {
         LOG_ERROR("Unknown color/alpha selector (csel1: {}, csel2: {}, asel1: {}", csel1, csel2,
             asel1);
-        return true;
+        return false;
     }
 
     // Lookup color selector
@@ -1445,12 +1445,12 @@ bool shader::metal3::usse::USSETranslatorVisitor::sop3(Imm2 pred,
     if (!color_selector_1_func || !color_selector_2_func || !alpha_selector_1_func) {
         LOG_ERROR("Unimplemented color/alpha selector (csel1: {}, csel2: {}, asel1: {}", csel1, csel2,
             asel1);
-        return true;
+        return false;
     }
 
     if (dmod != 0) {
         LOG_ERROR("Unimplemented non-null dmod");
-        return true;
+        return false;
     }
 
     auto apply_opcode = [&](Opcode op, spv::Id type, spv::Id lhs, spv::Id rhs) {
@@ -1768,6 +1768,10 @@ bool USSETranslatorVisitor::vdual(
     op1.opcode = op1_codes[(!comp_count_type && dual_op1_ext_vec3_or_has_w_vec4) << 3u | dual_op1];
     op2.opcode = op2_codes[dual_op2_ext << 3u | dual_op2];
 
+    if (op1.opcode == Opcode::INVALID || op2.opcode == Opcode::INVALID) {
+        LOG_ERROR("Metal: reserved VDUAL opcode combination");
+        return false;
+    }
     const auto op1_info = op_info.at(op1.opcode);
     const auto op2_info = op_info.at(op2.opcode);
 

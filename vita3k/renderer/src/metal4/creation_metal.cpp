@@ -225,7 +225,7 @@ bool create_metal3(std::unique_ptr<FragmentProgram> &fp, State &state, const Sce
 #ifdef __APPLE__
     case Backend::Metal: {
         auto result = std::make_unique<metal::MetalFragmentProgram>();
-        if (blend) result->blend = *blend;
+        if (blend && !program.is_native_color()) result->blend = *blend;
         else {
             result->blend.colorMask = SCE_GXM_COLOR_MASK_ALL;
             result->blend.colorSrc = result->blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;

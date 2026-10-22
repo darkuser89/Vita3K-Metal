@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Overlay constants/effect mapping adapted from the existing Vita3K overlay renderer.
 #include <renderer/metal4/overlay.h>
+#include <renderer/metal4/overlay_mips.h>
 #include <overlay/display_manager.h>
 #include <overlay/controls.h>
 #include <overlay/font.h>
@@ -38,7 +39,7 @@ std::vector<uint32_t> read_shader(const std::filesystem::path &path) {
 struct OverlayRenderer::Impl {
     Device &device;
     id<MTLRenderPipelineState> pipeline;
-    id<MTLSamplerState> sampler;
+    id<MTLSamplerState> sampler, image_sampler;
     id<MTLTexture> white, white_array;
     std::map<const overlay::font *, id<MTLTexture>> fonts;
     struct CachedImage {
@@ -53,8 +54,8 @@ struct OverlayRenderer::Impl {
     bool resources_loaded = false;
     size_t last_view_count = SIZE_MAX, last_command_count = SIZE_MAX, last_nontransparent_count = SIZE_MAX;
     explicit Impl(Device &device) : device(device) {}
-    id<MTLTexture> texture(MTLPixelFormat format, uint32_t w, uint32_t h, uint32_t layers = 0) {
-        auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:w height:h mipmapped:NO];
+    id<MTLTexture> texture(MTLPixelFormat format, uint32_t w, uint32_t h, uint32_t layers = 0, bool mipmapped = false) {
+        auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:w height:h mipmapped:mipmapped];
         desc.storageMode = MTLStorageModeShared; desc.usage = MTLTextureUsageShaderRead;
         if (layers) { desc.textureType = MTLTextureType2DArray; desc.arrayLength = layers; }
         auto image = [device.native_device() newTextureWithDescriptor:desc];
@@ -77,8 +78,20 @@ struct OverlayRenderer::Impl {
         }
         // A changed image gets a new resource: an older command buffer may
         // still be sampling the previous texture asynchronously.
-        auto result = texture(info->channels == 4 ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatR8Unorm, info->w, info->h);
+        auto result = texture(info->channels == 4 ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatR8Unorm,
+            info->w, info->h, 0, info->w > 256 || info->h > 256);
         [result replaceRegion:MTLRegionMake2D(0,0,info->w,info->h) mipmapLevel:0 withBytes:data bytesPerRow:info->w * info->channels];
+        uint32_t mip_width = info->w, mip_height = info->h;
+        std::span<const uint8_t> previous(data, bytes);
+        std::vector<uint8_t> mip;
+        for (NSUInteger level = 1; level < result.mipmapLevelCount; ++level) {
+            mip = overlay_next_mip(previous, mip_width, mip_height, info->channels);
+            mip_width = std::max(1u, mip_width / 2);
+            mip_height = std::max(1u, mip_height / 2);
+            [result replaceRegion:MTLRegionMake2D(0,0,mip_width,mip_height) mipmapLevel:level
+                withBytes:mip.data() bytesPerRow:mip_width * info->channels];
+            previous = mip;
+        }
         cached.width = info->w;
         cached.height = info->h;
         cached.channels = info->channels;
@@ -162,6 +175,9 @@ struct OverlayRenderer::Impl {
 
     const bool is_sdf = config.active_effect == overlay::compiled_resource::effect_type::sdf
         && config.effect.sdf.func != overlay::sdf_function::none;
+    // Font atlases, legacy font images and SDF inputs retain their existing
+    // center-level filtering. Only regular image draws use trilinear sampling.
+    [encoder setFragmentSamplerState:sampler_mode == 3 && !is_sdf ? image_sampler : sampler atIndex:0];
     const bool is_gloss = config.active_effect == overlay::compiled_resource::effect_type::gloss;
     const bool is_btn_gloss = config.active_effect == overlay::compiled_resource::effect_type::btn_gloss;
     const bool has_sdf_btn_gloss = is_sdf && config.effect.sdf.btn_gloss_height > 0.f;
@@ -239,16 +255,9 @@ struct OverlayRenderer::Impl {
         }
         if (vertices->empty()) return;
         const size_t vertex_bytes = vertices->size() * sizeof(overlay::vertex);
-        if (vertex_bytes <= 4096) {
-            // Most UI commands are a single quad. Inline bytes avoid a new
-            // MTLBuffer allocation and a resource lifetime per command.
-            [encoder setVertexBytes:vertices->data() length:vertex_bytes atIndex:1];
-        } else {
-            auto buffer = [device.native_device() newBufferWithBytes:vertices->data()
-                length:vertex_bytes options:MTLResourceStorageModeShared];
-            if (!buffer) throw std::runtime_error("Metal: overlay vertex allocation failed");
-            [encoder setVertexBuffer:buffer offset:0 atIndex:1];
-        }
+        // Metal 4's wrapper owns a submission-local upload arena, including
+        // payloads larger than legacy Metal's 4 KiB inline-byte limit.
+        [encoder setVertexBytes:vertices->data() length:vertex_bytes atIndex:1];
         if (config.primitives == overlay::primitive_type::quad_list) {
             for (size_t i = 0; i + 3 < count; i += 4) [encoder drawPrimitives:type vertexStart:i vertexCount:4];
         } else [encoder drawPrimitives:type vertexStart:0 vertexCount:vertices->size()];
@@ -277,6 +286,9 @@ OverlayRenderer::OverlayRenderer(Device &device, const std::filesystem::path &as
     sampling.sAddressMode = sampling.tAddressMode = MTLSamplerAddressModeClampToEdge;
     sampling.supportArgumentBuffers = YES;
     impl->sampler = [device.native_device() newSamplerStateWithDescriptor:sampling];
+    sampling.mipFilter = MTLSamplerMipFilterLinear;
+    impl->image_sampler = [device.native_device() newSamplerStateWithDescriptor:sampling];
+    if (!impl->sampler || !impl->image_sampler) throw std::runtime_error("Metal: overlay sampler allocation failed");
     impl->white = impl->texture(MTLPixelFormatRGBA8Unorm,1,1);
     impl->white_array = impl->texture(MTLPixelFormatR8Unorm,1,1,1);
     const uint32_t pixel = 0xffffffff;

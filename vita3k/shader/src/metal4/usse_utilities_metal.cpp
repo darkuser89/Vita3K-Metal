@@ -1052,7 +1052,7 @@ static spv::Id apply_modifiers(spv::Builder &b, const SpirvUtilFunctions &utils,
             return result;
         }
 
-        result = b.createBuiltinCall(dest_type, utils.std_builtins, GLSLstd450FAbs, { result });
+        result = b.createBuiltinCall(dest_type, utils.std_builtins, is_int ? GLSLstd450SAbs : GLSLstd450FAbs, { result });
     }
 
     // Apply modifier flags
@@ -1135,6 +1135,14 @@ spv::Id load(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunc
     }
 
     if (op.bank == RegisterBank::FPCONSTANT) {
+        // SPECIAL's lower six bits select this bank. Reject malformed direct
+        // operands before a reserved register/swizzle reaches a table or ID 0.
+        if (op.num >= std::size(usse::f32_constant_table_bank_0_raw))
+            throw std::runtime_error("Metal: FP constant register out of range");
+        for (unsigned channel = 0; channel < 4; ++channel)
+            if ((dest_mask & (1u << channel))
+                && uint32_t(op.swizzle[channel]) > uint32_t(SwizzleChannel::C_H))
+                throw std::runtime_error("Metal: reserved FP constant swizzle");
         const bool integral_unsigned = (op.type == DataType::UINT32) || (op.type == DataType::UINT16);
         const bool integral_signed = (op.type == DataType::INT32) || (op.type == DataType::INT16);
         std::vector<spv::Id> consts;
@@ -1227,7 +1235,11 @@ spv::Id load(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunc
                     if (integral_unsigned)
                         return b.makeUintConstant(value_int);
                     else
-                        return b.makeIntConstant(static_cast<int16_t>(value));
+                        // Signed and unsigned loads see the same encoded half
+                        // word; only its extension to the SPIR-V scalar differs.
+                        // Numeric float->S16 conversion is also undefined for
+                        // the bank's NaNs and out-of-range finite entries.
+                        return b.makeIntConstant(std::bit_cast<int16_t>(value_int));
                 } else {
                     return b.makeFloatConstant(value);
                 }
@@ -1240,10 +1252,13 @@ spv::Id load(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunc
             }
         }
 
+        if (consts.empty())
+            throw std::runtime_error("Metal: empty or unsupported FP constant load");
         if (consts.size() == 1) {
             return apply_modifiers(b, utils, op.flags, consts[0]);
         } else {
-            spv::Id result = b.makeCompositeConstant(b.makeVectorType(type_f32, static_cast<int>(consts.size())), consts);
+            const spv::Id component_type = b.getTypeId(consts.front());
+            spv::Id result = b.makeCompositeConstant(b.makeVectorType(component_type, static_cast<int>(consts.size())), consts);
             return apply_modifiers(b, utils, op.flags, result);
         }
     }

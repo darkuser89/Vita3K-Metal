@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <renderer/metal4/device.h>
+#include <renderer/metal4/vertex_snapshots.h>
 #include <map>
 #include <span>
 #include <utility>
@@ -42,6 +43,13 @@ public:
 struct UploadBufferSlice {
     id<MTLBuffer> buffer = nil;
     size_t offset = 0;
+    // Immutable residency membership follows cached no-copy buffer ownership.
+    // Submissions retain both until GPU feedback, including after cache clear.
+    id<MTLResidencySet> residency = nil;
+};
+struct ReadonlyBufferUpload {
+    UploadBufferSlice slice;
+    size_t copied_bytes = 0;
 };
 // Each allocation owns a distinct slice until reset_after_completion(). The
 // caller must wait for every command using these slices before resetting.
@@ -53,31 +61,49 @@ class UploadBufferArena {
     std::vector<Block> blocks;
     size_t current = 0;
     size_t block_size;
+    // Only inputs explicitly uploaded as immutable may enter these caches.
+    // Mutable uniform/replay destinations continue to use allocate().
+    std::multimap<std::pair<size_t, uint64_t>, UploadBufferSlice> readonly_copies;
+    struct SnapshotCopy { OwnedVertexSnapshot owner; UploadBufferSlice slice; };
+    std::map<const std::vector<uint8_t> *, SnapshotCopy> snapshot_copies;
 public:
     explicit UploadBufferArena(size_t block_size = 1024 * 1024) : block_size(block_size) {}
     UploadBufferArena(const UploadBufferArena &) = delete;
     UploadBufferArena &operator=(const UploadBufferArena &) = delete;
     UploadBufferArena(UploadBufferArena &&other) noexcept
-        : blocks(std::move(other.blocks)), current(std::exchange(other.current, 0)), block_size(other.block_size) {}
+        : blocks(std::move(other.blocks)), current(std::exchange(other.current, 0)), block_size(other.block_size),
+          readonly_copies(std::move(other.readonly_copies)), snapshot_copies(std::move(other.snapshot_copies)) {
+        other.readonly_copies.clear(); other.snapshot_copies.clear();
+    }
     UploadBufferArena &operator=(UploadBufferArena &&other) noexcept {
         if (this != &other) {
             blocks = std::move(other.blocks);
             current = std::exchange(other.current, 0);
             block_size = other.block_size;
+            readonly_copies = std::move(other.readonly_copies);
+            snapshot_copies = std::move(other.snapshot_copies);
+            other.readonly_copies.clear(); other.snapshot_copies.clear();
         }
         return *this;
     }
     UploadBufferSlice allocate(Device &, size_t length, size_t alignment = 256);
+    // The returned slice must remain read-only on both CPU and GPU. A hit
+    // owns the same immutable bytes until this arena is completed/reset.
+    ReadonlyBufferUpload copy_readonly(Device &, std::span<const uint8_t>);
+    ReadonlyBufferUpload copy_snapshot(Device &, const OwnedVertexSnapshot &);
     void reset_after_completion();
 };
 // A GXM-mapped guest region stays live until its ordered Unmap command.
 // Reuse its no-copy Metal resource across draws and drop it after the GPU
 // has finished, before guest pages can be released or reused.
 class DirectGuestBufferCache {
-    std::map<std::pair<uintptr_t, uintptr_t>, id<MTLBuffer>> buffers;
+    std::map<std::pair<uintptr_t, uintptr_t>, UploadBufferSlice> buffers;
+    // No cached range contains another: insertion reuses a containing range
+    // and removes ranges it covers. Ends therefore increase with starts.
+    std::map<uintptr_t, uintptr_t> starts_by_end;
 public:
     UploadBufferSlice get(Device &, uintptr_t begin, uintptr_t end);
-    void clear() { buffers.clear(); }
+    void clear() { buffers.clear(); starts_by_end.clear(); }
     size_t size() const { return buffers.size(); }
 };
 // Borrowed mappings require the guest pages until GPU completion. Snapshot
@@ -88,6 +114,7 @@ class GuestBufferBindings {
         uintptr_t begin, end;
         id<MTLBuffer> buffer;
         size_t offset = 0;
+        id<MTLResidencySet> residency = nil;
         bool direct = false;
         bool cacheable = false;
     };

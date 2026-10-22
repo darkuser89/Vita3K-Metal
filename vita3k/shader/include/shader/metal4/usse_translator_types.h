@@ -136,6 +136,7 @@ struct NonDependentTextureQueryCallInfo {
     int store_type = 0; ///< For sampling method later
     int prod_pos = -1;
     int dim = 2;
+    bool centroid = false; // Query interpolation, independent of PA copies of the same varying.
 
     DataType component_type;
     uint8_t component_count;

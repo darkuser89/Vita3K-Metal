@@ -28,6 +28,9 @@
 #undef has_alpha_channel
 #include <fmt/format.h>
 
+#include <array>
+#include <bit>
+#include <cstring>
 #include <stb_image.h>
 #include <stb_image_write.h>
 
@@ -84,6 +87,36 @@ static bool software_bcn_format(SceGxmTextureBaseFormat format) {
     }
 }
 
+static uint64_t dds_mip_size(const ddspp::Descriptor &desc, uint32_t width, uint32_t height) {
+    const uint64_t blocks_x = (width + desc.blockWidth - 1) / desc.blockWidth;
+    const uint64_t blocks_y = (height + desc.blockHeight - 1) / desc.blockHeight;
+    return blocks_x * blocks_y * (desc.bitsPerPixelOrBlock / 8);
+}
+
+static bool valid_dds_import(const ddspp::Descriptor &desc, size_t file_size) {
+    // Match the native upload extent/mip limits before allocating or
+    // software decoders read any payload. The imported image is one 2D/cube
+    // texture; volume slices and texture arrays cannot be silently discarded.
+    constexpr uint32_t max_dim = 16384;
+    if (!desc.width || !desc.height || desc.width > max_dim || desc.height > max_dim
+        || !desc.numMips || desc.numMips > std::bit_width(std::max(desc.width, desc.height))
+        || desc.depth != 1 || desc.arraySize != 1 || desc.type == ddspp::Texture3D
+        || (desc.type == ddspp::Texture1D && desc.height != 1)
+        || (desc.type == ddspp::Cubemap && desc.width != desc.height)
+        || !desc.blockWidth || !desc.blockHeight || !desc.bitsPerPixelOrBlock
+        || desc.bitsPerPixelOrBlock % 8 || desc.headerSize > file_size)
+        return false;
+
+    uint64_t chain_bytes = 0;
+    uint32_t width = desc.width, height = desc.height;
+    for (uint32_t mip = 0; mip < desc.numMips; ++mip) {
+        chain_bytes += dds_mip_size(desc, width, height);
+        width = std::max(1u, width / 2);
+        height = std::max(1u, height / 2);
+    }
+    const uint64_t payload_bytes = chain_bytes * (desc.type == ddspp::Cubemap ? 6 : 1);
+    return payload_bytes <= file_size - desc.headerSize;
+}
 
 
 
@@ -131,11 +164,21 @@ bool metal::MetalTextureCache::import_configure_texture() {
             LOG_ERROR("Failed to read {}", file_name);
             return false;
         }
-        if (imported_texture_raw_data.size() < ddspp::MAX_HEADER_SIZE) {
-            imported_texture_raw_data.resize(ddspp::MAX_HEADER_SIZE);
+        constexpr size_t base_header_size = sizeof(ddspp::DDS_MAGIC) + sizeof(ddspp::Header);
+        if (imported_texture_raw_data.size() < base_header_size) {
+            LOG_ERROR("Incomplete DDS header in {}", file_name);
+            return false;
         }
-
-        if (ddspp::decode_header(imported_texture_raw_data.data(), *dds_descriptor) != ddspp::Success) {
+        // ddspp reads the DX10 extension even for a legacy header. Pad only
+        // this aligned local header, never the file/payload used for bounds.
+        alignas(ddspp::Header) std::array<uint8_t, ddspp::MAX_HEADER_SIZE> header{};
+        std::memcpy(header.data(), imported_texture_raw_data.data(),
+            std::min(header.size(), imported_texture_raw_data.size()));
+        ddspp::Header basic_header;
+        std::memcpy(&basic_header, header.data() + sizeof(ddspp::DDS_MAGIC), sizeof(basic_header));
+        if (basic_header.size != sizeof(ddspp::Header) || basic_header.ddspf.size != sizeof(ddspp::PixelFormat)
+            || (ddspp::is_dxt10(basic_header) && imported_texture_raw_data.size() < header.size())
+            || ddspp::decode_header(header.data(), *dds_descriptor) != ddspp::Success) {
             LOG_ERROR("Failed to decode file {} header", file_name);
             return false;
         }
@@ -154,6 +197,20 @@ bool metal::MetalTextureCache::import_configure_texture() {
         base_format = dxgi_to_gxm(dds_descriptor->format);
         if (base_format == SCE_GXM_TEXTURE_BASE_FORMAT_INVALID) {
             LOG_ERROR("dds format {} used by texture {} is unhandled", fmt::underlying(dds_descriptor->format), file_name);
+            return false;
+        }
+        if (texture::is_astc_format(base_format)) {
+            // The bundled DDS parser falls through several ASTC block-size
+            // cases. Use the existing GXM format geometry in this private
+            // descriptor so every subsequent face/mip offset stays correct.
+            const auto [block_width, block_height] = gxm::get_block_size(base_format);
+            dds_descriptor->blockWidth = block_width;
+            dds_descriptor->blockHeight = block_height;
+            dds_descriptor->rowPitch = ((width + block_width - 1) / block_width) * 16;
+            dds_descriptor->depthPitch = dds_descriptor->rowPitch * ((height + block_height - 1) / block_height);
+        }
+        if (!valid_dds_import(*dds_descriptor, imported_texture_raw_data.size())) {
+            LOG_ERROR("Invalid DDS layout or incomplete mip/face data in {}", file_name);
             return false;
         }
         is_srgb = ddspp::is_srgb(dds_descriptor->format);
@@ -229,13 +286,17 @@ void metal::MetalTextureCache::import_upload_texture() {
         const uint32_t mipcount = current_info->mip_count;
         const bool is_cube = current_info->texture.texture_type() == SCE_GXM_TEXTURE_CUBE || current_info->texture.texture_type() == SCE_GXM_TEXTURE_CUBE_ARBITRARY;
 
+        // DDS stores complete mip chains face by face. Use the validated
+        // block geometry and wide byte arithmetic; ddspp::get_offset first
+        // multiplies sizes in 32-bit bits, which can wrap on large images.
+        size_t offset = 0;
         // upload each face one by one
         for (uint32_t face = 0; face < (is_cube ? 6 : 1); face++) {
             uint32_t width = current_info->width;
             uint32_t height = current_info->height;
             // upload each mip one by one
             for (uint32_t mip = 0; mip < mipcount; mip++) {
-                const uint8_t *mip_data = imported_texture_decoded + ddspp::get_offset(*dds_descriptor, mip, face);
+                const uint8_t *mip_data = imported_texture_decoded + offset;
                 // dds textures are tightly packed (up to the block size)
                 const uint32_t upload_stride = texture::is_astc_format(current_info->format)
                     ? ((width + block_width - 1) / block_width) * block_width : align(width, block_width);
@@ -253,8 +314,9 @@ void metal::MetalTextureCache::import_upload_texture() {
                 }
 
                 // on to the next mip
-                width /= 2;
-                height /= 2;
+                offset += dds_mip_size(*dds_descriptor, width, height);
+                width = std::max(1u, width / 2);
+                height = std::max(1u, height / 2);
             }
         }
     } else {

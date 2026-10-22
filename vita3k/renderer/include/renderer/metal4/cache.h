@@ -13,10 +13,17 @@
 
 namespace renderer::metal {
 class Device;
+struct CacheWriteWaitStats {
+    uint64_t acquisitions = 0, contended = 0;
+    uint64_t total_wait_ns = 0, max_wait_ns = 0;
+};
 struct CacheStats {
+    uint64_t library_requests = 0, library_builds = 0, library_reuses = 0;
     uint64_t program_hits = 0, program_misses = 0, program_writes = 0;
     uint64_t pipeline_hits = 0, pipeline_misses = 0, archive_writes = 0;
+    uint64_t program_disk_hits = 0, pipeline_disk_hits = 0;
     uint64_t rejected_files = 0, io_errors = 0;
+    CacheWriteWaitStats file_write_slots, archive_write_slots;
     bool archive_loaded = false, archive_writable = false;
 };
 struct CachedVariant {

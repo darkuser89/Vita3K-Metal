@@ -67,7 +67,8 @@ static spv::Id get_uv_coeffs(spv::Builder &b, const spv::Id std_builtins, spv::I
         const auto size = load({b.makeIntConstant(0), b.makeIntConstant(slot), b.makeIntConstant(1), b.makeIntConstant(0)});
         const auto use_original = b.createBinOp(spv::OpINotEqual, b.makeBoolType(), enabled, b.makeUintConstant(0));
         image_size = b.createOp(spv::OpSelect, v2f32,
-            {use_original, b.createUnaryOp(spv::OpConvertUToF, v2f32, size), image_size});
+            {b.createCompositeConstruct(b.makeVectorType(b.makeBoolType(), 2), {use_original, use_original}),
+                b.createUnaryOp(spv::OpConvertUToF, v2f32, size), image_size});
     }
 
     // un-normalize the coordinates
@@ -293,7 +294,8 @@ static spv::Id sample_native_cube_level(spv::Builder &b,spv::Id builtins,spv::Id
         const auto corner_direction=b.createCompositeConstruct(f3,{
             b.createBinOp(spv::OpFMul,f,extract(vertex,0),fi(1.01f)),
             extract(vertex,1),extract(vertex,2)});
-        tap_direction=b.createOp(spv::OpSelect,f3,{corner,corner_direction,tap_direction});
+        tap_direction=b.createOp(spv::OpSelect,f3,
+            {b.createCompositeConstruct(b.makeVectorType(boolean,3),{corner,corner,corner}),corner_direction,tap_direction});
         return b.createOp(spv::OpImageSampleExplicitLod,f4,
             {tex,tap_direction,spv::ImageOperandsLodMask,mip_f});
     };
@@ -403,7 +405,8 @@ static spv::Id sample_native_mips(spv::Builder &b, spv::Id builtins, spv::Id inf
             const auto point = b.createBinOp(spv::OpUDiv, u2, numerator, b.createBinOp(spv::OpIMul, u2, size, two));
             const auto value = b.createOp(spv::OpImageFetch, f4, {image, point, spv::ImageOperandsLodMask, mip});
             return b.createOp(spv::OpSelect, f4,
-                {valid, value, b.makeCompositeConstant(f4, {fi(0), fi(0), fi(0), fi(0)})});
+                {b.createCompositeConstruct(b.makeVectorType(boolean, 4), {valid, valid, valid, valid}),
+                    value, b.makeCompositeConstant(f4, {fi(0), fi(0), fi(0), fi(0)})});
         };
         const auto mix = [&](spv::Id a, spv::Id c, spv::Id t) {
             return b.createBinOp(spv::OpFAdd, f4, a,
@@ -517,6 +520,44 @@ spv::Id shader::metal3::usse::USSETranslatorVisitor::do_fetch_texture(const spv:
 
     assert(m_b.getTypeClass(m_b.getContainedTypeId(m_b.getTypeId(coord_id))) == spv::OpTypeFloat);
 
+    if (!m_spirv_params.native_metal || !m_spirv_params.native_texture_info)
+        return emit_fetch_texture(tex, texture_index, dim, coord_id, dest_type, lod_mode, extra1, extra2, gather4_comp, gather_uv);
+
+    // The potentially large grid/cube/raw-carrier body is identical across
+    // calls with this signature. Keep UV/LOD/gradients and the sampled image as
+    // values, and continue reading dynamic texture metadata inside the helper.
+    const std::array<uint32_t, 10> key{uint32_t(texture_index), uint32_t(dim), uint32_t(dest_type),
+        uint32_t(lod_mode), uint32_t(gather4_comp), uint32_t(gather_uv), m_b.getTypeId(tex),
+        m_b.getTypeId(coord_id), extra1 ? m_b.getTypeId(extra1) : 0, extra2 ? m_b.getTypeId(extra2) : 0};
+    std::vector<spv::Id> arguments{tex, coord_id};
+    if (extra1) arguments.push_back(extra1);
+    if (extra2) arguments.push_back(extra2);
+    auto found = texture_helpers.find(key);
+    if (found == texture_helpers.end()) {
+        std::vector<spv::Id> types;
+        for (auto argument : arguments) types.push_back(m_b.getTypeId(argument));
+        const auto scalar = is_integer_data_type(dest_type)
+            ? (is_unsigned_integer_data_type(dest_type) ? m_b.makeUintType(32) : m_b.makeIntType(32)) : type_f32;
+        const auto saved = m_b.getBuildPoint();
+        spv::Block *entry = nullptr;
+        auto helper = m_b.makeFunctionEntry(spv::NoPrecision, m_b.makeVectorType(scalar, 4),
+            "metal_texture_fetch", spv::LinkageTypeMax, types, {}, &entry);
+        unsigned next = 2;
+        const auto first = extra1 ? helper->getParamId(next++) : spv::NoResult;
+        const auto second = extra2 ? helper->getParamId(next++) : spv::NoResult;
+        const auto result = emit_fetch_texture(helper->getParamId(0), texture_index, dim, helper->getParamId(1),
+            dest_type, lod_mode, first, second, gather4_comp, gather_uv);
+        m_b.makeReturn(true, result);
+        m_b.leaveFunction();
+        m_b.setBuildPoint(saved);
+        found = texture_helpers.emplace(key, helper).first;
+    }
+    return m_b.createFunctionCall(found->second, arguments);
+}
+
+spv::Id shader::metal3::usse::USSETranslatorVisitor::emit_fetch_texture(spv::Id tex, int texture_index,
+    int dim, spv::Id coord_id, DataType dest_type, int lod_mode, spv::Id extra1, spv::Id extra2,
+    int gather4_comp, bool gather_uv) {
     if (m_spirv_params.native_metal && dim == 2 && texture_index >= 0
         && texture_index < SCE_GXM_MAX_TEXTURE_UNITS && m_spirv_params.native_texture_info
         && m_spirv_params.native_frag_coord)
@@ -773,8 +814,19 @@ void shader::metal3::usse::USSETranslatorVisitor::do_texture_queries(const NonDe
         bool proj = (texture_query.prod_pos >= 0);
         shader::metal3::usse::Coord coord_inst = texture_query.coord;
 
+        if (m_spirv_params.native_metal && texture_query.centroid && texture_query.coord_index < 10) {
+            // Apply to this query only. Decorating the shared input would also
+            // change center queries and PA loads using the same location.
+            // PointCoord is a rasterizer builtin, not a user interpolant; keep
+            // its existing path until its centroid semantics can be emulated.
+            m_b.addCapability(spv::CapabilityInterpolationFunction);
+            coord_inst.first = m_b.createBuiltinCall(type_f32_v[4], m_util_funcs.std_builtins,
+                GLSLstd450InterpolateAtCentroid, {texture_query.coord.first});
+        }
+
         if (texture_query.prod_pos >= 0) {
-            spv::Id texture_coord = m_b.createLoad(texture_query.coord.first, spv::NoPrecision);
+            spv::Id texture_coord = m_b.isPointer(coord_inst.first)
+                ? m_b.createLoad(coord_inst.first, spv::NoPrecision) : coord_inst.first;
             coord_inst.first = m_b.createOp(spv::OpVectorShuffle, type_f32_v[3], { { true, texture_coord }, { true, texture_coord }, { false, 0 }, { false, 1 }, { false, static_cast<uint32_t>(texture_query.prod_pos) } });
             proj = true;
         }
@@ -838,12 +890,12 @@ bool USSETranslatorVisitor::smp(
     if (!m_spirv_params.samplers.contains(inst.opr.src1.num)) {
         if (m_spirv_params.texture_buffer_sa_offset == -1) {
             LOG_ERROR("Can't get the sampler (sampler doesn't exist!)");
-            return true;
+            return false;
         }
 
         if (sb_mode != 0 || (!m_spirv_params.native_metal && lod_mode != 2)) {
             LOG_ERROR("Unhandled load using texture buffer with sb mode {} and lod mode {}", sb_mode, lod_mode);
-            return true;
+            return false;
         }
 
         is_texture_buffer_load = true;
@@ -853,7 +905,7 @@ bool USSETranslatorVisitor::smp(
 
     if (m_spirv_params.native_metal && is_texture_buffer_load && m_spirv_params.samplers.empty()) {
         LOG_ERROR("Texture buffer load without any sampler");
-        return true;
+        return false;
     }
 
     // if this is a texture buffer load, just attribute the first available sampler to it

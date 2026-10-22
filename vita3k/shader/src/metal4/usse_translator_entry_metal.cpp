@@ -906,6 +906,10 @@ spv::Id USSERecompiler::get_condition_value(const std::uint8_t pred, const bool 
     } else if (native_metal && predicator == ExtPredicate::NEGP2) {
         pred_opr.num = 2;
         do_neg = !do_neg;
+    } else {
+        // PN needs per-channel predicate semantics; never generate a read
+        // at Operand's unset 0xFFFF index while that path is unsupported.
+        throw std::runtime_error(fmt::format("Metal: unsupported USSE predicate {}", pred));
     }
 
     spv::Id pred_v = visitor.load(pred_opr, 0b0001);
@@ -944,10 +948,14 @@ void USSERecompiler::compile_code_node(const usse::USSECodeNode &code) {
 
         // Recompile the instruction, to the current block
         auto decoder = usse::DecodeUSSE<usse::USSETranslatorVisitor>(cur_instr);
-        if (decoder.has_value())
-            decoder->call(visitor, cur_instr);
-        else
-            LOG_DISASM("{:016x}: error: instruction unmatched", cur_instr);
+        try {
+            if (!decoder.has_value())
+                throw std::runtime_error("instruction unmatched");
+            if (!decoder->call(visitor, cur_instr))
+                throw std::runtime_error("instruction variant is not supported");
+        } catch (const std::exception &error) {
+            throw std::runtime_error(fmt::format("Metal USSE PC {} opcode {:016x}: {}", pc, cur_instr, error.what()));
+        }
     }
 
     if (cond_builder) {

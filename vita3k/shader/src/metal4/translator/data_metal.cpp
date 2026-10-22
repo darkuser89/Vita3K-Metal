@@ -657,7 +657,7 @@ bool USSETranslatorVisitor::vldst(
         break;
     default:
         LOG_ERROR("Unknown load/store operation {}", op1);
-        return true;
+        return false;
     }
     const bool is_store = inst.opcode == Opcode::STR;
     DataType type_to_ldst = DataType::UNK;
@@ -761,7 +761,7 @@ bool USSETranslatorVisitor::vldst(
         // We are reading the texture buffer
 
         if (!check_for_literal_texture_read())
-            return true;
+            return false;
 
         int offset = (m_spirv_params.texture_buffer_base + inst.opr.src1.num + inst.opr.src2.num) / sizeof(uint32_t);
         // we store the texture index in the first texture register, we don't do anything with the other 3
@@ -788,7 +788,7 @@ bool USSETranslatorVisitor::vldst(
         // We are reading the literal buffer
 
         if (!check_for_literal_texture_read())
-            return true;
+            return false;
 
         int offset = m_spirv_params.literal_buffer_base + inst.opr.src1.num + inst.opr.src2.num;
         const uint8_t *literal_buffer = m_program.literal_buffer_data();
@@ -882,11 +882,11 @@ bool USSETranslatorVisitor::vldst(
         // first some checks
         if (mask_count > 0) {
             LOG_ERROR("Unimplemented thread buffer access with repeat");
-            return true;
+            return false;
         }
         if (to_store.type != DataType::F32) {
             LOG_ERROR("Unimplemented non-f32 thread buffer access");
-            return true;
+            return false;
         }
 
         if (m_spirv_params.thread_buffer_base != 0)
@@ -913,7 +913,7 @@ bool USSETranslatorVisitor::vldst(
     } else {
         if (is_store) {
             LOG_ERROR("Store opcode is not supported without memory mapping");
-            return true;
+            return false;
         }
 
         for (int i = 0; i < total_bytes_fo_fetch / 4; ++i) {

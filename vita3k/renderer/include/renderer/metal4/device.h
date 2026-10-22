@@ -15,7 +15,9 @@
 
 namespace renderer::metal {
 
+struct NativeShaderLibrary;
 struct CompiledProgram {
+    std::shared_ptr<const NativeShaderLibrary> native_owner;
     id<MTLLibrary> library;
     id<MTLFunction> function;
     shader::metal::Stage stage;
@@ -56,7 +58,9 @@ public:
     bool supports_raster_order_groups() const { return device.rasterOrderGroupsSupported; }
 
 private:
-    Device() = default;
+    Device();
+    struct LibraryCache;
+    std::unique_ptr<LibraryCache> libraries;
     id<MTLDevice> device;
     id<MTL4Compiler> compiler;
     V3KMetal4Queue * queue;

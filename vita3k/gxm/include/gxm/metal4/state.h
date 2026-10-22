@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <mem/ptr.h>
+#include <gxm/metal4/uniform_bounds.h>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -15,6 +16,7 @@ enum class MetalGxmProgramKind {
 
 namespace gxm::metal3 {
 struct Bookkeeping {
+    UniformMappingBounds uniform_mapping_bounds;
     std::mutex metal_shader_caches_mutex;
     std::unordered_map<const void *, std::shared_ptr<void>> metal_shader_caches;
     std::mutex metal_programs_mutex;

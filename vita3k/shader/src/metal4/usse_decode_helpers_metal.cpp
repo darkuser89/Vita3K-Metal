@@ -19,6 +19,7 @@
 #include <shader/metal4/usse_types.h>
 
 #include <util/log.h>
+#include <stdexcept>
 
 namespace shader::metal3::usse {
 
@@ -240,6 +241,8 @@ Swizzle4 decode_vec34_swizzle(Imm4 swizz, const bool swizz_extended, const int t
     // vec3
     if (type == 1) {
         if (swizz_extended) {
+            if (swizz >= std::size(swizz_v3_ext))
+                throw std::runtime_error("reserved extended vec3 swizzle");
             return to_swizzle4(swizz_v3_ext[swizz]);
         } else {
             return to_swizzle4(swizz_v3_std[swizz]);

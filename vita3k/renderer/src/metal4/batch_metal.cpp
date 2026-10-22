@@ -151,6 +151,10 @@ void process_batch_metal3(renderer::State &state, const FeatureState &features, 
                 && cmd->opcode!=CommandOpcode::Draw && cmd->opcode!=CommandOpcode::SetState
                 && cmd->opcode!=CommandOpcode::SyncSurfaceData)
                 static_cast<metal::MetalState &>(state).finish(*static_cast<metal::MetalContext *>(state.context));
+            if (state.current_backend == Backend::Metal
+                && cmd->opcode != CommandOpcode::Draw && cmd->opcode != CommandOpcode::SetState
+                && cmd->opcode != CommandOpcode::SetContext && cmd->opcode != CommandOpcode::SyncSurfaceData)
+                static_cast<metal::MetalState &>(state).drain_guest_publications();
 #endif
             CommandHelper helper(cmd);
             handler->second(state, mem, config, helper, features, command_list.context);
@@ -172,6 +176,10 @@ void process_batches_metal3(renderer::State &state, const FeatureState &features
     auto max_time = duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() + max_wait_ms;
 
     while (!state.should_display) {
+#ifdef __APPLE__
+        if (state.current_backend == Backend::Metal)
+            static_cast<metal::MetalState &>(state).check_guest_publications();
+#endif
         if (state.render_abort.load(std::memory_order_relaxed))
             return;
 

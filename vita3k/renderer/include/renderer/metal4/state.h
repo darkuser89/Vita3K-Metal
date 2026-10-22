@@ -155,6 +155,11 @@ struct MetalState : renderer::State {
     uint64_t count_nonzero_color_samples(MetalContext &);
     void mid_scene_flush(MetalContext &, bool wait_for_completion);
     bool end_scene(MetalContext &, bool allow_deferred = false);
+    bool defer_scene_completion(MetalContext &, MemState &, SceGxmNotification, SceGxmNotification);
+    bool defer_color_scene_completion(MetalContext &, MemState &, SceGxmNotification, SceGxmNotification);
+    void collect_color_publications();
+    void drain_guest_publications();
+    void check_guest_publications();
     void set_visibility_buffer(MetalContext &, Ptr<uint32_t> buffer, uint32_t stride);
     void set_visibility_index(MetalContext &, bool enable, uint32_t index, bool increment);
     void set_back_visibility_index(MetalContext &, bool enable, uint32_t index, bool increment);
@@ -170,7 +175,7 @@ private:
         SceGxmTransferType source_type, SceGxmTransferType destination_type,
         std::span<const std::pair<uint64_t, uint64_t>> reads,
         std::span<const std::pair<uint64_t, uint64_t>> writes);
-    std::vector<uint8_t> vertex_stream_snapshot(uint64_t handle, size_t size);
+    std::shared_ptr<const std::vector<uint8_t>> vertex_stream_snapshot(uint64_t handle, size_t size);
     void retire_cpu_overwritten_surfaces(MemState &, std::span<const std::pair<uint64_t, uint64_t>> ranges);
     bool transfer_image(MemState &, const SceGxmTransferImage &source, const SceGxmTransferImage &destination,
         SceGxmTransferType source_type, SceGxmTransferType destination_type,

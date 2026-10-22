@@ -76,7 +76,7 @@ void export_sceGxmColorSurfaceSetScaleMode_metal3(EmuEnvState &emuenv, SceUID th
 int export_sceGxmCreateContext_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, const SceGxmContextParams *params, Ptr<SceGxmContext> *context);
 int export_sceGxmCreateDeferredContext_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, SceGxmDeferredContextParams *params, Ptr<SceGxmContext> *deferredContext);
 int export_sceGxmDisplayQueueAddEntry_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, Ptr<SceGxmSyncObject> oldBuffer, Ptr<SceGxmSyncObject> newBuffer, Ptr<const void> callbackData);
-static uint32_t metal_mapped_uniform_size_metal3(const GxmState &gxm, Address address, uint32_t requested_size);
+static uint32_t metal_mapped_uniform_size_metal3(GxmState &gxm, Address address, uint32_t requested_size);
 static void gxmSetUniformBuffers_metal3(renderer::State &state, GxmState &gxm, SceGxmContext *context, const SceGxmProgram &program, std::span<UniformBuffer> buffers, const UniformBufferSizes &sizes, const MemState &mem);
 static bool metal_vertex_stream_sizes_metal3(const SceGxmVertexProgram &program, uint32_t max_index,
     uint32_t instances, std::array<size_t, SCE_GXM_MAX_VERTEX_STREAMS> &sizes, uint32_t &used);
@@ -910,29 +910,9 @@ int export_sceGxmDisplayQueueAddEntry_metal3(EmuEnvState &emuenv, SceUID thread_
     return 0;
     }
 
-static uint32_t metal_mapped_uniform_size_metal3(const GxmState &gxm, Address address, uint32_t requested_size) {
-    const uint64_t requested_end = uint64_t(address) + requested_size;
-    const auto next = gxm.memory_mapped_regions.upper_bound(address);
-    uint64_t mapped_end = address;
-
-    // A later overlapping mapping may end before the binding while an older
-    // mapping still contains it. Find the full mapped prefix from this address.
-    for (auto it = next; it != gxm.memory_mapped_regions.begin();) {
-        --it;
-        mapped_end = std::max(mapped_end, uint64_t(it->first) + it->second.size);
-        if (mapped_end >= requested_end)
-            return requested_size;
-    }
-    if (mapped_end == address)
-        return requested_size; // No GXM mapping at the binding address.
-
-    // Adjacent or overlapping mappings extend the readable prefix.
-    for (auto it = next; it != gxm.memory_mapped_regions.end() && it->first <= mapped_end; ++it) {
-        mapped_end = std::max(mapped_end, uint64_t(it->first) + it->second.size);
-        if (mapped_end >= requested_end)
-            return requested_size;
-    }
-    return static_cast<uint32_t>(mapped_end - address);
+static uint32_t metal_mapped_uniform_size_metal3(GxmState &gxm, Address address, uint32_t requested_size) {
+    return metal_gxm_bookkeeping(gxm).uniform_mapping_bounds.size(
+        gxm.memory_mapped_regions, address, requested_size);
 }
 
 static void gxmSetUniformBuffers_metal3(renderer::State &state, GxmState &gxm, SceGxmContext *context, const SceGxmProgram &program, std::span<UniformBuffer> buffers, const UniformBufferSizes &sizes, const MemState &mem) {
@@ -1599,7 +1579,7 @@ int export_sceGxmInitialize_metal3(EmuEnvState &emuenv, SceUID thread_id, const 
     emuenv.gxm.display_queue.maxPendingCount_ = max_queue_size;
 
     const ThreadStatePtr main_thread = emuenv.kernel.get_thread(thread_id);
-    const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", Ptr<void>(0), SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, nullptr);
+    const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", Ptr<void>(0), SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, 0, nullptr);
     if (!display_queue_thread) {
         return RET_ERROR(SCE_GXM_ERROR_DRIVER);
     }
@@ -1607,8 +1587,11 @@ int export_sceGxmInitialize_metal3(EmuEnvState &emuenv, SceUID thread_id, const 
 
     // Reset the queue in case sceGxmTerminate was called earlier
     emuenv.gxm.display_queue.reset();
-    if (emuenv.renderer->current_backend == renderer::Backend::Metal)
-        metal_gxm_bookkeeping(emuenv.gxm).clear_metal_programs();
+    if (emuenv.renderer->current_backend == renderer::Backend::Metal) {
+        auto &bookkeeping = metal_gxm_bookkeeping(emuenv.gxm);
+        bookkeeping.clear_metal_programs();
+        bookkeeping.uniform_mapping_bounds.invalidate();
+    }
     emuenv.gxm.display_host_thread = std::thread(display_entry_thread_metal3, std::ref(emuenv));
     emuenv.gxm.notification_region = Ptr<uint32_t>(alloc(emuenv.mem, MiB(1), "SceGxmNotificationRegion"));
     memset(emuenv.gxm.notification_region.get(emuenv.mem), 0, MiB(1));
@@ -1651,6 +1634,9 @@ int export_sceGxmMapMemory_metal3(EmuEnvState &emuenv, SceUID thread_id, const c
                 renderer::CommandOpcode::MemoryMap, true, aligned_base, size) != renderer::CommandErrorCodeNone)
             return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
+        // Invalidate before mutation, including a failed allocation. The next
+        // uniform reader rebuilds from the authoritative successful mappings.
+        metal_gxm_bookkeeping(gxm).uniform_mapping_bounds.invalidate();
         gxm.memory_mapped_regions.emplace(aligned_base, MemoryMapInfo{ aligned_base, size, attribs });
 
         return 0;
@@ -2139,12 +2125,18 @@ int export_sceGxmSetUniformDataF_metal3(EmuEnvState &emuenv, SceUID thread_id, c
     if (parameter->category != SceGxmParameterCategory::SCE_GXM_PARAMETER_CATEGORY_UNIFORM)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
 
+    if (parameter->component_count < 1 || parameter->component_count > 4)
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+
     const bool native_metal = emuenv.renderer->current_backend == renderer::Backend::Metal;
     if (native_metal) {
         const uint64_t parameter_components = uint64_t(parameter->component_count) * std::max<uint32_t>(parameter->array_size, 1);
         if (uint64_t(componentOffset) + componentCount > parameter_components)
             return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
     }
+
+    if (!componentCount)
+        return 0;
 
     size_t size = 0;
     size_t offset = 0;
@@ -2211,14 +2203,20 @@ int export_sceGxmSetUniformDataF_metal3(EmuEnvState &emuenv, SceUID thread_id, c
         assert(false);
     }
 
-    if (parameter->array_size == 1 || parameter->component_count == 1) {
-        // Case 1: No array. Only a single vector. Don't apply any alignment
-        // Case 2: Array but component count equals to 1. This case, a scalar array, align it to 32-bit bound
-        if (parameter->component_count == 1) {
-            // Apply 32 bit alignment, by making each component has 4 bytes
-            comp_size = 4;
-        }
+    // Scalar array elements occupy 32-bit slots, but their payload retains
+    // the declared type width. Preserve padding and neighbouring components;
+    // widening the copy instead would read past S8/U8/S16/U16 conversions.
+    if (parameter->component_count == 1) {
+        auto *dest = static_cast<uint8_t *>(uniformBuffer)
+            + size_t(parameter->resource_index) * sizeof(float)
+            + size_t(componentOffset) * sizeof(float);
+        for (uint32_t i = 0; i < componentCount; ++i)
+            memcpy(dest + size_t(i) * sizeof(float), source + size_t(i) * comp_size, comp_size);
+        return 0;
+    }
 
+    if (parameter->array_size == 1) {
+        // A single vector has tightly packed components.
         size = componentCount * comp_size;
         offset = parameter->resource_index * sizeof(float) + componentOffset * comp_size;
 
@@ -2724,9 +2722,7 @@ uint32_t export_sceGxmTextureGetLodMin_metal3(EmuEnvState &emuenv, SceUID thread
         return 0;
     }
 
-    if (emuenv.renderer->current_backend == renderer::Backend::Metal)
-        return (texture->lod_min0 << 2) | texture->lod_min1;
-    return texture->lod_min0 | (texture->lod_min1 << 2);
+    return texture->true_lod_min();
     }
 
 static void set_linear_strided_texture_stride_metal3(SceGxmTexture &texture, uint32_t byte_stride) {
@@ -2818,13 +2814,8 @@ int export_sceGxmTextureSetLodMin_metal3(EmuEnvState &emuenv, SceUID thread_id, 
         return RET_ERROR(SCE_GXM_ERROR_UNSUPPORTED);
     }
 
-    if (emuenv.renderer->current_backend == renderer::Backend::Metal) {
-        texture->lod_min0 = lodMin >> 2;
-        texture->lod_min1 = lodMin & 3;
-    } else {
-        texture->lod_min0 = lodMin & 3;
-        texture->lod_min1 = lodMin >> 2;
-    }
+    texture->lod_min0 = lodMin >> 2;
+    texture->lod_min1 = lodMin & 3;
 
     return 0;
     }
@@ -2945,6 +2936,7 @@ int export_sceGxmUnmapMemory_metal3(EmuEnvState &emuenv, SceUID thread_id, const
             || emuenv.renderer->current_backend == renderer::Backend::Metal) && ite->second.size > 0)
         renderer::send_single_command(*emuenv.renderer, nullptr, renderer::CommandOpcode::MemoryUnmap, true, aligned_base);
 
+    metal_gxm_bookkeeping(emuenv.gxm).uniform_mapping_bounds.invalidate();
     emuenv.gxm.memory_mapped_regions.erase(ite);
     return 0;
     }

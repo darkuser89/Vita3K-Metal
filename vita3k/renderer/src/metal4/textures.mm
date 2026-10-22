@@ -7,6 +7,11 @@
 #include <renderer/metal4/textures.h>
 #include <renderer/metal4/device.h>
 #include <renderer/metal4/texture_layout.h>
+#include <renderer/metal4/texture_views.h>
+#include <renderer/metal4/depth_patch_bounds.h>
+#include <renderer/metal4/linear_surface_patch.h>
+#include <renderer/metal4/snapshot_channels.h>
+#include <renderer/metal4/packed_surface_cast.h>
 #include <renderer/functions.h>
 #include <renderer/gxm_types.h>
 #include <gxm/functions.h>
@@ -739,16 +744,26 @@ bool surface_memory_ranges(const SceGxmColorSurface &surface, SurfaceRect rectan
     } else if (!x0 && !y0 && x1 == surface.width && y1 == surface.height) {
         append(0, size_t(surface.width) * surface.height);
     } else {
-        // surface_memory_size validates power-of-two Morton dimensions and
-        // a compact stride. Decode in storage order to coalesce adjacent words.
-        const uint32_t side = std::min(surface.width, surface.height);
-        const uint32_t k = std::bit_width(side) - 1;
-        for (uint32_t pixel = 0; pixel < uint32_t(surface.width) * surface.height; ++pixel) {
-            const uint32_t upper = (pixel >> (2 * k)) << k;
-            const uint32_t x = (texture::decode_morton2_x(pixel) & (side - 1)) | (surface.width >= surface.height ? upper : 0);
-            const uint32_t y = (texture::decode_morton2_y(pixel) & (side - 1)) | (surface.width < surface.height ? upper : 0);
-            if (x >= x0 && x < x1 && y >= y0 && y < y1) append(pixel, 1);
-        }
+        // Visit only intersecting Morton blocks in storage order. A fully
+        // covered block is one contiguous interval, regardless of its area.
+        // The longer axis owns the next high bit; squares split X before Y.
+        const auto visit = [&](auto &&self, uint32_t x, uint32_t y,
+                               uint32_t width, uint32_t height, size_t pixel) -> void {
+            if (x >= x1 || y >= y1 || x + width <= x0 || y + height <= y0) return;
+            if (x >= x0 && y >= y0 && x + width <= x1 && y + height <= y1) {
+                append(pixel, size_t(width) * height);
+                return;
+            }
+            const size_t half_pixels = size_t(width) * height / 2;
+            if (width >= height) {
+                self(self, x, y, width / 2, height, pixel);
+                self(self, x + width / 2, y, width / 2, height, pixel + half_pixels);
+            } else {
+                self(self, x, y, width, height / 2, pixel);
+                self(self, x, y + height / 2, width, height / 2, pixel + half_pixels);
+            }
+        };
+        visit(visit, 0, 0, surface.width, surface.height, 0);
     }
     for (const auto &range : ranges) {
         if (range.offset > size || range.size > size - range.offset) {
@@ -900,6 +915,25 @@ static bool full_surface_write(std::span<const SurfaceMemoryRange> ranges, size_
     }
     return end == size;
 }
+struct SurfaceWritePatch {
+    LinearSurfacePatch guest, native;
+};
+static SurfaceWritePatch surface_write_patch(const SceGxmColorSurface &surface,
+    size_t pixel_bytes, std::span<const SurfaceMemoryRange> ranges, bool complete,
+    size_t native_width, size_t native_height, size_t samples_x, size_t samples_y) {
+    if (complete)
+        return {{0, 0, surface.width, surface.height}, {0, 0, native_width, native_height}};
+    const auto layout = surface.surfaceType == SCE_GXM_COLOR_SURFACE_TILED ? SurfacePatchLayout::Tiled
+        : surface.surfaceType == SCE_GXM_COLOR_SURFACE_SWIZZLED ? SurfacePatchLayout::Morton : SurfacePatchLayout::Linear;
+    const auto guest = guest_surface_patch(surface.width, surface.height, pixel_bytes,
+        surface.strideInPixels, layout, ranges);
+    if (!guest.width || !guest.height) return {};
+    const auto left = write_native_interval(guest.x, surface.width, native_width, samples_x).first;
+    const auto right = write_native_interval(guest.x + guest.width - 1, surface.width, native_width, samples_x).second;
+    const auto top = write_native_interval(guest.y, surface.height, native_height, samples_y).first;
+    const auto bottom = write_native_interval(guest.y + guest.height - 1, surface.height, native_height, samples_y).second;
+    return {guest, {left, top, right - left, bottom - top}};
+}
 static bool u8u3u3u2_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surface,
     std::span<const uint8_t> source, std::span<uint8_t> destination,
     std::span<const SurfaceMemoryRange> ranges, bool upload, uint32_t samples_x=1, uint32_t samples_y=1) {
@@ -918,42 +952,47 @@ static bool u8u3u3u2_surface_memory(id<MTLTexture> texture, const SceGxmColorSur
     }
     if (upload && ranges.empty()) return true;
     const bool full_upload = upload && full_surface_write(ranges, size);
-    const size_t stride = native_width * 4;
-    std::vector<uint8_t> raw(stride * native_height);
+    const auto patch = surface_write_patch(surface, 2, ranges, !upload || full_upload,
+        native_width, native_height, samples_x, samples_y);
+    if (!patch.native.width || !patch.native.height) return true;
+    const auto region = MTLRegionMake2D(patch.native.x, patch.native.y, patch.native.width, patch.native.height);
+    const size_t stride = patch.native.width * 4;
+    std::vector<uint8_t> raw(stride * patch.native.height);
     if (!full_upload) [texture getBytes:raw.data() bytesPerRow:stride
-        fromRegion:MTLRegionMake2D(0, 0, native_width, native_height) mipmapLevel:0];
+        fromRegion:region mipmapLevel:0];
     bool changed = false;
-    for (uint32_t y = 0; y < surface.height; ++y) for (uint32_t x = 0; x < surface.width; ++x) {
-        const size_t offset = packed_float_guest_pixel(surface, x, y) * 2;
-        if (upload) {
-            auto range = std::lower_bound(ranges.begin(), ranges.end(), offset,
-                [](const auto &range, size_t byte) { return range.offset + range.size <= byte; });
-            if (range == ranges.end() || range->offset >= offset + 2) continue;
-            const auto [top,bottom] = write_native_interval(y,surface.height,native_height,samples_y);
-            const auto [left,right] = write_native_interval(x,surface.width,native_width,samples_x);
-            for (size_t ny = top; ny < bottom; ++ny) for (size_t nx = left; nx < right; ++nx) {
-                auto *rgba = raw.data() + ny * stride + nx * 4;
-                uint16_t word;
-                if (full_upload) std::memcpy(&word, source.data() + offset, sizeof(word));
-                else {
-                    word = pack_u8u3u3u2(rgba);
-                    auto *bytes = reinterpret_cast<uint8_t *>(&word);
-                    for (auto part = range; part != ranges.end() && part->offset < offset + 2; ++part)
-                        for (size_t byte = std::max(offset,part->offset);
-                            byte < std::min(offset + 2,part->offset + part->size); ++byte)
-                            bytes[byte-offset] = source[byte];
+    for (uint32_t y = patch.guest.y; y < patch.guest.y + patch.guest.height; ++y)
+        for (uint32_t x = patch.guest.x; x < patch.guest.x + patch.guest.width; ++x) {
+            const size_t offset = packed_float_guest_pixel(surface, x, y) * 2;
+            if (upload) {
+                auto range = std::lower_bound(ranges.begin(), ranges.end(), offset,
+                    [](const auto &range, size_t byte) { return range.offset + range.size <= byte; });
+                if (range == ranges.end() || range->offset >= offset + 2) continue;
+                const auto [top,bottom] = write_native_interval(y,surface.height,native_height,samples_y);
+                const auto [left,right] = write_native_interval(x,surface.width,native_width,samples_x);
+                for (size_t ny = top; ny < bottom; ++ny) for (size_t nx = left; nx < right; ++nx) {
+                    auto *rgba = raw.data() + (ny - patch.native.y) * stride + (nx - patch.native.x) * 4;
+                    uint16_t word;
+                    if (full_upload) std::memcpy(&word, source.data() + offset, sizeof(word));
+                    else {
+                        word = pack_u8u3u3u2(rgba);
+                        auto *bytes = reinterpret_cast<uint8_t *>(&word);
+                        for (auto part = range; part != ranges.end() && part->offset < offset + 2; ++part)
+                            for (size_t byte = std::max(offset,part->offset);
+                                byte < std::min(offset + 2,part->offset + part->size); ++byte)
+                                bytes[byte-offset] = source[byte];
+                    }
+                    unpack_u8u3u3u2(word,rgba);
                 }
-                unpack_u8u3u3u2(word,rgba);
+                changed = true;
+            } else {
+                const size_t ny = size_t(y) * native_height / surface.height;
+                const size_t nx = size_t(x) * native_width / surface.width;
+                const uint16_t word = pack_u8u3u3u2(raw.data() + (ny - patch.native.y) * stride + (nx - patch.native.x) * 4);
+                std::memcpy(destination.data() + offset, &word, 2);
             }
-            changed = true;
-        } else {
-            const size_t ny = size_t(y) * native_height / surface.height;
-            const size_t nx = size_t(x) * native_width / surface.width;
-            const uint16_t word = pack_u8u3u3u2(raw.data() + ny * stride + nx * 4);
-            std::memcpy(destination.data() + offset, &word, 2);
         }
-    }
-    if (changed) [texture replaceRegion:MTLRegionMake2D(0, 0, native_width, native_height)
+    if (changed) [texture replaceRegion:region
         mipmapLevel:0 withBytes:raw.data() bytesPerRow:stride];
     return true;
 }
@@ -1001,46 +1040,51 @@ static bool s5s5u6_surface_memory(id<MTLTexture> texture,const SceGxmColorSurfac
     }
     if (upload && ranges.empty()) return true;
     const bool full_upload = upload && full_surface_write(ranges, size);
-    const size_t stride=native_width*8;
-    std::vector<uint8_t> raw(stride*native_height);
+    const auto patch = surface_write_patch(surface, 2, ranges, !upload || full_upload,
+        native_width, native_height, samples_x, samples_y);
+    if (!patch.native.width || !patch.native.height) return true;
+    const auto region = MTLRegionMake2D(patch.native.x, patch.native.y, patch.native.width, patch.native.height);
+    const size_t stride = patch.native.width * 8;
+    std::vector<uint8_t> raw(stride*patch.native.height);
     if (!full_upload) [texture getBytes:raw.data() bytesPerRow:stride
-        fromRegion:MTLRegionMake2D(0,0,native_width,native_height) mipmapLevel:0];
+        fromRegion:region mipmapLevel:0];
     bool changed=false;
-    for (uint32_t y=0;y<surface.height;++y) for (uint32_t x=0;x<surface.width;++x) {
-        const size_t offset=packed_float_guest_pixel(surface,x,y)*2;
-        if (upload) {
-            auto range=std::lower_bound(ranges.begin(),ranges.end(),offset,
-                [](const auto &range,size_t byte) { return range.offset+range.size<=byte; });
-            if (range==ranges.end() || range->offset>=offset+2) continue;
-            const auto [top,bottom]=write_native_interval(y,surface.height,native_height,samples_y);
-            const auto [left,right]=write_native_interval(x,surface.width,native_width,samples_x);
-            for (size_t ny=top;ny<bottom;++ny) for (size_t nx=left;nx<right;++nx) {
-                auto *native=raw.data()+ny*stride+nx*8;
-                uint16_t rgba[4], word;
-                if (full_upload) std::memcpy(&word,source.data()+offset,sizeof(word));
-                else {
-                    std::memcpy(rgba,native,8);
-                    word=pack_s5s5u6(rgba,mode);
-                    auto *bytes=reinterpret_cast<uint8_t *>(&word);
-                    for (auto part=range;part!=ranges.end() && part->offset<offset+2;++part)
-                        for (size_t byte=std::max(offset,part->offset);
-                            byte<std::min(offset+2,part->offset+part->size);++byte)
-                            bytes[byte-offset]=source[byte];
+    for (uint32_t y = patch.guest.y; y < patch.guest.y + patch.guest.height; ++y)
+        for (uint32_t x = patch.guest.x; x < patch.guest.x + patch.guest.width; ++x) {
+            const size_t offset=packed_float_guest_pixel(surface,x,y)*2;
+            if (upload) {
+                auto range=std::lower_bound(ranges.begin(),ranges.end(),offset,
+                    [](const auto &range,size_t byte) { return range.offset+range.size<=byte; });
+                if (range==ranges.end() || range->offset>=offset+2) continue;
+                const auto [top,bottom]=write_native_interval(y,surface.height,native_height,samples_y);
+                const auto [left,right]=write_native_interval(x,surface.width,native_width,samples_x);
+                for (size_t ny=top;ny<bottom;++ny) for (size_t nx=left;nx<right;++nx) {
+                    auto *native=raw.data() + (ny - patch.native.y) * stride + (nx - patch.native.x) * 8;
+                    uint16_t rgba[4], word;
+                    if (full_upload) std::memcpy(&word,source.data()+offset,sizeof(word));
+                    else {
+                        std::memcpy(rgba,native,8);
+                        word=pack_s5s5u6(rgba,mode);
+                        auto *bytes=reinterpret_cast<uint8_t *>(&word);
+                        for (auto part=range;part!=ranges.end() && part->offset<offset+2;++part)
+                            for (size_t byte=std::max(offset,part->offset);
+                                byte<std::min(offset+2,part->offset+part->size);++byte)
+                                bytes[byte-offset]=source[byte];
+                    }
+                    unpack_s5s5u6(word,mode,rgba);
+                    std::memcpy(native,rgba,8);
                 }
-                unpack_s5s5u6(word,mode,rgba);
-                std::memcpy(native,rgba,8);
+                changed=true;
+            } else {
+                const size_t ny=size_t(y)*native_height/surface.height;
+                const size_t nx=size_t(x)*native_width/surface.width;
+                uint16_t rgba[4];
+                std::memcpy(rgba,raw.data() + (ny - patch.native.y) * stride + (nx - patch.native.x) * 8,8);
+                const uint16_t word=pack_s5s5u6(rgba,mode);
+                std::memcpy(destination.data()+offset,&word,2);
             }
-            changed=true;
-        } else {
-            const size_t ny=size_t(y)*native_height/surface.height;
-            const size_t nx=size_t(x)*native_width/surface.width;
-            uint16_t rgba[4];
-            std::memcpy(rgba,raw.data()+ny*stride+nx*8,8);
-            const uint16_t word=pack_s5s5u6(rgba,mode);
-            std::memcpy(destination.data()+offset,&word,2);
         }
-    }
-    if (changed) [texture replaceRegion:MTLRegionMake2D(0,0,native_width,native_height)
+    if (changed) [texture replaceRegion:region
         mipmapLevel:0 withBytes:raw.data() bytesPerRow:stride];
     return true;
 }
@@ -1090,45 +1134,50 @@ static bool u8s8s8u8_surface_memory(id<MTLTexture> texture, const SceGxmColorSur
     }
     if (upload && ranges.empty()) return true;
     const bool full_upload = upload && full_surface_write(ranges, size);
-    const size_t stride=native_width*8;
-    std::vector<uint8_t> raw(stride*native_height);
+    const auto patch = surface_write_patch(surface, 4, ranges, !upload || full_upload,
+        native_width, native_height, samples_x, samples_y);
+    if (!patch.native.width || !patch.native.height) return true;
+    const auto region = MTLRegionMake2D(patch.native.x, patch.native.y, patch.native.width, patch.native.height);
+    const size_t stride = patch.native.width * 8;
+    std::vector<uint8_t> raw(stride*patch.native.height);
     if (!full_upload) [texture getBytes:raw.data() bytesPerRow:stride
-        fromRegion:MTLRegionMake2D(0,0,native_width,native_height) mipmapLevel:0];
+        fromRegion:region mipmapLevel:0];
     bool changed=false;
-    for (uint32_t y=0;y<surface.height;++y) for (uint32_t x=0;x<surface.width;++x) {
-        const size_t offset=packed_float_guest_pixel(surface,x,y)*4;
-        if (upload) {
-            auto range=std::lower_bound(ranges.begin(),ranges.end(),offset,
-                [](const auto &range,size_t byte) { return range.offset+range.size<=byte; });
-            if (range==ranges.end() || range->offset>=offset+4) continue;
-            const auto [top,bottom]=write_native_interval(y,surface.height,native_height,samples_y);
-            const auto [left,right]=write_native_interval(x,surface.width,native_width,samples_x);
-            for (size_t ny=top;ny<bottom;++ny) for (size_t nx=left;nx<right;++nx) {
-                auto *native=raw.data()+ny*stride+nx*8;
-                uint16_t rgba[4];
-                uint8_t bytes[4];
-                if (full_upload) std::memcpy(bytes,source.data()+offset,sizeof(bytes));
-                else {
-                    std::memcpy(rgba,native,8);
-                    pack_u8s8s8u8(rgba,mode,bytes);
-                    for (auto part=range;part!=ranges.end() && part->offset<offset+4;++part)
-                        for (size_t byte=std::max(offset,part->offset);
-                            byte<std::min(offset+4,part->offset+part->size);++byte)
-                            bytes[byte-offset]=source[byte];
+    for (uint32_t y = patch.guest.y; y < patch.guest.y + patch.guest.height; ++y)
+        for (uint32_t x = patch.guest.x; x < patch.guest.x + patch.guest.width; ++x) {
+            const size_t offset=packed_float_guest_pixel(surface,x,y)*4;
+            if (upload) {
+                auto range=std::lower_bound(ranges.begin(),ranges.end(),offset,
+                    [](const auto &range,size_t byte) { return range.offset+range.size<=byte; });
+                if (range==ranges.end() || range->offset>=offset+4) continue;
+                const auto [top,bottom]=write_native_interval(y,surface.height,native_height,samples_y);
+                const auto [left,right]=write_native_interval(x,surface.width,native_width,samples_x);
+                for (size_t ny=top;ny<bottom;++ny) for (size_t nx=left;nx<right;++nx) {
+                    auto *native=raw.data() + (ny - patch.native.y) * stride + (nx - patch.native.x) * 8;
+                    uint16_t rgba[4];
+                    uint8_t bytes[4];
+                    if (full_upload) std::memcpy(bytes,source.data()+offset,sizeof(bytes));
+                    else {
+                        std::memcpy(rgba,native,8);
+                        pack_u8s8s8u8(rgba,mode,bytes);
+                        for (auto part=range;part!=ranges.end() && part->offset<offset+4;++part)
+                            for (size_t byte=std::max(offset,part->offset);
+                                byte<std::min(offset+4,part->offset+part->size);++byte)
+                                bytes[byte-offset]=source[byte];
+                    }
+                    unpack_u8s8s8u8(bytes,mode,rgba);
+                    std::memcpy(native,rgba,8);
                 }
-                unpack_u8s8s8u8(bytes,mode,rgba);
-                std::memcpy(native,rgba,8);
+                changed=true;
+            } else {
+                const size_t ny=size_t(y)*native_height/surface.height;
+                const size_t nx=size_t(x)*native_width/surface.width;
+                uint16_t rgba[4];
+                std::memcpy(rgba,raw.data() + (ny - patch.native.y) * stride + (nx - patch.native.x) * 8,8);
+                pack_u8s8s8u8(rgba,mode,destination.data()+offset);
             }
-            changed=true;
-        } else {
-            const size_t ny=size_t(y)*native_height/surface.height;
-            const size_t nx=size_t(x)*native_width/surface.width;
-            uint16_t rgba[4];
-            std::memcpy(rgba,raw.data()+ny*stride+nx*8,8);
-            pack_u8s8s8u8(rgba,mode,destination.data()+offset);
         }
-    }
-    if (changed) [texture replaceRegion:MTLRegionMake2D(0,0,native_width,native_height)
+    if (changed) [texture replaceRegion:region
         mipmapLevel:0 withBytes:raw.data() bytesPerRow:stride];
     return true;
 }
@@ -1161,7 +1210,11 @@ static bool packed_float_surface_memory(id<MTLTexture> texture, const SceGxmColo
     if (upload && ranges.empty()) return true;
     const bool full_upload = upload && full_surface_write(ranges, size);
     const size_t native_width = texture.width, native_height = texture.height;
-    const size_t stride = native_width * 8;
+    const auto patch = surface_write_patch(surface, 4, ranges, !upload || full_upload,
+        native_width, native_height, samples_x, samples_y);
+    if (!patch.native.width || !patch.native.height) return true;
+    const auto region = MTLRegionMake2D(patch.native.x, patch.native.y, patch.native.width, patch.native.height);
+    const size_t stride = patch.native.width * 8;
     id<MTLBuffer> backing = upload ? nil : texture.buffer;
     const size_t buffer_stride = backing ? texture.bufferBytesPerRow : 0;
     const size_t buffer_offset = backing ? texture.bufferOffset : 0;
@@ -1175,9 +1228,9 @@ static bool packed_float_surface_memory(id<MTLTexture> texture, const SceGxmColo
         pixels = static_cast<const uint8_t *>(backing.contents) + buffer_offset;
         pixel_stride = buffer_stride;
     } else {
-        fetched.resize(stride * native_height);
+        fetched.resize(stride * patch.native.height);
         if (!full_upload) [texture getBytes:fetched.data() bytesPerRow:stride
-            fromRegion:MTLRegionMake2D(0, 0, native_width, native_height) mipmapLevel:0];
+            fromRegion:region mipmapLevel:0];
         pixels = fetched.data();
         pixel_stride = stride;
     }
@@ -1197,40 +1250,41 @@ static bool packed_float_surface_memory(id<MTLTexture> texture, const SceGxmColo
         return true;
     }
     bool changed = false;
-    for (uint32_t y = 0; y < surface.height; ++y) for (uint32_t x = 0; x < surface.width; ++x) {
-        const size_t offset = packed_float_guest_pixel(surface, x, y) * 4;
-        if (upload) {
-            const uint32_t mask = full_upload ? UINT32_MAX : changed_word_mask(ranges, offset);
-            if (!mask) continue;
-            uint32_t incoming;
-            std::memcpy(&incoming, source.data() + offset, 4);
-            uint16_t channels[4];
-            // Full writes decode once per guest word, independently of the
-            // native scale/sample footprint. Partial writes merge each sample.
-            if (mask == UINT32_MAX) unpack_packed_float(incoming, mode, channels);
-            const auto [top,bottom]=write_native_interval(y,surface.height,native_height,samples_y);
-            const auto [left,right]=write_native_interval(x,surface.width,native_width,samples_x);
-            for (size_t ny=top;ny<bottom;++ny)
-                for (size_t nx=left;nx<right;++nx) {
-                    auto *native = fetched.data() + ny * stride + nx * 8;
-                    if (mask != UINT32_MAX) {
-                        std::memcpy(channels, native, 8);
-                        const uint32_t previous = packed_float_word(channels, mode);
-                        unpack_packed_float((previous & ~mask) | (incoming & mask), mode, channels);
+    for (uint32_t y = patch.guest.y; y < patch.guest.y + patch.guest.height; ++y)
+        for (uint32_t x = patch.guest.x; x < patch.guest.x + patch.guest.width; ++x) {
+            const size_t offset = packed_float_guest_pixel(surface, x, y) * 4;
+            if (upload) {
+                const uint32_t mask = full_upload ? UINT32_MAX : changed_word_mask(ranges, offset);
+                if (!mask) continue;
+                uint32_t incoming;
+                std::memcpy(&incoming, source.data() + offset, 4);
+                uint16_t channels[4];
+                // Full writes decode once per guest word, independently of the
+                // native scale/sample footprint. Partial writes merge each sample.
+                if (mask == UINT32_MAX) unpack_packed_float(incoming, mode, channels);
+                const auto [top,bottom]=write_native_interval(y,surface.height,native_height,samples_y);
+                const auto [left,right]=write_native_interval(x,surface.width,native_width,samples_x);
+                for (size_t ny=top;ny<bottom;++ny)
+                    for (size_t nx=left;nx<right;++nx) {
+                        auto *native = fetched.data() + (ny - patch.native.y) * stride + (nx - patch.native.x) * 8;
+                        if (mask != UINT32_MAX) {
+                            std::memcpy(channels, native, 8);
+                            const uint32_t previous = packed_float_word(channels, mode);
+                            unpack_packed_float((previous & ~mask) | (incoming & mask), mode, channels);
+                        }
+                        std::memcpy(native, channels, 8);
                     }
-                    std::memcpy(native, channels, 8);
-                }
-            changed = true;
-        } else {
-            const size_t ny = size_t(y) * native_height / surface.height;
-            const size_t nx = size_t(x) * native_width / surface.width;
-            uint16_t channels[4];
-            std::memcpy(channels, pixels + ny * pixel_stride + nx * 8, 8);
-            const uint32_t word = packed_float_word(channels, mode);
-            std::memcpy(destination.data() + offset, &word, 4);
+                changed = true;
+            } else {
+                const size_t ny = size_t(y) * native_height / surface.height;
+                const size_t nx = size_t(x) * native_width / surface.width;
+                uint16_t channels[4];
+                std::memcpy(channels, pixels + ny * pixel_stride + nx * 8, 8);
+                const uint32_t word = packed_float_word(channels, mode);
+                std::memcpy(destination.data() + offset, &word, 4);
+            }
         }
-    }
-    if (changed) [texture replaceRegion:MTLRegionMake2D(0, 0, native_width, native_height)
+    if (changed) [texture replaceRegion:region
         mipmapLevel:0 withBytes:fetched.data() bytesPerRow:stride];
     return true;
 }
@@ -1253,47 +1307,52 @@ static bool rgb9e5_expanded_surface_memory(id<MTLTexture> texture, const SceGxmC
     }
     if (upload && ranges.empty()) return true;
     const bool full_upload = upload && full_surface_write(ranges, size);
-    const size_t stride=native_width*8;
-    std::vector<uint8_t> raw(stride*native_height);
+    const auto patch = surface_write_patch(surface, 4, ranges, !upload || full_upload,
+        native_width, native_height, samples_x, samples_y);
+    if (!patch.native.width || !patch.native.height) return true;
+    const auto region = MTLRegionMake2D(patch.native.x, patch.native.y, patch.native.width, patch.native.height);
+    const size_t stride = patch.native.width * 8;
+    std::vector<uint8_t> raw(stride*patch.native.height);
     if (!full_upload) [texture getBytes:raw.data() bytesPerRow:stride
-        fromRegion:MTLRegionMake2D(0,0,native_width,native_height) mipmapLevel:0];
+        fromRegion:region mipmapLevel:0];
     bool changed=false;
-    for (uint32_t y=0;y<surface.height;++y) for (uint32_t x=0;x<surface.width;++x) {
-        const size_t offset=packed_float_guest_pixel(surface,x,y)*4;
-        if (upload) {
-            const uint32_t mask = full_upload ? UINT32_MAX : changed_word_mask(ranges, offset);
-            if (!mask) continue;
-            uint32_t incoming;
-            std::memcpy(&incoming,source.data()+offset,4);
-            uint16_t channels[4];
-            if (mask==UINT32_MAX) unpack_rgb9e5(mode==1 ? swap_e5_red_blue(incoming) : incoming,channels);
-            const auto [top,bottom]=write_native_interval(y,surface.height,native_height,samples_y);
-            const auto [left,right]=write_native_interval(x,surface.width,native_width,samples_x);
-            for (size_t ny=top;ny<bottom;++ny)
-                for (size_t nx=left;nx<right;++nx) {
-                    auto *native=raw.data()+ny*stride+nx*8;
-                    if (mask!=UINT32_MAX) {
-                        std::memcpy(channels,native,8);
-                        uint32_t previous=pack_rgb9e5(channels);
-                        if (mode==1) previous=swap_e5_red_blue(previous);
-                        uint32_t word=(previous & ~mask) | (incoming & mask);
-                        if (mode==1) word=swap_e5_red_blue(word);
-                        unpack_rgb9e5(word,channels);
+    for (uint32_t y = patch.guest.y; y < patch.guest.y + patch.guest.height; ++y)
+        for (uint32_t x = patch.guest.x; x < patch.guest.x + patch.guest.width; ++x) {
+            const size_t offset=packed_float_guest_pixel(surface,x,y)*4;
+            if (upload) {
+                const uint32_t mask = full_upload ? UINT32_MAX : changed_word_mask(ranges, offset);
+                if (!mask) continue;
+                uint32_t incoming;
+                std::memcpy(&incoming,source.data()+offset,4);
+                uint16_t channels[4];
+                if (mask==UINT32_MAX) unpack_rgb9e5(mode==1 ? swap_e5_red_blue(incoming) : incoming,channels);
+                const auto [top,bottom]=write_native_interval(y,surface.height,native_height,samples_y);
+                const auto [left,right]=write_native_interval(x,surface.width,native_width,samples_x);
+                for (size_t ny=top;ny<bottom;++ny)
+                    for (size_t nx=left;nx<right;++nx) {
+                        auto *native=raw.data() + (ny - patch.native.y) * stride + (nx - patch.native.x) * 8;
+                        if (mask!=UINT32_MAX) {
+                            std::memcpy(channels,native,8);
+                            uint32_t previous=pack_rgb9e5(channels);
+                            if (mode==1) previous=swap_e5_red_blue(previous);
+                            uint32_t word=(previous & ~mask) | (incoming & mask);
+                            if (mode==1) word=swap_e5_red_blue(word);
+                            unpack_rgb9e5(word,channels);
+                        }
+                        std::memcpy(native,channels,8);
                     }
-                    std::memcpy(native,channels,8);
-                }
-            changed=true;
-        } else {
-            const size_t ny=size_t(y)*native_height/surface.height;
-            const size_t nx=size_t(x)*native_width/surface.width;
-            uint16_t channels[4];
-            std::memcpy(channels,raw.data()+ny*stride+nx*8,8);
-            uint32_t word=pack_rgb9e5(channels);
-            if (mode==1) word=swap_e5_red_blue(word);
-            std::memcpy(destination.data()+offset,&word,4);
+                changed=true;
+            } else {
+                const size_t ny=size_t(y)*native_height/surface.height;
+                const size_t nx=size_t(x)*native_width/surface.width;
+                uint16_t channels[4];
+                std::memcpy(channels,raw.data() + (ny - patch.native.y) * stride + (nx - patch.native.x) * 8,8);
+                uint32_t word=pack_rgb9e5(channels);
+                if (mode==1) word=swap_e5_red_blue(word);
+                std::memcpy(destination.data()+offset,&word,4);
+            }
         }
-    }
-    if (changed) [texture replaceRegion:MTLRegionMake2D(0,0,native_width,native_height)
+    if (changed) [texture replaceRegion:region
         mipmapLevel:0 withBytes:raw.data() bytesPerRow:stride];
     return true;
 }
@@ -1551,8 +1610,8 @@ static bool write_surface_memory_mapped(id<MTLTexture> texture, const SceGxmColo
     for (size_t byte = 0; byte < pixel_bytes; ++byte)
         native_byte_indices[byte] = channel[byte / components.bytes] * components.bytes + byte % components.bytes;
     // Linear, unscaled imports can visit just the written row intervals.
-    // Preserve bytes outside partial ranges in one native read. Full writes
-    // need no readback, and identical channel order needs no conversion.
+    // Preserve bytes outside partial ranges in a bounded native read. Full
+    // writes need no readback, and identical order needs no conversion.
     const bool direct_linear = surface.surfaceType == SCE_GXM_COLOR_SURFACE_LINEAR
         && samples_x == 1 && samples_y == 1
         && native_width == surface.width && native_height == surface.height
@@ -1562,16 +1621,21 @@ static bool write_surface_memory_mapped(id<MTLTexture> texture, const SceGxmColo
         && !packed565 && !packed4444 && !packed_u1
         && !packed_e5 && !packed_u2 && !packed_f11;
     if (direct_linear) {
-        const auto region = MTLRegionMake2D(0, 0, native_width, native_height);
         const size_t guest_stride = size_t(surface.strideInPixels) * pixel_bytes;
         const bool complete = full_surface_write(ranges, size);
+        const auto patch = complete ? LinearSurfacePatch{0, 0, native_width, native_height}
+            : linear_surface_patch(native_width, native_height, pixel_bytes, guest_stride, ranges);
+        if (!patch.width || !patch.height) return true; // Guest padding only.
+        const auto region = MTLRegionMake2D(patch.x, patch.y, patch.width, patch.height);
+        const size_t patch_stride = patch.width * pixel_bytes;
+        const size_t patch_left = patch.x * pixel_bytes;
         if (complete && mapping == identity) {
             [texture replaceRegion:region mipmapLevel:0 withBytes:source.data() bytesPerRow:guest_stride];
             return true;
         }
-        std::vector<uint8_t> native(native_stride * native_height);
+        std::vector<uint8_t> native(patch_stride * patch.height);
         if (!complete)
-            [texture getBytes:native.data() bytesPerRow:native_stride fromRegion:region mipmapLevel:0];
+            [texture getBytes:native.data() bytesPerRow:patch_stride fromRegion:region mipmapLevel:0];
         const auto copy_row = [&]<size_t Bytes>(uint8_t *destination, const uint8_t *guest,
                                   size_t first, size_t last) {
             // Only the interval ends can contain partial pixels. Their other
@@ -1594,20 +1658,22 @@ static bool write_surface_memory_mapped(id<MTLTexture> texture, const SceGxmColo
                 const size_t first = std::max(range.offset, row_begin);
                 const size_t last = std::min(end, row_begin + native_stride);
                 if (first >= last) continue;
-                auto *destination = native.data() + y * native_stride;
-                const auto *guest = source.data() + row_begin;
+                auto *destination = native.data() + (y - patch.y) * patch_stride;
+                const auto *guest = source.data() + row_begin + patch_left;
+                const size_t local_first = first - row_begin - patch_left;
+                const size_t local_last = last - row_begin - patch_left;
                 if (mapping == identity)
-                    std::memcpy(destination + first - row_begin, source.data() + first, last - first);
+                    std::memcpy(destination + local_first, source.data() + first, last - first);
                 else switch (pixel_bytes) {
-                case 1: copy_row.template operator()<1>(destination, guest, first - row_begin, last - row_begin); break;
-                case 2: copy_row.template operator()<2>(destination, guest, first - row_begin, last - row_begin); break;
-                case 4: copy_row.template operator()<4>(destination, guest, first - row_begin, last - row_begin); break;
-                case 8: copy_row.template operator()<8>(destination, guest, first - row_begin, last - row_begin); break;
-                case 16: copy_row.template operator()<16>(destination, guest, first - row_begin, last - row_begin); break;
+                case 1: copy_row.template operator()<1>(destination, guest, local_first, local_last); break;
+                case 2: copy_row.template operator()<2>(destination, guest, local_first, local_last); break;
+                case 4: copy_row.template operator()<4>(destination, guest, local_first, local_last); break;
+                case 8: copy_row.template operator()<8>(destination, guest, local_first, local_last); break;
+                case 16: copy_row.template operator()<16>(destination, guest, local_first, local_last); break;
                 }
             }
         }
-        [texture replaceRegion:region mipmapLevel:0 withBytes:native.data() bytesPerRow:native_stride];
+        [texture replaceRegion:region mipmapLevel:0 withBytes:native.data() bytesPerRow:patch_stride];
         return true;
     }
     // Column footprints are shared by every row, including overlapping
@@ -1656,16 +1722,21 @@ static bool write_surface_memory_mapped(id<MTLTexture> texture, const SceGxmColo
             mipmapLevel:0 withBytes:converted.data() bytesPerRow:native_stride];
         return true;
     }
-    std::vector<uint8_t> raw(native_stride * native_height);
+    const auto patch = surface_write_patch(surface, pixel_bytes, ranges, full_surface_write(ranges, size),
+        native_width, native_height, samples_x, samples_y);
+    if (!patch.native.width || !patch.native.height) return true;
+    const auto region = MTLRegionMake2D(patch.native.x, patch.native.y, patch.native.width, patch.native.height);
+    const size_t patch_stride = patch.native.width * native_pixel_bytes;
+    std::vector<uint8_t> raw(patch_stride * patch.native.height);
     if (pixel_bytes != native_pixel_bytes || !full_surface_write(ranges, size))
-        [texture getBytes:raw.data() bytesPerRow:native_stride
-            fromRegion:MTLRegionMake2D(0,0,native_width,native_height) mipmapLevel:0];
+        [texture getBytes:raw.data() bytesPerRow:patch_stride
+            fromRegion:region mipmapLevel:0];
     bool changed = false;
     size_t linear_range_index = 0;
     const uint32_t whole_pixel_mask = (uint32_t(1) << pixel_bytes) - 1;
-    for (uint32_t y = 0; y < surface.height; ++y) {
+    for (uint32_t y = patch.guest.y; y < patch.guest.y + patch.guest.height; ++y) {
         const auto [top, bottom] = write_native_interval(y, surface.height, native_height, samples_y);
-        for (uint32_t x = 0; x < surface.width; ++x) {
+        for (uint32_t x = patch.guest.x; x < patch.guest.x + patch.guest.width; ++x) {
             size_t pixel;
             if (surface.surfaceType == SCE_GXM_COLOR_SURFACE_TILED)
                 pixel = ((size_t(y / 32) * (surface.strideInPixels / 32) + x / 32) * 1024) + (y % 32) * 32 + x % 32;
@@ -1709,7 +1780,7 @@ static bool write_surface_memory_mapped(id<MTLTexture> texture, const SceGxmColo
                 const auto copy_pixel = [&]<size_t Bytes>() {
                     for (size_t ny = top; ny < bottom; ++ny)
                         for (size_t nx = left; nx < right; ++nx)
-                            std::memcpy(raw.data() + ny * native_stride + nx * Bytes, converted.data(), Bytes);
+                            std::memcpy(raw.data() + (ny - patch.native.y) * patch_stride + (nx - patch.native.x) * Bytes, converted.data(), Bytes);
                 };
                 switch (pixel_bytes) {
                 case 1: copy_pixel.template operator()<1>(); break;
@@ -1723,7 +1794,7 @@ static bool write_surface_memory_mapped(id<MTLTexture> texture, const SceGxmColo
             }
             for (size_t ny=top;ny<bottom;++ny)
                 for (size_t nx=left;nx<right;++nx) {
-                    auto *native = raw.data()+ny*native_stride+nx*native_pixel_bytes;
+                    auto *native = raw.data() + (ny - patch.native.y) * patch_stride + (nx - patch.native.x) * native_pixel_bytes;
                     if (packed565) {
                         uint16_t word;
                         std::memcpy(&word,native,2);
@@ -1765,8 +1836,8 @@ static bool write_surface_memory_mapped(id<MTLTexture> texture, const SceGxmColo
             changed = true;
         }
     }
-    if (changed) [texture replaceRegion:MTLRegionMake2D(0,0,native_width,native_height)
-        mipmapLevel:0 withBytes:raw.data() bytesPerRow:native_stride];
+    if (changed) [texture replaceRegion:region
+        mipmapLevel:0 withBytes:raw.data() bytesPerRow:patch_stride];
     return true;
 }
 bool write_surface_memory(id<MTLTexture> texture, const SceGxmColorSurface &surface,
@@ -1778,9 +1849,8 @@ id<MTLTexture> rgba8_gamma_view(id<MTLTexture> texture, bool srgb) {
         throw std::runtime_error("Metal: gamma view requires RGBA8 storage");
     const auto format = srgb ? MTLPixelFormatRGBA8Unorm_sRGB : MTLPixelFormatRGBA8Unorm;
     if (texture.pixelFormat == format) return texture;
-    auto view = [texture newTextureViewWithPixelFormat:format];
-    if (!view) throw std::runtime_error("Metal: cannot create gamma texture view");
-    return view;
+    return cached_texture_view(texture, {format, texture.textureType, texture.mipmapLevelCount,
+        texture.arrayLength, identity, true});
 }
 id<MTLTexture> sampling_view(id<MTLTexture> texture, SceGxmTextureFormat format,
     const SceGxmColorFormat *rendered_format, const ImportedTextureView *imported) {
@@ -1816,12 +1886,8 @@ id<MTLTexture> sampling_view(id<MTLTexture> texture, SceGxmTextureFormat format,
     }
     if (mapping == identity && sampled_format == texture.pixelFormat) return texture;
     const NSUInteger slices = texture.textureType == MTLTextureTypeCube ? 6 : texture.arrayLength;
-    id<MTLTexture> result = [texture newTextureViewWithPixelFormat:sampled_format
-        textureType:texture.textureType levels:NSMakeRange(0, texture.mipmapLevelCount)
-        slices:NSMakeRange(0, slices)
-        swizzle:MTLTextureSwizzleChannelsMake(mapping[0], mapping[1], mapping[2], mapping[3])];
-    if (!result) throw std::runtime_error("Metal: cannot create texture channel view");
-    return result;
+    return cached_texture_view(texture, {sampled_format, texture.textureType,
+        texture.mipmapLevelCount, slices, mapping});
 }
 
 static MTLSamplerMinMagFilter sampler_filter(uint32_t value) {
@@ -2031,11 +2097,12 @@ static bool packed_32_word_target(SceGxmTextureBaseFormat texture) {
         || texture==SCE_GXM_TEXTURE_BASE_FORMAT_SE5M9M9M9
         || texture==SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10;
 }
+static std::optional<std::array<uint32_t,17>> packed_surface_cast_config(SceGxmColorFormat,
+    SceGxmTextureBaseFormat, uint32_t, MTLPixelFormat, uint64_t, uint64_t);
 bool surface_format_cast_enqueueable(SceGxmColorFormat color, SceGxmTextureBaseFormat texture,
     uint32_t texture_swizzle) {
-    return !packed_color_cast_source(gxm::get_base_format(color))
-        && !packed_texture_cast_target(texture)
-        && surface_format_cast_supported(color,texture,texture_swizzle);
+    return surface_format_cast_supported(color,texture,texture_swizzle)
+        && packed_surface_cast_config(color,texture,texture_swizzle,surface_components(color).native,1,1).has_value();
 }
 bool surface_raw_cast_required(SceGxmColorFormat color, SceGxmTextureBaseFormat texture) {
     const auto source=surface_components(color), target=texture_components(texture);
@@ -2757,43 +2824,13 @@ fragment uint4 publication_words(float4 position [[position]],
     NSError *error = nil;
     auto library = device.compile_library(source, nil, &error);
     if (!library) throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal: surface cast shader failed");
-    pipeline = cached_compute(device, library, @"unpack_words");
-    if (!pipeline) throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal: surface cast pipeline failed");
-    halfword_unpack_pipeline = cached_compute(device, library, @"unpack_halfwords");
-    byte_halfword_pipeline = cached_compute(device, library, @"unpack_byte_halfwords");
-    byte_halfword_buffer_pipeline = cached_compute(device, library, @"unpack_byte_halfwords_buffer");
-    byte_unpack_pipeline = cached_compute(device, library, @"unpack_16bit_bytes");
-    rgba8_byte_unpack_pipeline = cached_compute(device, library, @"unpack_rgba8_bytes");
-    wide_small_unpack_pipeline = cached_compute(device, library, @"unpack_wide_small");
-    wide_small_buffer_pipeline = cached_compute(device, library, @"unpack_wide_small_buffer");
-    word_buffer_pipeline = cached_compute(device, library, @"unpack_words_buffer");
-    halfword_buffer_pipeline = cached_compute(device, library, @"unpack_halfwords_buffer");
-    x8_word_decode_pipeline = cached_compute(device, library, @"decode_x8_word");
-    depth_pipeline = cached_compute(device, library, @"copy_depth");
-    if (!depth_pipeline) throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal: depth copy pipeline failed");
-    scaled_snapshot_pipeline = cached_compute(device, library, @"scale_snapshot_words");
-    if (!scaled_snapshot_pipeline) throw std::runtime_error("Metal: depth-view scaling pipeline failed");
-    packed_depth_snapshot_pipeline = cached_compute(device, library, @"copy_packed_depth");
-    if (!packed_depth_snapshot_pipeline) throw std::runtime_error("Metal: packed depth snapshot pipeline failed");
-    stencil_pipeline = cached_compute(device, library, @"copy_stencil");
-    stencil_ms_pipeline = cached_compute(device, library, @"expand_stencil");
-    if (!stencil_pipeline || !stencil_ms_pipeline) throw std::runtime_error("Metal: stencil snapshot pipeline failed");
-    depth_store_pipeline=cached_compute(device, library, @"store_depth_samples");
-    depth_store_ms_pipeline=cached_compute(device, library, @"store_depth_samples_ms");
-    if(!depth_store_pipeline || !depth_store_ms_pipeline) throw std::runtime_error("Metal: depth readback pipeline failed");
-    packed_depth_store_pipeline=cached_compute(device, library, @"store_packed_depth_samples");
-    packed_depth_store_ms_pipeline=cached_compute(device, library, @"store_packed_depth_samples_ms");
-    if(!packed_depth_store_pipeline || !packed_depth_store_ms_pipeline) throw std::runtime_error("Metal: packed depth readback pipeline failed");
-    mask_store_pipeline=cached_compute(device, library, @"store_mask_samples");
-    mask_store_ms_pipeline=cached_compute(device, library, @"store_mask_samples_ms");
-    if(!mask_store_pipeline || !mask_store_ms_pipeline) throw std::runtime_error("Metal: mask readback pipeline failed");
-    multisample_library=library;
-    multisample_pipeline=cached_compute(device, library, @"expand_samples");
-    multisample_depth_pipeline=cached_compute(device, library, @"expand_depth");
-    multisample_integer_pipeline=cached_compute(device, library, @"expand_integer_samples");
-    raw_multisample_resolve_pipeline=cached_compute(device, library, @"resolve_raw_f16_samples");
-    if (!multisample_pipeline || !multisample_depth_pipeline || !multisample_integer_pipeline
-        || !raw_multisample_resolve_pipeline) throw std::runtime_error("Metal: multisample copy pipeline failed");
+    multisample_library = library;
+}
+id<MTLComputePipelineState> SurfaceCaster::compute_pipeline(id<MTLComputePipelineState> __strong &slot, NSString *name) {
+    // Only the selected helper is compiled. Failed creation leaves the slot
+    // empty so a later attempt can retry; all users retain their native PSO.
+    if (!slot) slot = cached_compute(device, multisample_library, name);
+    return slot;
 }
 void SurfaceCaster::resolve_raw_multisample(id<MTLTexture> source, id<MTLTexture> resolved,
     id<MTLTexture> destination, V3KMetal4Commands * commands) {
@@ -2815,7 +2852,7 @@ void SurfaceCaster::resolve_raw_multisample(id<MTLTexture> source, id<MTLTexture
         throw std::runtime_error("Metal: cannot view raw F16 sample bits");
     auto encoder=[commands computeCommandEncoder];
     if (!encoder) throw std::runtime_error("Metal: cannot encode raw F16 sample resolve");
-    [encoder setComputePipelineState:raw_multisample_resolve_pipeline];
+    [encoder setComputePipelineState:compute_pipeline(raw_multisample_resolve_pipeline, @"resolve_raw_f16_samples")];
     [encoder setTexture:source atIndex:0];
     [encoder setTexture:resolved atIndex:1];
     [encoder setTexture:destination atIndex:2];
@@ -2844,8 +2881,8 @@ void SurfaceCaster::expand_multisample(id<MTLTexture> source, id<MTLTexture> des
     }
     auto commands=pending_commands ? pending_commands : surface_command_buffer(device, @"Vita3K surface expand MSAA");
     auto encoder=[commands computeCommandEncoder];
-    [encoder setComputePipelineState:integer ? multisample_integer_pipeline
-        : source.pixelFormat==MTLPixelFormatDepth32Float_Stencil8 ? multisample_depth_pipeline : multisample_pipeline];
+    [encoder setComputePipelineState:integer ? compute_pipeline(multisample_integer_pipeline, @"expand_integer_samples")
+        : source.pixelFormat==MTLPixelFormatDepth32Float_Stencil8 ? compute_pipeline(multisample_depth_pipeline, @"expand_depth") : compute_pipeline(multisample_pipeline, @"expand_samples")];
     [encoder setTexture:source atIndex:0]; [encoder setTexture:destination atIndex:1];
     const uint32_t guest_size[]={guest_width,guest_height};
     [encoder setBytes:guest_size length:sizeof(guest_size) atIndex:0];
@@ -3029,9 +3066,24 @@ id<MTLTexture> SurfaceCaster::texture_snapshot(id<MTLTexture> uploaded, std::spa
         throw std::runtime_error("Metal: invalid rendered texture source");
     const bool cube=uploaded.textureType==MTLTextureTypeCube;
     const auto extent = snapshot_texture_extent(uploaded.width, uploaded.height, uploaded.mipmapLevelCount, scale);
-    if (!cube_pipeline) {
+    // Resolve exactly the views that will be read, including the last override
+    // of a face/mip. Their effective swizzles, not the parent storage format,
+    // determine which channels can be omitted. Keep them alive until encoded.
+    std::vector<id<MTLTexture>> selected;
+    uint32_t live_components = 0;
+    for (uint32_t face=0;face<(cube?6u:1u);++face) for (uint32_t mip=0;mip<uploaded.mipmapLevelCount;++mip) {
+        id<MTLTexture> source=nil;
+        for (const auto &surface:surfaces) if (surface.face==face && surface.mip==mip) source=surface.texture;
+        if (!source) source=[uploaded newTextureViewWithPixelFormat:uploaded.pixelFormat textureType:MTLTextureType2D
+            levels:NSMakeRange(mip,1) slices:NSMakeRange(face,1)];
+        if (!source) throw std::runtime_error("Metal: cannot create cube face view");
+        live_components |= snapshot_live_components(source.pixelFormat, source.swizzle);
+        selected.push_back(source);
+    }
+    const auto channels = snapshot_channels(live_components);
+    if (!snapshot_library) {
         NSError *error = nil;
-        auto library = device.compile_library(@R"(#include <metal_stdlib>
+        snapshot_library = device.compile_library(@R"(#include <metal_stdlib>
 using namespace metal;
 kernel void copy_cube_face(texture2d<float,access::read> source [[texture(0)]],
     texture2d<float,access::write> output [[texture(1)]], uint2 p [[thread_position_in_grid]]) {
@@ -3041,29 +3093,46 @@ kernel void copy_cube_face(texture2d<float,access::read> source [[texture(0)]],
     // mip has more destination pixels than the rendered guest level * scale.
     uint2 coord=((2*p+1)*uint2(source.get_width(),source.get_height()))/(2*size);
     output.write(source.read(coord),p);
+}
+kernel void copy_cube_face_packed(texture2d<float,access::read> source [[texture(0)]],
+    texture2d<float,access::write> output [[texture(1)]], constant uint4 &pack [[buffer(0)]],
+    uint2 p [[thread_position_in_grid]]) {
+    uint2 size=uint2(output.get_width(),output.get_height());
+    if(any(p>=size)) return;
+    uint2 coord=((2*p+1)*uint2(source.get_width(),source.get_height()))/(2*size);
+    float4 value=source.read(coord);
+    output.write(float4(value[pack.x],value[pack.y],value[pack.z],value[pack.w]),p);
 })", nil, &error);
-        if (!library) throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal: cube copy compilation failed");
-        cube_pipeline = cached_compute(device, library, @"copy_cube_face");
-        if (!cube_pipeline) throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal: cube copy pipeline failed");
+        if (!snapshot_library) throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal: cube copy compilation failed");
     }
+    auto &snapshot_pipeline = channels.packed() ? cube_packed_pipeline : cube_pipeline;
+    if (!snapshot_pipeline) snapshot_pipeline = cached_compute(device, snapshot_library,
+        channels.packed() ? @"copy_cube_face_packed" : @"copy_cube_face");
     const auto [scaled_width, scaled_height] = extent;
     auto desc = cube
-        ? [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float size:scaled_width mipmapped:NO]
-        : [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:scaled_width height:scaled_height mipmapped:NO];
+        ? [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:channels.format size:scaled_width mipmapped:NO]
+        : [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:channels.format width:scaled_width height:scaled_height mipmapped:NO];
     desc.mipmapLevelCount=uploaded.mipmapLevelCount;
     desc.storageMode=MTLStorageModeShared;
     desc.usage=MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite|MTLTextureUsagePixelFormatView;
     auto result=[device.native_device() newTextureWithDescriptor:desc];
     if (!result) throw std::runtime_error("Metal: rendered cube allocation failed");
+    // Native samplers use transparent-black borders. Reconstruct omitted
+    // zeros with a view, but keep all nonzero/implicit-one channels in actual
+    // storage so out-of-range texel reads and border samples remain zero.
+    id<MTLTexture> sampled = result;
+    if (channels.packed()) {
+        sampled = [result newTextureViewWithPixelFormat:result.pixelFormat textureType:result.textureType
+            levels:NSMakeRange(0,result.mipmapLevelCount) slices:NSMakeRange(0,cube?6:1) swizzle:channels.swizzle];
+        if (!sampled) throw std::runtime_error("Metal: cannot reconstruct packed snapshot channels");
+    }
     auto commands=pending_commands ? pending_commands : surface_command_buffer(device, @"Vita3K surface texture snapshot");
     auto encoder=[commands computeCommandEncoder];
     if (!encoder) throw std::runtime_error("Metal: cannot encode texture snapshot");
-    [encoder setComputePipelineState:cube_pipeline];
+    [encoder setComputePipelineState:snapshot_pipeline];
+    if (channels.packed()) [encoder setBytes:channels.pack.data() length:sizeof(channels.pack) atIndex:0];
     for (uint32_t face=0;face<(cube?6u:1u);++face) for (uint32_t mip=0;mip<uploaded.mipmapLevelCount;++mip) {
-        id<MTLTexture> source=nil;
-        for (const auto &surface:surfaces) if (surface.face==face && surface.mip==mip) source=surface.texture;
-        if (!source) source=[uploaded newTextureViewWithPixelFormat:uploaded.pixelFormat textureType:MTLTextureType2D
-            levels:NSMakeRange(mip,1) slices:NSMakeRange(face,1)];
+        id<MTLTexture> source=selected[face*uploaded.mipmapLevelCount+mip];
         auto output=[result newTextureViewWithPixelFormat:result.pixelFormat textureType:MTLTextureType2D
             levels:NSMakeRange(mip,1) slices:NSMakeRange(face,1)];
         if (!source || !output) throw std::runtime_error("Metal: cannot create cube face view");
@@ -3075,7 +3144,7 @@ kernel void copy_cube_face(texture2d<float,access::read> source [[texture(0)]],
         std::string error;
         if (!device.submit_and_wait(commands,error)) throw std::runtime_error(error);
     }
-    return result;
+    return sampled;
 }
 
 id<MTLTexture> SurfaceCaster::color_snapshot(id<MTLTexture> source, V3KMetal4Commands * pending_commands) {
@@ -3127,7 +3196,7 @@ id<MTLTexture> SurfaceCaster::scaled_snapshot(id<MTLTexture> source, uint32_t wi
     auto commands = pending_commands ? pending_commands : surface_command_buffer(device, @"Vita3K scaled depth view");
     auto encoder = [commands computeCommandEncoder];
     if (!encoder) throw std::runtime_error("Metal: cannot encode scaled depth view");
-    [encoder setComputePipelineState:scaled_snapshot_pipeline];
+    [encoder setComputePipelineState:compute_pipeline(scaled_snapshot_pipeline, @"scale_snapshot_words")];
     [encoder setTexture:input atIndex:0];
     [encoder setTexture:output atIndex:1];
     [encoder dispatchThreads:MTLSizeMake(width,height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
@@ -3250,7 +3319,7 @@ id<MTLTexture> SurfaceCaster::rgba8_from_rg32(id<MTLTexture> source, bool swap_w
     if (!bytes) throw std::runtime_error("Metal: cannot write raw reinterpreted color bytes");
     auto commands = pending_commands ? pending_commands : surface_command_buffer(device, @"Vita3K surface RG32 cast");
     auto encoder = [commands computeCommandEncoder];
-    [encoder setComputePipelineState:pipeline];
+    [encoder setComputePipelineState:compute_pipeline(pipeline, @"unpack_words")];
     [encoder setTexture:words atIndex:0];
     [encoder setTexture:bytes atIndex:1];
     const uint32_t config[] = {guest_width, uint32_t(swap_words) | (separate_word ? 2u : 0u), word_offset, guest_height};
@@ -3321,7 +3390,7 @@ id<MTLTexture> SurfaceCaster::word_texture_from_rg32(id<MTLTexture> source,
         auto commands=pending_commands ? pending_commands : surface_command_buffer(device,@"Vita3K surface X8 word decode");
         auto word_image=word_texture_from_rg32(source,SCE_GXM_TEXTURE_BASE_FORMAT_U32,
             0,swap_words,word_offset,guest_width,guest_height,commands,separate_word);
-        auto decoded=decode_x8_word_texture(device,commands,x8_word_decode_pipeline,word_image,texture_swizzle);
+        auto decoded=decode_x8_word_texture(device,commands,compute_pipeline(x8_word_decode_pipeline, @"decode_x8_word"),word_image,texture_swizzle);
         if (!pending_commands) {
             std::string error;
             if (!device.submit_and_wait(commands,error)) throw std::runtime_error(error);
@@ -3342,7 +3411,7 @@ id<MTLTexture> SurfaceCaster::word_texture_from_rg32(id<MTLTexture> source,
         | (target.bytes << 2),word_offset,guest_height};
     auto commands=pending_commands ? pending_commands : surface_command_buffer(device,@"Vita3K surface RG32 word cast");
     if (packed_32_word_target(texture)) {
-        encode_packed_word_texture(device,commands,word_buffer_pipeline,words,result,config,nullptr,
+        encode_packed_word_texture(device,commands,compute_pipeline(word_buffer_pipeline, @"unpack_words_buffer"),words,result,config,nullptr,
             texture==SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10 ? texture_swizzle&3u : UINT32_MAX);
         if (!pending_commands) {
             std::string error;
@@ -3353,7 +3422,7 @@ id<MTLTexture> SurfaceCaster::word_texture_from_rg32(id<MTLTexture> source,
     auto bits=[result newTextureViewWithPixelFormat:sample_bits_format(target.native)];
     if (!bits) throw std::runtime_error("Metal: cannot write RG32 word alias bits");
     auto encoder=[commands computeCommandEncoder];
-    [encoder setComputePipelineState:pipeline];
+    [encoder setComputePipelineState:compute_pipeline(pipeline, @"unpack_words")];
     [encoder setTexture:words atIndex:0];
     [encoder setTexture:bits atIndex:1];
     [encoder setBytes:config length:sizeof(config) atIndex:0];
@@ -3383,7 +3452,7 @@ id<MTLTexture> SurfaceCaster::word_texture_from_rgba16(id<MTLTexture> source, Sc
         auto commands=pending_commands ? pending_commands : surface_command_buffer(device,@"Vita3K surface X8 halfword decode");
         auto word_image=word_texture_from_rgba16(source,color,SCE_GXM_TEXTURE_BASE_FORMAT_U32,
             0,word_offset,guest_width,guest_height,commands,separate_word);
-        auto decoded=decode_x8_word_texture(device,commands,x8_word_decode_pipeline,word_image,texture_swizzle);
+        auto decoded=decode_x8_word_texture(device,commands,compute_pipeline(x8_word_decode_pipeline, @"decode_x8_word"),word_image,texture_swizzle);
         if (!pending_commands) {
             std::string error;
             if (!device.submit_and_wait(commands,error)) throw std::runtime_error(error);
@@ -3410,7 +3479,7 @@ id<MTLTexture> SurfaceCaster::word_texture_from_rgba16(id<MTLTexture> source, Sc
     const uint32_t config[] = {guest_width, uint32_t(separate_word) | (target.bytes << 1), word_offset, guest_height};
     auto commands = pending_commands ? pending_commands : surface_command_buffer(device, @"Vita3K surface RGBA16 word cast");
     if (packed_32_word_target(texture)) {
-        encode_packed_word_texture(device,commands,halfword_buffer_pipeline,words,result,config,memory_channels,
+        encode_packed_word_texture(device,commands,compute_pipeline(halfword_buffer_pipeline, @"unpack_halfwords_buffer"),words,result,config,memory_channels,
             texture==SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10 ? texture_swizzle&3u : UINT32_MAX);
         if (!pending_commands) {
             std::string error;
@@ -3421,7 +3490,7 @@ id<MTLTexture> SurfaceCaster::word_texture_from_rgba16(id<MTLTexture> source, Sc
     auto bytes = [result newTextureViewWithPixelFormat:sample_bits_format(target.native)];
     if (!bytes) throw std::runtime_error("Metal: cannot write RGBA16 word alias bytes");
     auto encoder = [commands computeCommandEncoder];
-    [encoder setComputePipelineState:halfword_unpack_pipeline];
+    [encoder setComputePipelineState:compute_pipeline(halfword_unpack_pipeline, @"unpack_halfwords")];
     [encoder setTexture:words atIndex:0];
     [encoder setTexture:bytes atIndex:1];
     [encoder setBytes:config length:sizeof(config) atIndex:0];
@@ -3481,7 +3550,7 @@ id<MTLTexture> SurfaceCaster::halfword_texture_from_rgba8(id<MTLTexture> source,
         if (!buffer) throw std::runtime_error("Metal: cannot allocate packed halfword buffer");
         const uint32_t layout[]={uint32_t(result.width),uint32_t(result.height),uint32_t(row_bytes/2)};
         auto encoder=[commands computeCommandEncoder];
-        [encoder setComputePipelineState:byte_halfword_buffer_pipeline];
+        [encoder setComputePipelineState:compute_pipeline(byte_halfword_buffer_pipeline, @"unpack_byte_halfwords_buffer")];
         [encoder setTexture:bytes atIndex:0];
         [encoder setBuffer:buffer offset:0 atIndex:0];
         [encoder setBytes:memory_channels length:sizeof(memory_channels) atIndex:1];
@@ -3499,7 +3568,7 @@ id<MTLTexture> SurfaceCaster::halfword_texture_from_rgba8(id<MTLTexture> source,
         if (!raw) throw std::runtime_error("Metal: cannot view RGBA8 halfword destination bits");
         const uint32_t component_bytes=target.bytes;
         auto encoder=[commands computeCommandEncoder];
-        [encoder setComputePipelineState:byte_halfword_pipeline];
+        [encoder setComputePipelineState:compute_pipeline(byte_halfword_pipeline, @"unpack_byte_halfwords")];
         [encoder setTexture:bytes atIndex:0];
         [encoder setTexture:raw atIndex:1];
         [encoder setBytes:memory_channels length:sizeof(memory_channels) atIndex:0];
@@ -3582,7 +3651,7 @@ id<MTLTexture> SurfaceCaster::byte_texture_from_16bit_surface(id<MTLTexture> sou
         : base==SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5 && mode==3 ? 5u : 0u;
     auto commands=pending_commands ? pending_commands : surface_command_buffer(device,@"Vita3K 16-bit surface byte cast");
     auto encoder=[commands computeCommandEncoder];
-    [encoder setComputePipelineState:byte_unpack_pipeline];
+    [encoder setComputePipelineState:compute_pipeline(byte_unpack_pipeline, @"unpack_16bit_bytes")];
     [encoder setTexture:bits atIndex:0];
     [encoder setTexture:raw atIndex:1];
     [encoder setBytes:memory_channels length:sizeof(memory_channels) atIndex:0];
@@ -3633,7 +3702,7 @@ id<MTLTexture> SurfaceCaster::byte_texture_from_rgba8(id<MTLTexture> source,
     if (!raw) throw std::runtime_error("Metal: cannot view RGBA8 byte destination bits");
     auto commands=pending_commands ? pending_commands : surface_command_buffer(device,@"Vita3K RGBA8 byte cast");
     auto encoder=[commands computeCommandEncoder];
-    [encoder setComputePipelineState:rgba8_byte_unpack_pipeline];
+    [encoder setComputePipelineState:compute_pipeline(rgba8_byte_unpack_pipeline, @"unpack_rgba8_bytes")];
     [encoder setTexture:bytes atIndex:0];
     [encoder setTexture:raw atIndex:1];
     [encoder setBytes:memory_channels length:sizeof(memory_channels) atIndex:0];
@@ -3728,7 +3797,7 @@ id<MTLTexture> SurfaceCaster::small_texture_from_wide_surface(id<MTLTexture> sou
         const uint32_t config[]={component_bytes,ratio,packed_mode};
         const uint32_t layout[]={uint32_t(result.width),uint32_t(result.height),uint32_t(row_bytes/2)};
         auto encoder=[commands computeCommandEncoder];
-        [encoder setComputePipelineState:wide_small_buffer_pipeline];
+        [encoder setComputePipelineState:compute_pipeline(wide_small_buffer_pipeline, @"unpack_wide_small_buffer")];
         [encoder setTexture:words atIndex:0];
         [encoder setBuffer:buffer offset:0 atIndex:0];
         [encoder setBytes:memory_channels length:sizeof(memory_channels) atIndex:1];
@@ -3747,7 +3816,7 @@ id<MTLTexture> SurfaceCaster::small_texture_from_wide_surface(id<MTLTexture> sou
         if (!raw) throw std::runtime_error("Metal: cannot view wide small destination bits");
         const uint32_t config[]={component_bytes,target.bytes,bytes,ratio};
         auto encoder=[commands computeCommandEncoder];
-        [encoder setComputePipelineState:wide_small_unpack_pipeline];
+        [encoder setComputePipelineState:compute_pipeline(wide_small_unpack_pipeline, @"unpack_wide_small")];
         [encoder setTexture:words atIndex:0];
         [encoder setTexture:raw atIndex:1];
         [encoder setBytes:memory_channels length:sizeof(memory_channels) atIndex:0];
@@ -3763,6 +3832,53 @@ id<MTLTexture> SurfaceCaster::small_texture_from_wide_surface(id<MTLTexture> sou
     }
     return result;
 }
+static std::optional<std::array<uint32_t,17>> packed_surface_cast_config(SceGxmColorFormat color,
+    SceGxmTextureBaseFormat target, uint32_t swizzle, MTLPixelFormat native, uint64_t width, uint64_t height) {
+    if (!width || !height || width>16384 || height>16384) return std::nullopt;
+    const auto input=surface_components(color), output=texture_components(target);
+    if (!input.count || !output.count || input.count*input.bytes!=output.count*output.bytes) return std::nullopt;
+    const uint32_t mode=(uint32_t(color)&SCE_GXM_COLOR_SWIZZLE_MASK)>>20;
+    uint32_t kind=0, input_bytes=input.count*input.bytes;
+    switch (gxm::get_base_format(color)) {
+    case SCE_GXM_COLOR_BASE_FORMAT_U5U6U5: if (mode>=2) return std::nullopt; kind=1; break;
+    case SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5: if (mode>=4) return std::nullopt; kind=2; break;
+    case SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4: if (mode>=4) return std::nullopt; kind=3; break;
+    case SCE_GXM_COLOR_BASE_FORMAT_SE5M9M9M9:
+        if (mode>=2) return std::nullopt;
+        kind=native==MTLPixelFormatRGBA16Float ? 10 : 4; input_bytes=kind==10 ? 8 : 4; break;
+    case SCE_GXM_COLOR_BASE_FORMAT_U2U10U10U10: kind=5; break;
+    case SCE_GXM_COLOR_BASE_FORMAT_F11F11F10: if (mode>=2) return std::nullopt; kind=6; break;
+    case SCE_GXM_COLOR_BASE_FORMAT_U8U3U3U2: kind=7; input_bytes=4; break;
+    case SCE_GXM_COLOR_BASE_FORMAT_S5S5U6: kind=8; input_bytes=8; break;
+    case SCE_GXM_COLOR_BASE_FORMAT_U8S8S8U8: if (mode>=4) return std::nullopt; kind=9; input_bytes=8; break;
+    default: break;
+    }
+    uint32_t target_kind=0, output_bytes=output.count*output.bytes;
+    if (target==SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10 && swizzle<8 && (swizzle&2)) target_kind=1;
+    if (target==SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8) { if (swizzle>=2) return std::nullopt; target_kind=2; output_bytes=8; }
+    const auto mapping=surface_memory_mapping(color);
+    std::array<uint32_t,17> config{uint32_t(width),uint32_t(height),uint32_t(width)*input_bytes,
+        uint32_t(width)*output_bytes,input_bytes,output_bytes,input.count*input.bytes,kind,mode,target_kind,
+        target_kind==1 ? swizzle&3 : swizzle,input.count,input.bytes};
+    for (uint32_t i=0;i<4;++i) {
+        const auto channel=std::find(identity.begin(),identity.end(),mapping[i])-identity.begin();
+        config[13+i]=channel<4 ? uint32_t(channel) : 0;
+        if (!kind && i<input.count && channel>=input.count) return std::nullopt;
+    }
+    return config;
+}
+
+static id<MTLBuffer> packed_cast_buffer(Device &device, id<MTLBuffer> __strong &slot, uint64_t size) {
+    if (slot && slot.length>=size) return slot;
+    auto result=[device.native_device() newBufferWithLength:size options:MTLResourceStorageModePrivate];
+    // Scratch is GPU-only and private to this caster. The complete copy/cast/
+    // copy sequence is in one encoder; the wrapper's queue barriers order its
+    // reuse even across submissions. Commands retain replaced buffers until
+    // GPU retirement. Bound persistent scratch to two 32-MiB buffers.
+    if (result && size<=32u*1024*1024) slot=result;
+    return result;
+}
+
 id<MTLTexture> SurfaceCaster::surface_format_cast(id<MTLTexture> source, SceGxmColorFormat color,
     SceGxmTextureBaseFormat texture, uint32_t texture_swizzle, V3KMetal4Commands * pending_commands,
     bool raw_bits) {
@@ -3783,50 +3899,47 @@ id<MTLTexture> SurfaceCaster::surface_format_cast(id<MTLTexture> source, SceGxmC
         output.native=MTLPixelFormatA1BGR5Unorm;
     const bool packed_source=packed_color_cast_source(gxm::get_base_format(color));
     const bool packed_target=packed_texture_cast_target(texture);
-    if (pending_commands && (packed_source || packed_target
-        || pending_commands.status!=MTLCommandBufferStatusNotEnqueued)) return nil;
+    if (pending_commands && pending_commands.status!=MTLCommandBufferStatusNotEnqueued) return nil;
     if (packed_source || packed_target) {
-        // getBytes preserves packed storage bits; read_surface_memory then puts
-        // them into the guest's channel/bit order. The target format interprets
-        // those same guest bytes without any normalized float round-trip.
-        if (source.storageMode != MTLStorageModeShared) return nil;
-        SceGxmColorSurface surface{};
-        surface.colorFormat=color;
-        surface.width=uint32_t(source.width);
-        surface.height=uint32_t(source.height);
-        surface.strideInPixels=surface.width;
-        surface.surfaceType=SCE_GXM_COLOR_SURFACE_LINEAR;
-        const size_t pitch=size_t(source.width)*input.count*input.bytes;
-        std::vector<uint8_t> bytes(pitch*source.height);
-        if (!read_surface_memory(source,surface,bytes)) return nil;
-        if (texture == SCE_GXM_TEXTURE_BASE_FORMAT_U2U10U10U10
-            && texture_swizzle < 8 && (texture_swizzle & 2)) {
-            for (size_t offset=0;offset<bytes.size();offset+=4) {
-                uint32_t guest;
-                std::memcpy(&guest,bytes.data()+offset,4);
-                const uint32_t native=packed_10_native_word(guest,texture_swizzle&3);
-                std::memcpy(bytes.data()+offset,&native,4);
-            }
+        const auto plan=packed_surface_cast_config(color,texture,texture_swizzle,source.pixelFormat,source.width,source.height);
+        if (!plan || source.framebufferOnly || source.storageMode==MTLStorageModeMemoryless) return nil;
+        const auto &config=*plan;
+        const uint64_t input_size=uint64_t(config[2])*config[1], output_size=uint64_t(config[3])*config[1];
+        if (input_size>device.native_device().maxBufferLength || output_size>device.native_device().maxBufferLength) return nil;
+        if (!packed_cast_library) {
+            NSError *error=nil;
+            packed_cast_library=device.compile_library([NSString stringWithUTF8String:packed_surface_cast_msl],nil,&error);
+            if (!packed_cast_library) throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal: packed cast library failed");
         }
-        std::vector<uint16_t> decoded;
-        const void *upload_bytes=bytes.data();
-        size_t upload_pitch=pitch;
-        if (texture == SCE_GXM_TEXTURE_BASE_FORMAT_X8S8S8U8) {
-            decoded.resize(size_t(source.width)*source.height*4);
-            const auto format=static_cast<SceGxmTextureFormat>(uint32_t(texture) | (texture_swizzle<<12));
-            renderer::texture::convert_x8s8s8u8_to_f16f16f16f16(decoded.data(),bytes.data(),
-                uint32_t(source.width),uint32_t(source.height),format);
-            upload_bytes=decoded.data();
-            upload_pitch=size_t(source.width)*8;
-        }
+        if (!packed_cast_pipeline) packed_cast_pipeline=cached_compute(device,packed_cast_library,@"repack_packed_surface");
+        auto input_buffer=packed_cast_buffer(device,packed_cast_input,input_size);
+        auto output_buffer=packed_cast_buffer(device,packed_cast_output,output_size);
         auto desc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:output.native
             width:source.width height:source.height mipmapped:NO];
         desc.storageMode=MTLStorageModeShared;
         desc.usage=MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView;
         auto result=[device.native_device() newTextureWithDescriptor:desc];
-        if (!result) return nil;
-        [result replaceRegion:MTLRegionMake2D(0,0,source.width,source.height)
-            mipmapLevel:0 withBytes:upload_bytes bytesPerRow:upload_pitch];
+        if (!input_buffer || !output_buffer || !result) return nil;
+        // Metal 4 copies preserve storage bytes, including packed/NaN payloads.
+        // Pitches are multiples of the native pixel size and no larger than the
+        // texture's native maximum width, as required by the blit API.
+        auto commands=pending_commands ? pending_commands : surface_command_buffer(device,@"Vita3K packed surface cast");
+        auto encoder=[commands computeCommandEncoder];
+        [encoder copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+            sourceSize:MTLSizeMake(source.width,source.height,1) toBuffer:input_buffer destinationOffset:0
+            destinationBytesPerRow:config[2] destinationBytesPerImage:0];
+        [encoder setComputePipelineState:packed_cast_pipeline];
+        [encoder setBuffer:input_buffer offset:0 atIndex:0];
+        [encoder setBuffer:output_buffer offset:0 atIndex:1];
+        [encoder setBytes:config.data() length:sizeof(config) atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(source.width,source.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+        [encoder copyFromBuffer:output_buffer sourceOffset:0 sourceBytesPerRow:config[3] sourceBytesPerImage:0
+            sourceSize:MTLSizeMake(source.width,source.height,1) toTexture:result destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+        [encoder endEncoding];
+        if (!pending_commands) {
+            std::string error;
+            if (!device.submit_and_wait(commands,error)) throw std::runtime_error(error);
+        }
         return result;
     }
     const auto mapping=surface_memory_mapping(color);
@@ -3949,7 +4062,7 @@ id<MTLTexture> SurfaceCaster::rgba8_surface_sampling(id<MTLTexture> source, SceG
     if (!result) throw std::runtime_error("Metal: cannot allocate encoded memory-channel image");
     auto commands = pending_commands ? pending_commands : surface_command_buffer(device, @"Vita3K surface RGBA8 sampling");
     auto encoder = [commands computeCommandEncoder];
-    [encoder setComputePipelineState:gamma == 3 ? rg_gamma_pipeline : depth_pipeline];
+    [encoder setComputePipelineState:gamma == 3 ? rg_gamma_pipeline : compute_pipeline(depth_pipeline, @"copy_depth")];
     [encoder setTexture:memory atIndex:0]; [encoder setTexture:result atIndex:1];
     [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
     [encoder endEncoding];
@@ -3996,7 +4109,7 @@ id<MTLTexture> SurfaceCaster::sampling_snapshot(id<MTLTexture> source, uint32_t 
     auto result = [device.native_device() newTextureWithDescriptor:desc];
     if (!result) throw std::runtime_error("Metal: cannot allocate sampled texture diagnostic");
     auto commands = surface_command_buffer(device, @"Vita3K surface sampling snapshot"); auto encoder = [commands computeCommandEncoder];
-    [encoder setComputePipelineState:depth_pipeline];
+    [encoder setComputePipelineState:compute_pipeline(depth_pipeline, @"copy_depth")];
     [encoder setTexture:source atIndex:0]; [encoder setTexture:result atIndex:1];
     [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
     [encoder endEncoding]; std::string error;
@@ -4357,6 +4470,18 @@ bool SurfaceCaster::patch_depth_memory(id<MTLTexture> texture,const SceGxmDepthS
     patch_depth=bool(depth_written&depth_bits);
     patch_mask=masked && bool(depth_written&0x80000000u);
     if (!patch_depth && !patch_stencil && !patch_mask) return true;
+    const bool multisample = texture.sampleCount > 1;
+    const auto [patch_left, patch_right] = depth_patch_bounds(uint32_t(texture.width), layout.width,
+        multisample ? uint32_t(texture.sampleCount / 2) : 0, uint32_t(patch_x), uint32_t(patch_width));
+    const auto [patch_top, patch_bottom] = depth_patch_bounds(uint32_t(texture.height), layout.height,
+        multisample ? 2 : 0, uint32_t(patch_y), uint32_t(patch_height));
+    if (patch_left == patch_right || patch_top == patch_bottom) {
+        // Downscaling can omit every guest sample in a small patch. Preserve
+        // the original logical aspect flags, even though all fragments would
+        // have been discarded and no native sample needs a write.
+        if (written) *written = {patch_depth, patch_stencil, patch_mask};
+        return true;
+    }
     if (!input) {
         input=[native newTextureWithDescriptor:desc];
         if (!input) throw std::runtime_error("Metal: depth patch staging allocation failed");
@@ -4416,6 +4541,7 @@ bool SurfaceCaster::patch_depth_memory(id<MTLTexture> texture,const SceGxmDepthS
         if (!encoder) throw std::runtime_error("Metal: cannot encode depth memory patch");
         [encoder setRenderPipelineState:pipeline];[encoder setDepthStencilState:patch_state];
         [encoder setViewport:MTLViewport{0,0,double(texture.width),double(texture.height),0,1}];
+        [encoder setScissorRect:MTLScissorRect{patch_left,patch_top,patch_right-patch_left,patch_bottom-patch_top}];
         if (aspect==0 && needs_depth_snapshot) [encoder setFragmentTexture:previous atIndex:0];
         [encoder setFragmentTexture:input atIndex:1];
         const uint32_t config[]={uint32_t(texture.sampleCount),uint32_t(texture.width),uint32_t(texture.height),kind,
@@ -4614,22 +4740,15 @@ bool SurfaceCaster::enqueue_depth_store(id<MTLTexture> texture,const SceGxmDepth
         && layout.depth_size;
     const size_t bytes=size_t(layout.width)*layout.height*(direct_depth?layout.depth_bytes:sizeof(DepthReadback));
     if(bytes>device.native_device().maxBufferLength) return false;
-    id<MTLBuffer> buffer=depth_store_buffer;
-    if(!buffer || buffer.length<bytes) {
-        buffer=[device.native_device() newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-        if(!buffer) throw std::runtime_error("Metal: depth readback allocation failed");
-        if(bytes<=64*1024*1024) depth_store_buffer=buffer;
-    }
+    auto depth_owner=depth_store_buffers.acquire(device.native_device(),bytes);
+    id<MTLBuffer> buffer=depth_owner->buffer;
+    std::shared_ptr<const ReadbackBuffer> mask_owner;
     id<MTLBuffer> mask_buffer;
     if(masked) {
         const size_t mask_bytes=size_t(layout.width)*layout.height*sizeof(uint32_t);
         if(mask_bytes>device.native_device().maxBufferLength) return false;
-        mask_buffer=mask_store_buffer;
-        if(!mask_buffer || mask_buffer.length<mask_bytes) {
-            mask_buffer=[device.native_device() newBufferWithLength:mask_bytes options:MTLResourceStorageModeShared];
-            if(!mask_buffer) throw std::runtime_error("Metal: mask readback allocation failed");
-            if(mask_bytes<=64*1024*1024) mask_store_buffer=mask_buffer;
-        }
+        mask_owner=mask_store_buffers.acquire(device.native_device(),mask_bytes);
+        mask_buffer=mask_owner->buffer;
     }
     auto view=[texture newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
     if(!view) throw std::runtime_error("Metal: cannot view stencil for guest storage");
@@ -4640,15 +4759,15 @@ bool SurfaceCaster::enqueue_depth_store(id<MTLTexture> texture,const SceGxmDepth
     const uint32_t config[]={layout.width,layout.height,direct_depth && contiguous && layout.tiled?layout.stride:0,flags};
     auto encoder=[commands computeCommandEncoder];
     [encoder setComputePipelineState:direct_depth
-        ? (texture.sampleCount>1?packed_depth_store_ms_pipeline:packed_depth_store_pipeline)
-        : (texture.sampleCount>1?depth_store_ms_pipeline:depth_store_pipeline)];
+        ? (texture.sampleCount>1?compute_pipeline(packed_depth_store_ms_pipeline, @"store_packed_depth_samples_ms"):compute_pipeline(packed_depth_store_pipeline, @"store_packed_depth_samples"))
+        : (texture.sampleCount>1?compute_pipeline(depth_store_ms_pipeline, @"store_depth_samples_ms"):compute_pipeline(depth_store_pipeline, @"store_depth_samples"))];
     [encoder setTexture:texture atIndex:0];[encoder setTexture:view atIndex:1];
     [encoder setBuffer:buffer offset:0 atIndex:0];[encoder setBytes:config length:sizeof(config) atIndex:1];
     [encoder dispatchThreads:MTLSizeMake(layout.width,layout.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
     [encoder endEncoding];
     if(masked) {
         auto mask_encoder=[commands computeCommandEncoder];
-        [mask_encoder setComputePipelineState:mask.sampleCount>1?mask_store_ms_pipeline:mask_store_pipeline];
+        [mask_encoder setComputePipelineState:mask.sampleCount>1?compute_pipeline(mask_store_ms_pipeline, @"store_mask_samples_ms"):compute_pipeline(mask_store_pipeline, @"store_mask_samples")];
         [mask_encoder setTexture:mask atIndex:0];
         [mask_encoder setBuffer:mask_buffer offset:0 atIndex:0];
         [mask_encoder setBytes:config length:sizeof(config) atIndex:1];
@@ -4659,6 +4778,8 @@ bool SurfaceCaster::enqueue_depth_store(id<MTLTexture> texture,const SceGxmDepth
     readback.depth=buffer;
     readback.mask=mask_buffer;
     readback.packed_direct=direct_depth;
+    readback.depth_owner=std::move(depth_owner);
+    readback.mask_owner=std::move(mask_owner);
     return true;
 }
 void SurfaceCaster::finish_depth_store(const DepthStoreReadback &readback,const SceGxmDepthStencilSurface &surface,
@@ -4734,7 +4855,7 @@ id<MTLTexture> SurfaceCaster::depth_snapshot(id<MTLTexture> source, bool normali
     }
     auto commands = pending_commands ? pending_commands : surface_command_buffer(device, @"Vita3K surface depth snapshot");
     auto encoder = [commands computeCommandEncoder];
-    [encoder setComputePipelineState:depth_pipeline];
+    [encoder setComputePipelineState:compute_pipeline(depth_pipeline, @"copy_depth")];
     [encoder setTexture:source atIndex:0];
     [encoder setTexture:result atIndex:1];
     [encoder dispatchThreads:MTLSizeMake(result.width,result.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
@@ -4767,7 +4888,7 @@ id<MTLTexture> SurfaceCaster::packed_depth_snapshot(id<MTLTexture> source, bool 
     auto commands = pending_commands ? pending_commands : surface_command_buffer(device, @"Vita3K packed depth snapshot");
     auto encoder = [commands computeCommandEncoder];
     if (!encoder) throw std::runtime_error("Metal: cannot encode packed depth snapshot");
-    [encoder setComputePipelineState:packed_depth_snapshot_pipeline];
+    [encoder setComputePipelineState:compute_pipeline(packed_depth_snapshot_pipeline, @"copy_packed_depth")];
     [encoder setTexture:source atIndex:0];
     [encoder setTexture:stencil atIndex:1];
     [encoder setTexture:result atIndex:2];
@@ -4805,7 +4926,7 @@ id<MTLTexture> SurfaceCaster::stencil_snapshot(id<MTLTexture> source, bool signe
     if (!result) throw std::runtime_error("Metal: cannot allocate stencil snapshot");
     auto commands=pending_commands ? pending_commands : surface_command_buffer(device, @"Vita3K surface stencil snapshot");
     auto encoder=[commands computeCommandEncoder];
-    [encoder setComputePipelineState:ms ? stencil_ms_pipeline : stencil_pipeline];
+    [encoder setComputePipelineState:ms ? compute_pipeline(stencil_ms_pipeline, @"expand_stencil") : compute_pipeline(stencil_pipeline, @"copy_stencil")];
     [encoder setTexture:stencil atIndex:0];
     [encoder setTexture:result atIndex:1];
     if (!guest_width) guest_width=uint32_t(std::ceil(double(result.width)/scale));

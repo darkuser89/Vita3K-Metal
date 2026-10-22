@@ -27,6 +27,18 @@
 using namespace shader::metal3;
 using namespace usse;
 
+static spv::Id rotate_left32(spv::Builder &builder, spv::Id value, spv::Id count) {
+    const auto type = builder.makeUintType(32);
+    const auto mask = builder.makeUintConstant(31);
+    const auto left_count = builder.createBinOp(spv::OpBitwiseAnd, type, count, mask);
+    const auto complement = builder.createBinOp(spv::OpISub, type, builder.makeUintConstant(0), left_count);
+    const auto right_count = builder.createBinOp(spv::OpBitwiseAnd, type, complement, mask);
+    // Mask both shifts: a zero rotation must never emit a shift by 32.
+    const auto left = builder.createBinOp(spv::OpShiftLeftLogical, type, value, left_count);
+    const auto right = builder.createBinOp(spv::OpShiftRightLogical, type, value, right_count);
+    return builder.createBinOp(spv::OpBitwiseOr, type, left, right);
+}
+
 bool USSETranslatorVisitor::vbw(
     Imm3 op1,
     ExtPredicate pred,
@@ -136,8 +148,12 @@ bool USSETranslatorVisitor::vbw(
     case Opcode::AND: operation = spv::Op::OpBitwiseAnd; break;
     case Opcode::XOR: operation = spv::Op::OpBitwiseXor; break;
     case Opcode::ROL:
-        LOG_WARN("Bitwise Rotate Left operation unsupported.");
-        return false; // TODO: SPIRV doesn't seem to have a rotate left operation!
+        if (bitwise_partial) {
+            LOG_WARN("Partial-width Rotate Left operation unsupported.");
+            return false;
+        }
+        operation = spv::OpNop; // ROL is lowered to two bounded shifts below.
+        break;
     case Opcode::ASR: operation = spv::Op::OpShiftRightArithmetic; break;
     case Opcode::SHL: operation = spv::Op::OpShiftLeftLogical; break;
     case Opcode::SHR: operation = spv::Op::OpShiftRightLogical; break;
@@ -159,7 +175,8 @@ bool USSETranslatorVisitor::vbw(
             LOG_ERROR("Source not loaded");
             return false;
         }
-        result = m_b.createBinOp(operation, type_ui32, src1, src2);
+        result = inst.opcode == Opcode::ROL ? rotate_left32(m_b, src1, src2)
+                                           : m_b.createBinOp(operation, type_ui32, src1, src2);
         if (m_b.isFloatType(m_b.getTypeId(src2))) {
             result = m_b.createUnaryOp(spv::Op::OpBitcast, type_f32, src2);
         }
@@ -176,6 +193,57 @@ bool USSETranslatorVisitor::vbw(
     reset_repeat_multiplier();
 
     return true;
+}
+
+// Sources are unpacked UINT8 vectors. Select every term from the original
+// source lanes before applying that term's independent RGB/alpha complement.
+static spv::Id i8mad_result(spv::Builder &b, spv::Id src0, spv::Id src1, spv::Id src2,
+    unsigned csel0, bool asel0, bool csel1, bool csel2,
+    bool cmod0, bool amod0, bool cmod1, bool amod1, bool cmod2, bool amod2,
+    bool negate_add, bool saturate) {
+    const auto type = b.getTypeId(src0);
+    const auto splat = [&](uint32_t value) {
+        return b.makeCompositeConstant(type, std::vector<spv::Id>(4, b.makeUintConstant(value)));
+    };
+    const auto complement = [&](spv::Id value, bool rgb, bool alpha) {
+        if (!rgb && !alpha)
+            return value;
+        const auto color_mask = b.makeUintConstant(rgb ? 255 : 0);
+        const auto alpha_mask = b.makeUintConstant(alpha ? 255 : 0);
+        const auto mask = b.makeCompositeConstant(type, { color_mask, color_mask, color_mask, alpha_mask });
+        return b.createBinOp(spv::OpBitwiseXor, type, value, mask);
+    };
+    const auto alpha_rgb = [&](spv::Id value, bool select_alpha) {
+        return select_alpha ? b.createOp(spv::OpVectorShuffle, type,
+                                  std::vector<spv::IdImmediate>{ { true, value }, { true, value },
+                                      { false, 3 }, { false, 3 }, { false, 3 }, { false, 3 } })
+                            : value;
+    };
+    spv::Id add = src0;
+    if (csel0 || asel0) {
+        const unsigned base = (csel0 & 1) ? 4 : 0;
+        const bool alpha = (csel0 & 2) != 0;
+        add = b.createOp(spv::OpVectorShuffle, type,
+            std::vector<spv::IdImmediate>{ { true, src0 }, { true, src1 },
+                { false, base + (alpha ? 3 : 0) }, { false, base + (alpha ? 3 : 1) },
+                { false, base + (alpha ? 3 : 2) }, { false, asel0 ? 7u : 3u } });
+    }
+    add = complement(add, cmod0, amod0);
+    const auto lhs = complement(alpha_rgb(src1, csel1), cmod1, amod1);
+    const auto rhs = complement(alpha_rgb(src2, csel2), cmod2, amod2);
+    const auto product = b.createBinOp(spv::OpIMul, type, lhs, rhs);
+    auto result = b.createBinOp(negate_add ? spv::OpISub : spv::OpIAdd, type, product, add);
+    if (saturate) {
+        const auto bool_type = b.makeVectorType(b.makeBoolType(), 4);
+        if (negate_add) {
+            const auto underflow = b.createBinOp(spv::OpULessThan, bool_type, product, add);
+            result = b.createOp(spv::OpSelect, type, { underflow, splat(0), result });
+        }
+        const auto maximum = splat(255);
+        const auto overflow = b.createBinOp(spv::OpUGreaterThan, bool_type, result, maximum);
+        result = b.createOp(spv::OpSelect, type, { overflow, maximum, result });
+    }
+    return result;
 }
 
 bool USSETranslatorVisitor::i8mad(
@@ -221,29 +289,9 @@ bool USSETranslatorVisitor::i8mad(
 
     inst.opcode = Opcode::IMA8;
 
-    usse::Swizzle4 src1_swizz = SWIZZLE_CHANNEL_4_DEFAULT;
-    usse::Swizzle4 src2_swizz = SWIZZLE_CHANNEL_4_DEFAULT;
-
-    if (csel1) {
-        // RGB will be full alpha
-        src1_swizz[0] = usse::SwizzleChannel::C_W;
-        src1_swizz[1] = usse::SwizzleChannel::C_W;
-        src1_swizz[2] = usse::SwizzleChannel::C_W;
-    }
-
-    if (csel2) {
-        // RGB will be full alpha
-        src2_swizz[0] = usse::SwizzleChannel::C_W;
-        src2_swizz[1] = usse::SwizzleChannel::C_W;
-        src2_swizz[2] = usse::SwizzleChannel::C_W;
-    }
-
-    inst.opr.src1.swizzle = src1_swizz;
-    inst.opr.src2.swizzle = src2_swizz;
-
-    if ((amod0) || (amod1) || (amod2) || (cmod0) || (cmod1) || (cmod2)) {
-        LOG_ERROR("Custom modifiers for components not handled!");
-    }
+    inst.opr.src0.swizzle = SWIZZLE_CHANNEL_4_DEFAULT;
+    inst.opr.src1.swizzle = SWIZZLE_CHANNEL_4_DEFAULT;
+    inst.opr.src2.swizzle = SWIZZLE_CHANNEL_4_DEFAULT;
 
     if (m_spirv_params.native_metal)
         set_repeat_multiplier(1, 1, 1, 1);
@@ -251,88 +299,25 @@ bool USSETranslatorVisitor::i8mad(
     BEGIN_REPEAT(repeat_count);
     GET_REPEAT(inst, RepeatMode::SLMSI);
 
-    inst.opr.src0.swizzle = SWIZZLE_CHANNEL_4_DEFAULT;
-
-    spv::Id src1_mul = load(inst.opr.src1, 0b1111, src1_repeat_offset);
-    spv::Id src2_mul = load(inst.opr.src2, 0b1111, src2_repeat_offset);
-    spv::Id src0_add = load(inst.opr.src0, 0b1111, src0_repeat_offset);
-
-    spv::Id final_add = src0_add;
-
-    usse::Swizzle3 add_swizz_rgb = SWIZZLE_CHANNEL_3_DEFAULT;
-    bool add_swizz_rgb_src0 = true;
-
-    if ((csel0 != 0) || (asel0 != 0)) {
-        // We build source0 (the add component in this loop)
-        // Using OpVectorShuffle to construct the final one.
-        std::vector<spv::Id> shuffle_ops = { src0_add, src1_mul };
-
-        switch (csel0) {
-        case 0:
-            shuffle_ops.insert(shuffle_ops.end(), { 0, 1, 2 });
-            break;
-
-        case 1:
-            // Use src1 rgb
-            shuffle_ops.insert(shuffle_ops.end(), { 4, 5, 6 });
-            add_swizz_rgb_src0 = false;
-
-            break;
-
-        case 2:
-            // Use src0 full alpha
-            shuffle_ops.insert(shuffle_ops.end(), { 3, 3, 3 });
-            add_swizz_rgb = { usse::SwizzleChannel::C_W, usse::SwizzleChannel::C_W, usse::SwizzleChannel::C_W };
-
-            break;
-
-        case 3:
-            // Use src1 full alpha
-            shuffle_ops.insert(shuffle_ops.end(), { 7, 7, 7 });
-            add_swizz_rgb = { usse::SwizzleChannel::C_W, usse::SwizzleChannel::C_W, usse::SwizzleChannel::C_W };
-            add_swizz_rgb_src0 = false;
-
-            break;
-
-        default:
-            assert(false);
-            break;
-        }
-
-        switch (asel0) {
-        case 0:
-            // Use src0 alpha
-            shuffle_ops.push_back(3);
-            break;
-
-        case 1:
-            // Use src1 alpha
-            shuffle_ops.push_back(7);
-            break;
-
-        default:
-            assert(false);
-            break;
-        }
-
-        final_add = m_b.createOp(spv::OpVectorShuffle, m_b.getTypeId(src0_add), shuffle_ops);
-    }
-
-    spv::Id result = m_b.createBinOp(spv::OpIMul, m_b.getTypeId(src1_mul), src1_mul, src2_mul);
-    result = m_b.createBinOp(src0_neg ? spv::OpISub : spv::OpIAdd, m_b.getTypeId(src1_mul), result, src0_add);
-
+    const auto src0 = load(inst.opr.src0, 0b1111, src0_repeat_offset);
+    const auto src1 = load(inst.opr.src1, 0b1111, src1_repeat_offset);
+    const auto src2 = load(inst.opr.src2, 0b1111, src2_repeat_offset);
+    if (!src0 || !src1 || !src2)
+        return false;
+    const auto result = i8mad_result(m_b, src0, src1, src2, csel0, asel0, csel1, csel2,
+        cmod0, amod0, cmod1, amod1, cmod2, amod2, src0_neg, saturated);
     store(inst.opr.dest, result, 0b1111, dest_repeat_offset);
 
-    inst.opr.src0.swizzle[0] = add_swizz_rgb[0];
-    inst.opr.src0.swizzle[1] = add_swizz_rgb[1];
-    inst.opr.src0.swizzle[2] = add_swizz_rgb[2];
-
-    LOG_DISASM("{:016x}: {}{} {} {} {} {}({}, {})", m_instr, disasm::s_predicate_str(static_cast<usse::ShortPredicate>(pred)),
-        disasm::opcode_str(inst.opcode), disasm::operand_to_str(inst.opr.dest, 0b1111, dest_repeat_offset),
+    const bool add_swizz_rgb_src0 = (csel0 & 1) == 0;
+    LOG_DISASM("{:016x}: {}{}{} {} {} {} {}({}, {}) selectors={}/{}/{}/{} complements={}{}/{}{}/{}{}", m_instr,
+        disasm::s_predicate_str(static_cast<usse::ShortPredicate>(pred)), disasm::opcode_str(inst.opcode), saturated ? ".sat" : "",
+        disasm::operand_to_str(inst.opr.dest, 0b1111, dest_repeat_offset),
         disasm::operand_to_str(inst.opr.src1, 0b1111, src1_repeat_offset),
         disasm::operand_to_str(inst.opr.src2, 0b1111, src2_repeat_offset),
-        src0_neg ? "-" : "", disasm::operand_to_str((add_swizz_rgb_src0 ? inst.opr.src0 : inst.opr.src1), 0b0111, src0_repeat_offset),
-        disasm::operand_to_str(asel0 ? inst.opr.src1 : inst.opr.src0, 0b1000, src0_repeat_offset));
+        src0_neg ? "-" : "", disasm::operand_to_str(add_swizz_rgb_src0 ? inst.opr.src0 : inst.opr.src1, 0b0111,
+            add_swizz_rgb_src0 ? src0_repeat_offset : src1_repeat_offset),
+        disasm::operand_to_str(asel0 ? inst.opr.src1 : inst.opr.src0, 0b1000, asel0 ? src1_repeat_offset : src0_repeat_offset),
+        csel0, asel0, csel1, csel2, cmod0, amod0, cmod1, amod1, cmod2, amod2);
 
     END_REPEAT();
 
@@ -343,8 +328,8 @@ bool USSETranslatorVisitor::i8mad(
 }
 
 bool USSETranslatorVisitor::i8mad2() {
-    LOG_DISASM("Unimplemented Opcode: i8mad2");
-    return true;
+    LOG_ERROR("Metal: I8MAD2 is not implemented");
+    return false;
 }
 
 bool USSETranslatorVisitor::i16mad(
@@ -379,7 +364,6 @@ bool USSETranslatorVisitor::i16mad(
     Instruction inst;
     inst.opcode = Opcode::IMA16;
     DataType operate_type = ((mode == 0) || (mode == 1)) ? DataType::UINT16 : DataType::INT16;
-    bool is_signed = (mode >= 2);
 
     inst.opr.dest = decode_dest(inst.opr.dest, dest_n, dest_bank, dest_bank_ext, false, 7, m_second_program);
     inst.opr.src0 = decode_src0(inst.opr.src0, src0_n, src0_bank, false, false, 7, m_second_program);
@@ -390,10 +374,10 @@ bool USSETranslatorVisitor::i16mad(
     std::uint8_t mask_src1 = 0b1;
     std::uint8_t mask_src2 = 0b1;
     if (src1_format != 0) {
-        if (src1_format == 1) {
-            inst.opr.src1.type = (is_signed ? DataType::INT8 : DataType::UINT8);
+        if (src1_format == 1 || src1_format == 2) {
+            inst.opr.src1.type = src1_format == 1 ? DataType::UINT8 : DataType::INT8;
         } else {
-            LOG_DISASM("Only support selecting non sign-extended 8-bit integer for SRC1!");
+            LOG_DISASM("Offset-8 source format for IMA16 SRC1 not yet supported!");
         }
 
         if (sel1h_upper8) {
@@ -402,10 +386,10 @@ bool USSETranslatorVisitor::i16mad(
     }
 
     if (src2_format != 0) {
-        if (src2_format == 1) {
-            inst.opr.src2.type = (is_signed ? DataType::INT8 : DataType::UINT8);
+        if (src2_format == 1 || src2_format == 2) {
+            inst.opr.src2.type = src2_format == 1 ? DataType::UINT8 : DataType::INT8;
         } else {
-            LOG_DISASM("Only support selecting non sign-extended 8-bit integer for SRC2!");
+            LOG_DISASM("Offset-8 source format for IMA16 SRC2 not yet supported!");
         }
 
         if (sel2h_upper8) {
@@ -427,8 +411,16 @@ bool USSETranslatorVisitor::i16mad(
     spv::Id source0 = load(inst.opr.src0, 0b1, src0_repeat_offset);
     spv::Id source1 = load(inst.opr.src1, mask_src1, src1_repeat_offset);
     spv::Id source2 = load(inst.opr.src2, mask_src2, src2_repeat_offset);
+    if (!source0 || !source1 || !source2)
+        return false;
 
     spv::Id source0_type = m_b.getTypeId(source0);
+    // Preserve the source format's extension before matching SPIR-V operand
+    // signedness. The unsaturated UINT16/SINT16 store keeps the low 16 bits.
+    if (m_b.getTypeId(source1) != source0_type)
+        source1 = m_b.createUnaryOp(spv::OpBitcast, source0_type, source1);
+    if (m_b.getTypeId(source2) != source0_type)
+        source2 = m_b.createUnaryOp(spv::OpBitcast, source0_type, source2);
 
     auto mul_result = m_b.createBinOp(spv::OpIMul, source0_type, source0, source1);
     auto add_result = m_b.createBinOp(m_spirv_params.native_metal && src2_neg ? spv::OpISub : spv::OpIAdd, source0_type, mul_result, source2);
@@ -467,8 +459,12 @@ bool USSETranslatorVisitor::i32mad(
     Imm7 src0_n,
     Imm7 src1_n,
     Imm7 src2_n) {
-    // TODO: high and low modifier
-    // TODO: more data types for src2
+    // IMAE's third-source extension is independent of the multiplier sign.
+    // Encoding 3 is reserved, not another 16-bit source format.
+    if (src2_type == 3) {
+        LOG_ERROR("Metal: reserved IMAE source 2 format");
+        return false;
+    }
     Instruction inst;
     inst.opcode = Opcode::IMAD;
 
@@ -491,7 +487,7 @@ bool USSETranslatorVisitor::i32mad(
     if (src2_type == 2) {
         inst.opr.src2.type = inst_dt;
     } else {
-        inst.opr.src2.type = inst_dt_16;
+        inst.opr.src2.type = src2_type == 1 ? DataType::INT16 : DataType::UINT16;
     }
 
     if (src0_high) {
@@ -517,8 +513,16 @@ bool USSETranslatorVisitor::i32mad(
     spv::Id vsrc0 = load(inst.opr.src0, src0_mask, src0_repeat_offset);
     spv::Id vsrc1 = load(inst.opr.src1, src1_mask, src1_repeat_offset);
     spv::Id vsrc2 = load(inst.opr.src2, src2_mask, src2_repeat_offset);
+    if (!vsrc0 || !vsrc1 || !vsrc2)
+        return false;
 
-    auto mul_result = m_b.createBinOp(spv::OpIMul, m_b.getTypeId(vsrc0), vsrc0, vsrc1);
+    // The extension above produces the correct 32 bits. IAdd requires matching
+    // signedness in SPIR-V, even though the non-saturating sum is modulo 2^32.
+    const auto result_type = m_b.getTypeId(vsrc0);
+    if (m_b.getTypeId(vsrc2) != result_type)
+        vsrc2 = m_b.createUnaryOp(spv::OpBitcast, result_type, vsrc2);
+
+    auto mul_result = m_b.createBinOp(spv::OpIMul, result_type, vsrc0, vsrc1);
     auto add_result = m_b.createBinOp(spv::OpIAdd, m_b.getTypeId(mul_result), mul_result, vsrc2);
 
     store(inst.opr.dest, add_result, 0b1, dest_repeat_offset);

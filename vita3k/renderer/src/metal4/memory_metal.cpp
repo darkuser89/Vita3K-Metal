@@ -18,6 +18,10 @@
 #include <mem/functions.h>
 #include <mem/state.h>
 #include <mem/metal4.h>
+#include "../../include/renderer/metal4/guest_publication_queue.h"
+#ifdef __APPLE__
+#include "../../include/renderer/metal4/writable_guest_alias.h"
+#endif
 
 #include <util/align.h>
 #include <util/log.h>
@@ -304,6 +308,11 @@ bool handle_access_violation_metal3(MemState &state, uint8_t *addr, bool write) 
 
     auto it = state.protect_tree.lower_bound(vaddr);
     if (it == state.protect_tree.end()) {
+#ifdef __APPLE__
+        // A publication edge (or another completed watch) may have been
+        // restored while this write fault was waiting for protect_mutex.
+        if (write && renderer::metal::WritableGuestAlias::original_is_writable(addr)) return true;
+#endif
         // HACK: keep going
         unprotect_inner(state, align_down(vaddr, state.host_page_size), state.host_page_size);
         LOG_CRITICAL("Unhandled write protected region was valid. Address=0x{:X}", vaddr);
@@ -312,6 +321,11 @@ bool handle_access_violation_metal3(MemState &state, uint8_t *addr, bool write) 
 
     ProtectSegmentInfo &info = it->second;
     if (vaddr < it->first || vaddr >= it->first + info.size) {
+#ifdef __APPLE__
+        // A publication edge (or another completed watch) may have been
+        // restored while this write fault was waiting for protect_mutex.
+        if (write && renderer::metal::WritableGuestAlias::original_is_writable(addr)) return true;
+#endif
         // HACK: keep going
         unprotect_inner(state, align_down(vaddr, state.host_page_size), state.host_page_size);
         LOG_CRITICAL("Unhandled write protected region was valid. Address=0x{:X}", vaddr);
@@ -446,7 +460,7 @@ bool is_protecting_metal3(MemState &state, Address addr, MemPerm *perm) {
 
 
 void free_metal3(MemState &state, Address address) {
-    const std::lock_guard<std::mutex> lock(state.generation_mutex);
+    const auto lock = renderer::metal::lock_guest_memory_after_publication(&state, state.generation_mutex);
     const uint32_t page_num = address / STANDARD_PAGE_SIZE;
     assert(page_num >= 0);
 

@@ -329,6 +329,7 @@ void metal::MetalTextureCache::upload_texture(const SceGxmTexture &gxm_texture, 
             convert_U8U3U3U2_to_U8U8U8U8(texture_data_decompressed.data(), pixels, pixels_per_stride, memory_height);
             pixels = texture_data_decompressed.data();
             upload_format = SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8;
+            bytes_per_pixel = 4;
             bpp = 32;
             break;
         case SCE_GXM_TEXTURE_BASE_FORMAT_S5S5U6:
@@ -412,6 +413,7 @@ void metal::MetalTextureCache::upload_texture(const SceGxmTexture &gxm_texture, 
                 base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV420P3, gxm_texture.swizzle_format,
                 yuv_profiles[(gxm_texture.swizzle_format >> 1) & 1]);
             pixels = texture_data_decompressed.data();
+            bytes_per_pixel = 4;
             bpp = 32;
             upload_format = SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8;
             break;
@@ -452,12 +454,12 @@ void metal::MetalTextureCache::upload_texture(const SceGxmTexture &gxm_texture, 
 
         if (!support_dxt && gxm::is_bcn_format(base_format)) {
             // decompress the texture
-            const int num_comp = gxm::get_num_components(base_format);
-            texture_data_decompressed.resize(pixels_per_stride * memory_height * num_comp);
+            upload_format = get_matching_decompressed_format_metal3(base_format);
+            bytes_per_pixel = (gxm::bits_per_pixel(upload_format) + 7) / 8;
+            texture_data_decompressed.resize(size_t(pixels_per_stride) * memory_height * bytes_per_pixel);
             decompress_compressed_texture_metal3(base_format, texture_data_decompressed.data(), pixels, pixels_per_stride, memory_height);
             pixels = texture_data_decompressed.data();
-            bpp = num_comp * 8;
-            upload_format = get_matching_decompressed_format_metal3(base_format);
+            bpp = bytes_per_pixel * 8;
         }
 
         upload_texture_impl(upload_format, width, height, mip_index, pixels, upload_type, pixels_per_stride);

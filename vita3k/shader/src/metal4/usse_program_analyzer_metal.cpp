@@ -69,8 +69,29 @@ bool does_write_to_predicate(const std::uint64_t inst, std::uint8_t &pred) {
     return false;
 }
 
+static bool invalidates_native_test_predicate(uint64_t instruction, uint8_t condition) {
+    // VTSTMSK writes a register mask, not predicate storage. VTST with
+    // vector PERCHAN writes P0..P3 together, irrespective of encoded PDST.
+    if ((instruction >> 59) != 0b01001) return false;
+    const bool per_channel = ((instruction >> 18) & 3) == 0 && ((instruction >> 36) & 7) == 6;
+    const unsigned writes = per_channel ? 15 : 1u << ((instruction >> 34) & 3);
+    const auto predicate = static_cast<ExtPredicate>(condition);
+    if (predicate >= ExtPredicate::P0 && predicate <= ExtPredicate::P3)
+        return writes & (1u << (condition - static_cast<uint8_t>(ExtPredicate::P0)));
+    if (predicate == ExtPredicate::NEGP0) return writes & 1;
+    if (predicate == ExtPredicate::NEGP1) return writes & 2;
+    if (predicate == ExtPredicate::NEGP2) return writes & 4;
+    return predicate == ExtPredicate::PN && writes != 0;
+}
+
 std::uint8_t get_predicate(const std::uint64_t inst, bool native_metal) {
     switch (inst >> 59) {
+    case 0b01111:
+        // A write-disabled TESTMASK has neither register nor predicate
+        // results. No execution predicate is needed, including PN. Leave
+        // opcode/reserved-field validation to the instruction decoder.
+        if (native_metal && !(inst & (uint64_t(1) << 20))) return 0;
+        break;
     // V32NMAD, V16NMAD, VMAD
     case 0b00001:
     case 0b00010:
@@ -712,16 +733,12 @@ void analyze(USSEBlockNode &root, USSEOffset end_offset, const AnalyzeReadFuncti
             } else {
                 bool is_predicate_invalidated = false;
 
-                std::uint8_t predicate_writed_to = 0;
-                if (does_write_to_predicate(inst, predicate_writed_to)) {
-                    if (native_metal) {
-                        // NEGP2 is appended after PN, outside the legacy +5 encoding.
-                        static constexpr ExtPredicate negated[] = {ExtPredicate::NEGP0, ExtPredicate::NEGP1, ExtPredicate::NEGP2, ExtPredicate::PN};
-                        is_predicate_invalidated = ((predicate_writed_to + 1) == current_code->condition)
-                            || (predicate_writed_to < 4 && static_cast<uint8_t>(negated[predicate_writed_to]) == current_code->condition);
-                    } else {
+                if (native_metal)
+                    is_predicate_invalidated = invalidates_native_test_predicate(inst, current_code->condition);
+                else {
+                    std::uint8_t predicate_writed_to = 0;
+                    if (does_write_to_predicate(inst, predicate_writed_to))
                         is_predicate_invalidated = ((predicate_writed_to + 1) == current_code->condition) || ((predicate_writed_to + 5) == current_code->condition);
-                    }
                 }
 
                 std::uint32_t offset_end = 0;

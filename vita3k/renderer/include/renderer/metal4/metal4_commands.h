@@ -30,6 +30,7 @@
 - (V3KMetal4ComputeEncoder *)blitCommandEncoder;
 - (void)retainObject:(id)object;
 - (void)retainResource:(id<MTLResource>)resource;
+- (void)retainResource:(id<MTLResource>)resource residencySet:(id<MTLResidencySet>)residency;
 - (MTLGPUAddress)copyBytes:(const void *)bytes length:(NSUInteger)length;
 - (void)presentDrawable:(id<MTLDrawable>)drawable;
 - (void)addCompletedHandler:(void (^)(V3KMetal4Commands *))handler;
@@ -50,6 +51,9 @@
 - (void)setVertexSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index;
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index;
 - (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages;
+- (void)useResource:(id<MTLResource>)resource residencySet:(id<MTLResidencySet>)residency;
+// Order prior shader memory accesses before the next writing vertex call.
+- (void)orderVertexMemoryWrites;
 - (void)endEncoding;
 - (void)setRenderPipelineState:(id <MTLRenderPipelineState>)pipelineState;
 - (void)setViewport:(MTLViewport)viewport;

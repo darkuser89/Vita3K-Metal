@@ -2,7 +2,9 @@
 // Copyright (C) 2026 Vita3K team
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <renderer/metal4/screen.h>
+#include <renderer/metal4/fsr_presentation.h>
 #include <renderer/metal4/capabilities.h>
+#include <util/hash.h>
 #include <util/log.h>
 #include <fstream>
 #include <stdexcept>
@@ -138,19 +140,33 @@ id<MTLRenderPipelineState> ScreenRenderer::create_filter_pipeline(const std::str
     return result;
 }
 void ScreenRenderer::initialize_fsr() {
-    if (easu_pipeline && rcas_pipeline) return;
+    if (easu_pipeline && rcas_pipeline && rcas_present_pipeline) return;
     const auto directory = assets / "shaders-builtin/vulkan";
-    auto easu = shader::metal::convert_builtin_compute_spirv(load_spirv(directory / "fsr_filter_easu.comp.spv"));
-    auto rcas = shader::metal::convert_builtin_compute_spirv(load_spirv(directory / "fsr_filter_rcas.comp.spv"));
-    std::string error;
-    auto easu_program = device.compile(easu, false, error);
-    if (!easu_program) throw std::runtime_error(error);
-    auto rcas_program = device.compile(rcas, false, error);
-    if (!rcas_program) throw std::runtime_error(error);
-    easu_pipeline = device.create_compute_pipeline(easu_program->function, error);
-    if (!easu_pipeline) throw std::runtime_error(error);
-    rcas_pipeline = device.create_compute_pipeline(rcas_program->function, error);
-    if (!rcas_pipeline) throw std::runtime_error(error);
+    const auto rcas_words = load_spirv(directory / "fsr_filter_rcas.comp.spv");
+    auto rcas = shader::metal::convert_builtin_compute_spirv(rcas_words);
+    if (!easu_pipeline || !rcas_pipeline) {
+        auto easu = shader::metal::convert_builtin_compute_spirv(load_spirv(directory / "fsr_filter_easu.comp.spv"));
+        std::string error;
+        auto easu_program = device.compile(easu, false, error);
+        if (!easu_program) throw std::runtime_error(error);
+        auto rcas_program = device.compile(rcas, false, error);
+        if (!rcas_program) throw std::runtime_error(error);
+        easu_pipeline = device.create_compute_pipeline(easu_program->function, error);
+        if (!easu_pipeline) throw std::runtime_error(error);
+        rcas_pipeline = device.create_compute_pipeline(rcas_program->function, error);
+        if (!rcas_pipeline) throw std::runtime_error(error);
+    }
+    if (hex_string(sha256(rcas_words.data(), rcas_words.size() * sizeof(uint32_t))) != fsr_rcas_module_sha256)
+        return;
+    try {
+        // Preserve the original half-precision RCAS functions verbatim. Only
+        // the entry point changes: write directly to the BGRA render target.
+        rcas_present_pipeline = create_filter_pipeline(rcas.source + std::string(fsr_rcas_fragment), "screen_rcas");
+    } catch (const std::exception &error) {
+        // Optional optimization: the existing FSR compute path remains usable.
+        // Selecting FSR again retries; never retry compilation every frame.
+        LOG_WARN("Metal FSR fused presentation unavailable: {}; using compute RCAS", error.what());
+    }
 }
 void ScreenRenderer::disable_fsr(std::string_view reason) {
     // FSR uses the bilinear presentation sampler already. Stop retrying the
@@ -159,6 +175,7 @@ void ScreenRenderer::disable_fsr(std::string_view reason) {
     LOG_WARN("Metal FSR unavailable: {}; using Bilinear", reason);
 }
 void ScreenRenderer::set_filter(bool linear) {
+    fsr_fused_source = nil;
     metalfx_scaler = nil;
     metalfx_input = nil;
     metalfx_output = nil;
@@ -270,26 +287,42 @@ id<MTLTexture> ScreenRenderer::prepare_metalfx(V3KMetal4Commands * commands, id<
     return metalfx_output;
 }
 id<MTLTexture> ScreenRenderer::prepare(V3KMetal4Commands * commands, id<MTLTexture> source,
-    uint32_t width, uint32_t height) {
+    MTLViewport viewport) {
+    fsr_fused_source = nil;
+    if (!std::isfinite(viewport.width) || !std::isfinite(viewport.height)
+        || viewport.width < 0.5 || viewport.height < 0.5
+        || viewport.width > UINT32_MAX || viewport.height > UINT32_MAX) return source;
+    const auto width = uint32_t(std::lround(viewport.width));
+    const auto height = uint32_t(std::lround(viewport.height));
     if (!commands || !source || !width || !height) return source;
     if (filter == Filter::MetalFX) return prepare_metalfx(commands, source, width, height);
     if (filter != Filter::FSR) return source;
-    if (!fsr_intermediate || !fsr_output || fsr_intermediate.width != width || fsr_intermediate.height != height) {
+    const bool fused = rcas_present_pipeline
+        && fsr_pixel_aligned(viewport.originX, viewport.originY, viewport.width, viewport.height);
+    if (!fsr_intermediate || fsr_intermediate.width != width || fsr_intermediate.height != height
+        || (!fused && (!fsr_output || fsr_output.width != width || fsr_output.height != height))) {
         auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
                                                                        width:width height:height mipmapped:NO];
         desc.storageMode = MTLStorageModePrivate;
         desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-        // Publish the pair only after both allocations succeed. Preserve the
-        // previous pair on failure and keep presentation running unfiltered.
-        auto intermediate = [device.native_device() newTextureWithDescriptor:desc];
-        auto output = [device.native_device() newTextureWithDescriptor:desc];
-        if (!intermediate || !output) {
+        // Publish only after every required allocation succeeds. A pixel-aligned
+        // frame needs just EASU's RGBA16F texture, preserving its precision.
+        auto intermediate = fsr_intermediate;
+        if (!intermediate || intermediate.width != width || intermediate.height != height)
+            intermediate = [device.native_device() newTextureWithDescriptor:desc];
+        auto output = fsr_output;
+        if (!fused && (!output || output.width != width || output.height != height))
+            output = [device.native_device() newTextureWithDescriptor:desc];
+        if (!intermediate || (!fused && !output)) {
             disable_fsr("cannot allocate FSR textures");
             return source;
         }
         fsr_intermediate = intermediate;
         fsr_output = output;
     }
+    // Encoders retain previously used textures through GPU completion. Keeping
+    // an idle RCAS output here would defeat the one-intermediate memory saving.
+    if (fused) fsr_output = nil;
     struct EasuConstants {
         uint32_t offset[2], dimensions[2], texture_dimensions[2], output_dimensions[2];
     } easu{{0, 0}, {uint32_t(source.width), uint32_t(source.height)},
@@ -314,6 +347,10 @@ id<MTLTexture> ScreenRenderer::prepare(V3KMetal4Commands * commands, id<MTLTextu
     [encoder setSamplerState:sampler atIndex:0];
     [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
     [encoder endEncoding];
+    if (fused) {
+        fsr_fused_source = fsr_intermediate;
+        return fsr_intermediate;
+    }
     encoder = [commands computeCommandEncoder];
     if (!encoder) {
         // EASU may already be encoded, but presentation can still sample the
@@ -332,8 +369,14 @@ id<MTLTexture> ScreenRenderer::prepare(V3KMetal4Commands * commands, id<MTLTextu
 }
 void ScreenRenderer::render(V3KMetal4RenderEncoder * encoder, id<MTLTexture> source, MTLViewport viewport) {
     if (!source) return;
-    const auto selected = filter == Filter::Bicubic ? bicubic_pipeline : filter == Filter::FXAA ? fxaa_pipeline : pipeline;
+    const bool fused = filter == Filter::FSR && fsr_fused_source && source == fsr_fused_source;
+    const auto selected = fused ? rcas_present_pipeline
+        : filter == Filter::Bicubic ? bicubic_pipeline : filter == Filter::FXAA ? fxaa_pipeline : pipeline;
     [encoder setRenderPipelineState:selected];
+    if (fused) {
+        const std::array<float, 4> constants{float(viewport.originX), float(viewport.originY), 0.2f, 0};
+        [encoder setFragmentBytes:constants.data() length:sizeof(constants) atIndex:0];
+    }
     [encoder setViewport:viewport];
     [encoder setCullMode:MTLCullModeNone];
     [encoder setFragmentTexture:source atIndex:0];

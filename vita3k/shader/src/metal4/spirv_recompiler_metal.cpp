@@ -107,6 +107,7 @@ struct TranslationState {
     spv::Id color_attachment_id = spv::NoResult;
     spv::Id color_attachment_raw_id = spv::NoResult;
     spv::Id mask_id = spv::NoResult;
+    spv::Id mask_coverage_id = spv::NoResult;
     spv::Id frag_coord_id = spv::NoResult;
     spv::Id native_front_facing_id = spv::NoResult;
     spv::Id render_info_id = spv::NoResult;
@@ -356,6 +357,9 @@ static spv::Id create_builtin_sampler(spv::Builder &b, const FeatureState &featu
     spv::Id image_type = b.makeImageType(sampled_type, spv::Dim2D, false, false, multisampled_mask, sampled, format);
     spv::Id sampler = b.createVariable(spv::NoPrecision, spv::StorageClassUniformConstant, image_type, name.c_str());
 
+    if (translation_state.is_metal && name == "f_mask")
+        b.addDecoration(sampler, spv::DecorationNonWritable);
+
     return sampler;
 }
 
@@ -460,6 +464,46 @@ static spv::Id quantize_metal_guest_color(spv::Builder &b, utils::SpirvUtilFunct
     return b.createCompositeConstruct(v4, {channels[0], channels[1], channels[2], channels[3]});
 }
 
+static void reject_masked_metal_fragment(spv::Builder &b, TranslationState &state) {
+    // Reject before framebuffer reads, interlock and the guest program. Discard
+    // cannot undo guest buffer writes that have already executed.
+    const auto i32 = b.makeIntType(32);
+    const auto v4 = b.makeVectorType(b.makeFloatType(32), 4);
+    auto coord = b.createUnaryOp(spv::OpConvertFToS, b.makeVectorType(i32, 4),
+        b.createLoad(state.frag_coord_id, spv::NoPrecision));
+    coord = b.createOp(spv::OpVectorShuffle, b.makeVectorType(i32, 2),
+        {{true, coord}, {true, coord}, {false, 0}, {false, 1}});
+    const auto half = b.makeFloatConstant(0.5f);
+    const auto threshold = b.makeCompositeConstant(v4, {half, half, half, half});
+    const auto image = b.createLoad(state.mask_id, spv::NoPrecision);
+    spv::Id rejected;
+    if (state.hints->metal_samples > 1) {
+        if (state.hints->metal_samples > 32)
+            throw std::runtime_error("Metal mask coverage exceeds 32 samples");
+        auto coverage = b.makeIntConstant(0);
+        for (uint32_t sample = 0; sample < state.hints->metal_samples; ++sample) {
+            const auto texel = b.createOp(spv::OpImageRead, v4,
+                {{true, image}, {true, coord}, {false, spv::ImageOperandsSampleMask}, {true, b.makeIntConstant(sample)}});
+            const auto below = b.createBinOp(spv::OpFOrdLessThan, b.makeVectorType(b.makeBoolType(), 4), texel, threshold);
+            const auto masked = b.createUnaryOp(spv::OpAll, b.makeBoolType(), below);
+            const auto bit = b.createTriOp(spv::OpSelect, i32, masked, b.makeIntConstant(0), b.makeIntConstant(1u << sample));
+            coverage = b.createBinOp(spv::OpBitwiseOr, i32, coverage, bit);
+        }
+        // The finalizer is a separate SPIR-V function. Cache coverage in private
+        // invocation storage, not a main-function SSA value or a guest buffer.
+        state.mask_coverage_id = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate, i32, "metal_mask_coverage");
+        b.createStore(coverage, state.mask_coverage_id);
+        rejected = b.createBinOp(spv::OpIEqual, b.makeBoolType(), coverage, b.makeIntConstant(0));
+    } else {
+        const auto texel = b.createOp(spv::OpImageRead, v4, {image, coord});
+        const auto below = b.createBinOp(spv::OpFOrdLessThan, b.makeVectorType(b.makeBoolType(), 4), texel, threshold);
+        rejected = b.createUnaryOp(spv::OpAll, b.makeBoolType(), below);
+    }
+    spv::Builder::If masked(rejected, spv::SelectionControlMaskNone, b);
+    b.makeStatementTerminator(spv::OpKill, "discard_masked_metal");
+    masked.makeEndIf();
+}
+
 static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &parameters, utils::SpirvUtilFunctions &utils, const FeatureState &features, TranslationState &translation_state, NonDependentTextureQueryCallInfos &tex_query_infos, SamplerMap &samplers,
     const SceGxmProgram &program) {
     static const std::unordered_map<std::uint32_t, std::pair<std::string, std::uint32_t>> name_map = {
@@ -549,7 +593,8 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
             const auto pa_iter_size = num_comp;
             spv::Id pa_iter_var = spv::NoResult;
 
-            // TODO how about centroid?
+            // PA copies retain their ordinary interpolation. The independently
+            // decoded texture-query centroid bit is applied at that query.
             if (translation_state.is_metal && (input_id & 0x40000000)) {
                 // Sprite coordinates come from the point rasterizer, not a
                 // vertex output. Share the builtin with non-dependent texture
@@ -818,6 +863,7 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
             tex_query_info.dest_offset = pa_offset;
 
             tex_query_info.coord_index = tex_coord_index;
+            tex_query_info.centroid = (descriptor->attribute_info & 0x10) != 0;
             tex_query_info.prod_pos = prod_pos;
             tex_query_info.sampler_index = sampler_resource_index;
 
@@ -880,6 +926,11 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
             b.addDecoration(mask, spv::DecorationDescriptorSet, 1);
         } else {
             b.addDecoration(mask, spv::DecorationBinding, MASK_TEXTURE_SLOT_IMAGE);
+        }
+        if (translation_state.is_metal && !translation_state.is_maskupdate) {
+            reject_masked_metal_fragment(b, translation_state);
+            if (program.is_frag_color_used() && features.should_use_shader_interlock())
+                b.createNoResultOp(spv::OpBeginInvocationInterlockEXT);
         }
     }
 
@@ -2134,7 +2185,18 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
         }
     }
 
-    if (features.use_mask_bit) {
+    if (features.use_mask_bit && translate_state.is_metal) {
+        if (translate_state.mask_coverage_id != spv::NoResult) {
+            // Preserve pixel-frequency shading and gate each native sample.
+            const auto i32 = b.makeIntType(32);
+            const auto array = b.makeArrayType(i32, b.makeIntConstant(1), 0);
+            const auto output = b.createVariable(spv::NoPrecision, spv::StorageClassOutput, array, "metal_sample_mask");
+            b.addDecoration(output, spv::DecorationBuiltIn, spv::BuiltInSampleMask);
+            translate_state.interfaces.push_back(output);
+            b.createStore(b.createCompositeConstruct(array,
+                {b.createLoad(translate_state.mask_coverage_id, spv::NoPrecision)}), output);
+        }
+    } else if (features.use_mask_bit) {
         // Discard masked fragments
         spv::Id current_coord = translate_state.frag_coord_id;
         spv::Id i32 = b.makeIntegerType(32, true);
@@ -2146,32 +2208,12 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
         spv::Id v4 = b.makeVectorType(sampled_type, 4);
         spv::Id rezero = b.makeFloatConstant(0.5f);
         spv::Id zero = b.makeCompositeConstant(v4, { rezero, rezero, rezero, rezero });
-        if (translate_state.is_metal && translate_state.hints->metal_samples > 1) {
-            // Keep GXP shading at pixel frequency. The native coverage output
-            // gates color, depth and stencil independently for each mask bit.
-            spv::Id coverage = b.makeIntConstant(0);
-            for (uint32_t sample = 0; sample < translate_state.hints->metal_samples; ++sample) {
-                auto texel = b.createOp(spv::OpImageRead, v4, {
-                    {true, b.createLoad(translate_state.mask_id, spv::NoPrecision)}, {true, current_coord},
-                    {false, spv::ImageOperandsSampleMask}, {true, b.makeIntConstant(sample)} });
-                auto below = b.createBinOp(spv::OpFOrdLessThan, b.makeVectorType(b.makeBoolType(),4), texel, zero);
-                auto masked = b.createUnaryOp(spv::OpAll,b.makeBoolType(),below);
-                auto bit = b.createTriOp(spv::OpSelect,i32,masked,b.makeIntConstant(0),b.makeIntConstant(1u<<sample));
-                coverage = b.createBinOp(spv::OpBitwiseOr,i32,coverage,bit);
-            }
-            auto array = b.makeArrayType(i32,b.makeIntConstant(1),0);
-            auto output = b.createVariable(spv::NoPrecision,spv::StorageClassOutput,array,"metal_sample_mask");
-            b.addDecoration(output,spv::DecorationBuiltIn,spv::BuiltInSampleMask);
-            translate_state.interfaces.push_back(output);
-            b.createStore(b.createCompositeConstruct(array,{coverage}),output);
-        } else {
-            spv::Id texel = b.createOp(spv::OpImageRead, v4, { b.createLoad(translate_state.mask_id, spv::NoPrecision), current_coord });
-            spv::Id pred = b.createOp(spv::OpFOrdLessThan, b.makeVectorType(b.makeBoolType(), 4), { texel, zero });
-            spv::Id pred2 = b.createUnaryOp(spv::OpAll, b.makeBoolType(), pred);
-            spv::Builder::If cond_builder(pred2, spv::SelectionControlMaskNone, b);
-            b.makeStatementTerminator(spv::OpKill, "discard");
-            cond_builder.makeEndIf();
-        }
+        spv::Id texel = b.createOp(spv::OpImageRead, v4, { b.createLoad(translate_state.mask_id, spv::NoPrecision), current_coord });
+        spv::Id pred = b.createOp(spv::OpFOrdLessThan, b.makeVectorType(b.makeBoolType(), 4), { texel, zero });
+        spv::Id pred2 = b.createUnaryOp(spv::OpAll, b.makeBoolType(), pred);
+        spv::Builder::If cond_builder(pred2, spv::SelectionControlMaskNone, b);
+        b.makeStatementTerminator(spv::OpKill, "discard");
+        cond_builder.makeEndIf();
     }
 
     b.makeReturn(false);
@@ -2234,7 +2276,7 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
     // Each declared guest clip output consumes one scalar register after PSIZE.
     // Keep the existing output interface of other backends unchanged.
     if (translation_state.is_metal) {
-        for (uint32_t i = 0; i < metal::CAPTURE_CLIP_COUNT; ++i)
+        for (uint32_t i = 0; i < metal::GUEST_CLIP_COUNT; ++i)
             add_vertex_output_info(static_cast<SceGxmVertexProgramOutputs>(SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP0 << i),
                 "v_Clip", 1, metal::CAPTURE_CLIP_SLOT + i);
     }
@@ -2247,9 +2289,12 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
     spv::Id capture = spv::NoResult;
     spv::Id capture_vertex_id = spv::NoResult;
     if (translation_state.is_metal && translation_state.hints->metal_capture_vertex_outputs) {
+        // Capture uses StorageBuffer even when guest memory mapping uses
+        // physical addresses; SPIR-V 1.0 still requires this declaration.
+        b.addExtension("SPV_KHR_storage_buffer_storage_class");
         // Capture the values leaving the guest vertex stage, including the
         // position after viewport/depth mapping. Slots match output locations;
-        // point size occupies slot 14, rasterizer clip distances slots 15..22.
+        // point size occupies slot 14, all clip distances occupy slots 15..25.
         // Sparse indices use a distinct variant
         // whose output starts at the renderer-selected buffer offset.
         if (!translation_state.hints->metal_capture_vertex_outputs_compact
@@ -2302,14 +2347,11 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
     uint32_t clip_count = 0, clip_written = 0;
     const uint32_t guard_count = translation_state.is_metal && (vertex_outputs & SCE_GXM_VERTEX_PROGRAM_OUTPUT_POSITION) ? 3 : 0;
     if (translation_state.is_metal) {
-        for (uint32_t i = 0; i < metal::CAPTURE_CLIP_COUNT; ++i)
+        for (uint32_t i = 0; i < metal::GUEST_CLIP_COUNT; ++i)
             clip_count += bool(vertex_outputs & (SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP0 << i));
-        const uint32_t available = metal::CAPTURE_CLIP_COUNT - guard_count;
-        if (clip_count > available) {
-            LOG_WARN("Metal vertex program declares {} clip planes, only {} fit with depth-clamp guards", clip_count, available);
-            clip_count = available;
-        }
-        clip_count += guard_count;
+        // Excess guest planes remain in capture, where the renderer clips
+        // them before replay; the native stage never exceeds Metal's limit.
+        clip_count = std::min(clip_count + guard_count, metal::NATIVE_CLIP_COUNT);
         if (clip_count) {
             b.addCapability(spv::CapabilityClipDistance);
             const auto type = b.makeArrayType(b.makeFloatType(32), b.makeUintConstant(clip_count), 0);
@@ -2319,9 +2361,11 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
         }
     }
     const auto store_clip_distance = [&](uint32_t index, spv::Id distance) {
-        const auto target = utils::create_access_chain(b, spv::StorageClassOutput, clip_var,
-            {b.makeIntConstant(index)});
-        b.createStore(distance, target);
+        if (index < clip_count) {
+            const auto target = utils::create_access_chain(b, spv::StorageClassOutput, clip_var,
+                {b.makeIntConstant(index)});
+            b.createStore(distance, target);
+        }
         if (capture != spv::NoResult) {
             const auto zero = b.makeFloatConstant(0.0f);
             capture_output(metal::CAPTURE_CLIP_SLOT + index, b.createCompositeConstruct(
@@ -2334,8 +2378,7 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
             const VertexProgramOutputProperties &properties = vertex_properties_map.at(vo_typed);
 
             if (translation_state.is_metal && vo >= SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP0) {
-                if (guard_count + clip_written < clip_count)
-                    store_clip_distance(guard_count + clip_written++, utils::load(b, parameters, utils, features, o_op, 0b1, 0));
+                store_clip_distance(guard_count + clip_written++, utils::load(b, parameters, utils, features, o_op, 0b1, 0));
                 o_op.num += properties.component_count;
                 continue;
             }
@@ -2661,8 +2704,13 @@ static SpirvCode convert_gxp_to_spirv_impl(const SceGxmProgram &program, const s
 
     std::stringstream disasm_dump;
 
-    // Put disasm storage
-    disasm::disasm_storage = &disasm_dump;
+    // Collect disassembly only for an explicit dump. Restore thread-local
+    // state on success and on a rejected instruction (including nested use).
+    struct DisassemblyScope {
+        std::stringstream *previous = disasm::disasm_storage;
+        ~DisassemblyScope() { disasm::disasm_storage = previous; }
+    } disassembly_scope;
+    disasm::disasm_storage = dumper ? &disasm_dump : nullptr;
 
     // Entry point
     spv::Function *spv_func_main = b.makeEntryPoint(entry_point_name.c_str());
@@ -2686,11 +2734,14 @@ static SpirvCode convert_gxp_to_spirv_impl(const SceGxmProgram &program, const s
 
         if (program.is_frag_color_used() && features.should_use_shader_interlock()) {
             b.addExecutionMode(spv_func_main, spv::ExecutionModeSampleInterlockOrderedEXT);
-            b.addExecutionMode(spv_func_main, spv::ExecutionModeEarlyFragmentTests);
+            const bool early_metal_mask = translation_state.is_metal && features.use_mask_bit && !translation_state.is_maskupdate;
+            if (!early_metal_mask)
+                b.addExecutionMode(spv_func_main, spv::ExecutionModeEarlyFragmentTests);
             b.addExtension("SPV_EXT_fragment_shader_interlock");
             b.addCapability(spv::CapabilityFragmentShaderSampleInterlockEXT);
 
-            b.createNoResultOp(spv::OpBeginInvocationInterlockEXT);
+            if (!early_metal_mask)
+                b.createNoResultOp(spv::OpBeginInvocationInterlockEXT);
         }
     }
 

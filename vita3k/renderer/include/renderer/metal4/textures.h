@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <renderer/metal4/metal4_commands.h>
+#include <renderer/metal4/readback_buffers.h>
 #include <gxm/types.h>
 #include <span>
 #include <array>
@@ -28,7 +29,7 @@ inline float sampler_lod_bias(const SceGxmTexture &texture) {
     return texture.texture_type() == SCE_GXM_TEXTURE_LINEAR_STRIDED ? 0.f : (float(texture.lod_bias) - 31.f) / 8.f;
 }
 inline uint32_t metal_lod_min(const SceGxmTexture &texture) {
-    return (texture.lod_min0 << 2) | texture.lod_min1;
+    return texture.true_lod_min();
 }
 inline uint32_t sampler_metadata_flags(const SceGxmTexture &texture) {
     const auto linear=[](uint32_t filter) {
@@ -123,6 +124,7 @@ struct DepthStoreReadback {
     id<MTLBuffer> mask = nil;
     // The shared buffer already contains final guest words (D16, S8D24 or DF32).
     bool packed_direct = false;
+    std::shared_ptr<const ReadbackBuffer> depth_owner, mask_owner;
 };
 struct DepthMemoryWrite {
     bool depth = false, stencil = false, mask = false;
@@ -140,13 +142,16 @@ class SurfaceCaster {
     id<MTLComputePipelineState> depth_store_pipeline, depth_store_ms_pipeline;
     id<MTLComputePipelineState> packed_depth_store_pipeline, packed_depth_store_ms_pipeline;
     id<MTLComputePipelineState> mask_store_pipeline, mask_store_ms_pipeline;
-    id<MTLBuffer> depth_store_buffer, mask_store_buffer;
+    ReadbackBufferPool depth_store_buffers, mask_store_buffers;
     id<MTLComputePipelineState> pipeline, halfword_unpack_pipeline, byte_halfword_pipeline,
         byte_unpack_pipeline, rgba8_byte_unpack_pipeline, wide_small_unpack_pipeline;
     id<MTLComputePipelineState> word_buffer_pipeline, halfword_buffer_pipeline,
         byte_halfword_buffer_pipeline, wide_small_buffer_pipeline;
     id<MTLComputePipelineState> x8_word_decode_pipeline;
-    id<MTLComputePipelineState> cube_pipeline, component_cast_pipeline;
+    id<MTLComputePipelineState> cube_pipeline, cube_packed_pipeline, component_cast_pipeline;
+    id<MTLLibrary> snapshot_library, packed_cast_library;
+    id<MTLComputePipelineState> packed_cast_pipeline;
+    id<MTLBuffer> packed_cast_input, packed_cast_output;
     id<MTLComputePipelineState> depth_pipeline, stencil_pipeline, stencil_ms_pipeline, rg_gamma_pipeline;
     id<MTLComputePipelineState> scaled_snapshot_pipeline;
     id<MTLComputePipelineState> packed_depth_snapshot_pipeline;
@@ -154,6 +159,7 @@ class SurfaceCaster {
     id<MTLComputePipelineState> multisample_integer_pipeline;
     id<MTLComputePipelineState> raw_multisample_resolve_pipeline;
     id<MTLLibrary> multisample_library;
+    id<MTLComputePipelineState> compute_pipeline(id<MTLComputePipelineState> __strong &slot, NSString *name);
     std::map<std::pair<uint32_t,uint32_t>,id<MTLRenderPipelineState>> seed_pipelines;
     std::map<std::pair<uint32_t,uint32_t>,id<MTLRenderPipelineState>> clip_pipelines;
     std::map<uint32_t,id<MTLRenderPipelineState>> publication_pipelines;
@@ -212,7 +218,7 @@ public:
         std::span<uint8_t> depth, std::span<uint8_t> stencil, id<MTLTexture> mask = nil);
     bool enqueue_depth_store(id<MTLTexture>, const SceGxmDepthStencilSurface &, const DepthMemoryLayout &, float scale,
         size_t depth_size, size_t stencil_size, id<MTLTexture> mask, V3KMetal4Commands *, DepthStoreReadback &);
-    void finish_depth_store(const DepthStoreReadback &, const SceGxmDepthStencilSurface &, const DepthMemoryLayout &,
+    static void finish_depth_store(const DepthStoreReadback &, const SceGxmDepthStencilSurface &, const DepthMemoryLayout &,
         std::span<uint8_t> depth, std::span<uint8_t> stencil);
     id<MTLTexture> depth_snapshot(id<MTLTexture> source, bool normalized16 = false, float scale = 1,
         uint32_t guest_width = 0, uint32_t guest_height = 0, bool wait_for_completion = true,
