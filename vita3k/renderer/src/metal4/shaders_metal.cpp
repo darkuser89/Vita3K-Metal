@@ -35,7 +35,7 @@ namespace renderer {
 bool get_shaders_cache_hashs_metal3(State &renderer) {
     const std::string hash_file_name = fmt::format("hashs-{}.dat", (renderer.current_backend == Backend::OpenGL) ? "gl" : (renderer.current_backend == Backend::Metal ? "metal" : "vk"));
     const auto hash_path = renderer.shaders_path / hash_file_name;
-    fs::ifstream shaders_hashs(hash_path, std::ios::in | std::ios::binary);
+    std::ifstream shaders_hashs(hash_path, std::ios::in | std::ios::binary);
     if (!shaders_hashs.is_open())
         return false;
 
@@ -43,7 +43,7 @@ bool get_shaders_cache_hashs_metal3(State &renderer) {
     constexpr uintmax_t header_bytes = sizeof(size_t) + 2 * sizeof(uint32_t);
     constexpr uintmax_t pair_bytes = 2 * sizeof(Sha256Hash);
     constexpr size_t max_hash_pairs = 1'000'000;
-    boost::system::error_code size_error;
+    std::error_code size_error;
     const auto file_bytes = fs::file_size(hash_path, size_error);
     if (size_error || file_bytes < header_bytes) {
         LOG_WARN("Shader hash cache has an incomplete header: {}", hash_path.string());
@@ -120,7 +120,7 @@ bool get_shaders_cache_hashs_metal3(State &renderer) {
 void save_shaders_cache_hashs_metal3(State &renderer, std::vector<ShadersHash> &shaders_cache_hashs) {
     fs::create_directories(renderer.shaders_path);
     std::string hash_file_name = fmt::format("hashs-{}.dat", (renderer.current_backend == Backend::OpenGL) ? "gl" : (renderer.current_backend == Backend::Metal ? "metal" : "vk"));
-    fs::ofstream shaders_hashs(renderer.shaders_path / hash_file_name, std::ios::out | std::ios::binary);
+    std::ofstream shaders_hashs(renderer.shaders_path / hash_file_name, std::ios::out | std::ios::binary);
 
     if (shaders_hashs.is_open()) {
         // Write Size of shaders cache hashes list
