@@ -178,7 +178,7 @@ EXPORT(Ptr<void>, sceClibMemcpy_safe, Ptr<void> dst, const Ptr<void> src, SceSiz
         CALL_EXPORT(sceClibMemcpy, dst, src.get(emuenv.mem), len);
         return dst;
     }
-    const auto diff = std::abs((int)(src.address() - dst.address()));
+    const auto diff = std::abs(static_cast<int>(src.address() - dst.address()));
     if (len > diff) {
         LOG_ERROR("sceClibMemcpy({},{},{}) src/dst overlap", log_hex_full(src.address()), log_hex_full(dst.address()), len);
         assert(false);
@@ -1532,6 +1532,8 @@ EXPORT(int, sceKernelGetThreadRunStatus) {
 
 EXPORT(int, sceKernelGetTimerBase, SceUID timer_handle, SceKernelSysClock *time) {
     TRACY_FUNC(sceKernelGetTimerBase, timer_handle, time);
+    if (!time)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
     const TimerPtr timer = emuenv.kernel.objects.find<Timer>(timer_handle);
     uint64_t base;
     if (!timer || timer->get_base(base) != SCE_KERNEL_OK)
@@ -1542,18 +1544,20 @@ EXPORT(int, sceKernelGetTimerBase, SceUID timer_handle, SceKernelSysClock *time)
     return 0;
 }
 
-EXPORT(int, sceKernelGetTimerEventRemainingTime) {
-    TRACY_FUNC(sceKernelGetTimerEventRemainingTime);
-    return UNIMPLEMENTED();
+EXPORT(SceInt32, sceKernelGetTimerEventRemainingTime, SceUID timer_handle, SceKernelSysClock *time) {
+    TRACY_FUNC(sceKernelGetTimerEventRemainingTime, timer_handle, time);
+    return CALL_EXPORT(_sceKernelGetTimerEventRemainingTime, timer_handle, time);
 }
 
-EXPORT(int, sceKernelGetTimerInfo) {
-    TRACY_FUNC(sceKernelGetTimerInfo);
-    return UNIMPLEMENTED();
+EXPORT(SceInt32, sceKernelGetTimerInfo, SceUID timer_handle, Ptr<SceKernelTimerInfo> pInfo) {
+    TRACY_FUNC(sceKernelGetTimerInfo, timer_handle, pInfo);
+    return CALL_EXPORT(_sceKernelGetTimerInfo, timer_handle, pInfo);
 }
 
 EXPORT(int, sceKernelGetTimerTime, SceUID timer_handle, SceKernelSysClock *time) {
     TRACY_FUNC(sceKernelGetTimerTime, timer_handle, time);
+    if (!time)
+        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
     const TimerPtr timer = emuenv.kernel.objects.find<Timer>(timer_handle);
     uint64_t count;
     if (!timer || timer->get_time(count) != SCE_KERNEL_OK)
@@ -1598,7 +1602,11 @@ EXPORT(int, sceKernelLockLwMutexCB, Ptr<SceKernelLwMutexWork> workarea, int lock
     const SceInt32 taken = mutex->try_acquire(emuenv.mem, thread, lock_count);
     if (taken != SCE_KERNEL_ERROR_LW_MUTEX_FAILED_TO_OWN)
         return taken;
-    return mutex->acquire(emuenv.mem, thread, lock_count, ptimeout, true);
+    SceUInt32 time_left = ptimeout ? *ptimeout : 0;
+    const SceInt32 result = mutex->acquire(emuenv.mem, thread, lock_count, ptimeout ? &time_left : nullptr, true);
+    if (ptimeout)
+        *ptimeout = time_left;
+    return result;
 }
 
 EXPORT(int, sceKernelLockMutex, SceUID mutexid, int lock_count, unsigned int *timeout) {
@@ -1777,9 +1785,9 @@ EXPORT(int, sceKernelSetTimerEvent, SceUID timer_handle, SceInt32 type, SceKerne
     return timer->set_event(type, *interval, repeats);
 }
 
-EXPORT(int, sceKernelSetTimerTime) {
-    TRACY_FUNC(sceKernelSetTimerTime);
-    return UNIMPLEMENTED();
+EXPORT(SceInt32, sceKernelSetTimerTime, SceUID timer_handle, SceKernelSysClock *time) {
+    TRACY_FUNC(sceKernelSetTimerTime, timer_handle, time);
+    return CALL_EXPORT(_sceKernelSetTimerTime, timer_handle, time);
 }
 
 EXPORT(int, sceKernelSignalLwCond, Ptr<SceKernelLwCondWork> workarea) {
@@ -1940,10 +1948,7 @@ EXPORT(SceInt32, sceKernelWaitEventCB, SceUID event_id, SceUInt32 bit_pattern, S
 
 EXPORT(SceInt32, sceKernelWaitEventFlag, SceUID evfId, SceUInt32 bitPattern, SceUInt32 waitMode, SceUInt32 *pResultPat, SceUInt32 *pTimeout) {
     TRACY_FUNC(sceKernelWaitEventFlag, evfId, bitPattern, waitMode, pResultPat, pTimeout);
-    const EventFlagPtr event = emuenv.kernel.objects.find<EventFlag>(evfId);
-    if (!event)
-        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
-    return event->wait(emuenv.kernel.get_thread(thread_id), bitPattern, waitMode, pResultPat, pTimeout, false);
+    return CALL_EXPORT(_sceKernelWaitEventFlag, evfId, bitPattern, waitMode, pResultPat, pTimeout);
 }
 
 EXPORT(SceInt32, sceKernelWaitEventFlagCB, SceUID evfId, SceUInt32 bitPattern, SceUInt32 waitMode, SceUInt32 *pResultPat, SceUInt32 *pTimeout) {
@@ -1967,7 +1972,11 @@ EXPORT(int, sceKernelWaitLwCond, Ptr<SceKernelLwCondWork> workarea, SceUInt32 *t
     const CondvarPtr condvar = emuenv.kernel.objects.find<LwCond>(cond_id);
     if (!condvar)
         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID);
-    return condvar->wait(emuenv.mem, emuenv.kernel.get_thread(thread_id), timeout, false);
+    SceUInt32 time_left = timeout ? *timeout : 0;
+    const SceInt32 result = condvar->wait(emuenv.mem, emuenv.kernel.get_thread(thread_id), timeout ? &time_left : nullptr, false);
+    if (timeout)
+        *timeout = time_left;
+    return result;
 }
 
 EXPORT(SceInt32, sceKernelWaitLwCondCB, Ptr<SceKernelLwCondWork> pWork, SceUInt32 *pTimeout) {

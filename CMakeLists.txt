@@ -111,7 +111,7 @@ endif()
 option(VITA3K_FORCE_CUSTOM_BOOST "Force Vita3K build process to use the Boost version included with the repository" OFF)
 option(VITA3K_FORCE_SYSTEM_BOOST "Force Vita3K build process to use the Boost version in the system and CMake's default paths and ignore the Boost version included with Vita3K" OFF)
 
-set(VITA3K_REQUIRED_BOOST_VERSION 1.81)
+set(VITA3K_REQUIRED_BOOST_VERSION 1.82)
 if(APPLE)
 	include(CheckCXXSourceCompiles)
 	check_cxx_source_compiles("#include <version>

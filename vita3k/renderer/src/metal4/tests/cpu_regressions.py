@@ -1172,6 +1172,25 @@ def clip_replay_test(directory):
     subprocess.run([str(binary)], check=True, env={**os.environ, 'UBSAN_OPTIONS': 'halt_on_error=1'})
 
 
+def vertex_color_clamp_test(directory):
+    binary = directory / 'vertex_color_clamp'
+    link_shader_test(ROOT / 'vita3k/shader/src/metal4/tests/vertex_color_clamp.cpp', binary)
+    outputs = directory / 'vertex-colors'
+    outputs.mkdir()
+    subprocess.run([str(binary), str(outputs)], check=True)
+    spirv = sorted(outputs.glob('*.spv'))
+    sources = sorted(outputs.glob('*.metal'))
+    assert len(spirv) == len(sources) == 24
+    for path in spirv:
+        subprocess.run(['spirv-val', '--target-env', 'spv1.0', '--scalar-block-layout', str(path)], check=True)
+    for path in sources:
+        subprocess.run(['xcrun', '--toolchain', os.environ.get('VITA3K_METAL_TOOLCHAIN', 'Metal'),
+                        '-sdk', 'macosx', 'metal', '-std=metal3.0',
+                        '-fmodules-cache-path='+str(directory/'metal-modules'), '-fno-fast-math',
+                        '-c', str(path), '-o', str(path.with_suffix('.air'))], check=True)
+    print('PASS vertex color offline: 24 SPIR-V modules validated and 24 MSL outputs compiled to AIR; no GPU execution', flush=True)
+
+
 def clip_shader_test(directory):
     binary = directory / 'clip_shaders'
     link_shader_test(ROOT / 'vita3k/shader/src/metal4/tests/clip_shaders.cpp', binary)
@@ -1559,6 +1578,7 @@ if __name__ == '__main__':
         texture_helper_test(directory)
         clip_geometry_test(directory)
         clip_replay_test(directory)
+        vertex_color_clamp_test(directory)
         clip_shader_test(directory)
         fp_constants_test(directory)
         rotate_left_test(directory)
