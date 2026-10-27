@@ -303,6 +303,39 @@ def dds_import_test(directory):
         (str(directory / 'dds-input'),))
 
 
+def cache_read_concurrency_test(directory, implementation=None):
+    path = 'vita3k/renderer/src/metal4/cache.mm'
+    text = implementation if implementation is not None else (ROOT / path).read_text()
+    source = Path(__file__).with_name('cache_read_concurrency.mm').read_text()
+    source = source.replace('// STATS_HOOK', '\n'.join(function(
+        'vita3k/renderer/include/renderer/metal4/cache.h', signature) + ';'
+        for signature in ('struct CacheWriteWaitStats', 'struct CacheStats')))
+    source = source.replace('// HELPERS_HOOK', '\n'.join(function(path, signature, text)
+        for signature in ('bool valid_guest_hash(', 'NSURL *url(', 'std::string error_text(',
+                          'void put32(', 'uint32_t get32(')))
+    # Older baselines do not call reject_file; its unused definition is harmless.
+    source = source.replace('// REJECT_HOOK', function(path, '    void reject_file('))
+    source = source.replace('// ARCHIVE_HOOK', function(path, '    id<MTL4Archive> load_archive(', text))
+    source = source.replace('// READERS_HOOK', '\n'.join(function(path, signature, text)
+        for signature in ('std::optional<shader::metal::Program> PersistentCache::load_program(',
+                          'std::vector<CachedVariant> PersistentCache::variants(',
+                          'std::vector<CachedPipeline> PersistentCache::render_pipeline_templates('))
+        .replace('std::ifstream', 'ObservedInput'))
+    for marker, signature in (('// RENDER_OPEN_HOOK', 'id<MTLRenderPipelineState> PersistentCache::create_render_pipeline('),
+                              ('// COMPUTE_OPEN_HOOK', 'id<MTLComputePipelineState> PersistentCache::create_compute_pipeline(')):
+        body = function(path, signature, text)
+        source = source.replace(marker, body[body.index('    id<MTL4Archive> archive;'):body.index('    NSError *native_error = nil;')])
+    generated = directory / 'cache_read_concurrency.mm'; generated.write_text(source)
+    binary = directory / 'cache_read_concurrency'
+    sanitizer = os.environ.get('VITA3K_CACHE_READ_SANITIZER', 'address,undefined')
+    subprocess.run(['xcrun', 'clang++', '-std=c++23', '-fobjc-arc', '-O1', '-g',
+                    '-fsanitize='+sanitizer, '-fno-omit-frame-pointer', '-Wno-deprecated-declarations',
+                    '-I'+str(ROOT/'vita3k/shader/include'), str(generated),
+                    '-framework', 'Foundation', '-o', str(binary)], check=True)
+    subprocess.run([str(binary), str(directory/'cache-reader-files')], check=True,
+                   env={**os.environ, 'UBSAN_OPTIONS':'halt_on_error=1', 'TSAN_OPTIONS':'halt_on_error=1'})
+
+
 def cache_write_slots_test(directory):
     path = 'vita3k/renderer/src/metal4/cache.mm'
     source = Path(__file__).with_name('cache_write_slots.mm').read_text()
@@ -584,11 +617,14 @@ int main() {
 '''
 
 
-def caster_test(directory):
+def caster_test(directory, implementation=None):
     path = 'vita3k/renderer/src/metal4/textures.mm'
-    constructor = function(path, 'SurfaceCaster::SurfaceCaster(')
-    getter = function(path, 'id<MTLComputePipelineState> SurfaceCaster::compute_pipeline(')
-    factory = function(path, 'static id<MTLComputePipelineState> cached_compute(')
+    text = implementation if implementation is not None else (ROOT / path).read_text()
+    constructor = function(path, 'SurfaceCaster::SurfaceCaster(', text)
+    getter = function(path, 'id<MTLComputePipelineState> SurfaceCaster::compute_pipeline(', text)
+    factory = function(path, 'static id<MTLComputePipelineState> cached_compute(', text)
+    library = function(path, 'id<MTLLibrary> SurfaceCaster::surface_library(', text) if 'SurfaceCaster::surface_library(' in text else (
+        'id<MTLLibrary> SurfaceCaster::surface_library() { return multisample_library; }')
     source = r"""
 #include <Metal/Metal.h>
 #include <cassert>
@@ -596,12 +632,23 @@ def caster_test(directory):
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <memory>
+#include <vector>
+#include <utility>
 static size_t libraries, pipelines;
 static bool reject_next;
-static id<MTLFunction> metal4_function(id<MTLLibrary>, NSString *name) { return (id<MTLFunction>)name; }
+static unsigned library_failure;
+static id<MTLFunction> metal4_function(id<MTLLibrary> library, NSString *name) {
+    assert(library); return (id<MTLFunction>)name;
+}
 struct Device {
-    id<MTLLibrary> compile_library(NSString *source, id, NSError **) {
+    id<MTLLibrary> compile_library(NSString *source, id, NSError **error) {
         assert(source.length > 1000); ++libraries;
+        switch (std::exchange(library_failure, 0)) {
+        case 1: *error = [NSError errorWithDomain:@"test" code:1 userInfo:nil]; return nil;
+        case 2: return nil;
+        case 3: throw std::runtime_error("test library exception");
+        }
         return (id<MTLLibrary>)[NSObject new];
     }
     id<MTLComputePipelineState> create_compute_pipeline(id<MTLFunction> function, std::string &error) {
@@ -614,21 +661,34 @@ struct SurfaceCaster {
     Device &device;
     id<MTLLibrary> multisample_library;
     explicit SurfaceCaster(Device &);
+    id<MTLLibrary> surface_library();
     id<MTLComputePipelineState> compute_pipeline(id<MTLComputePipelineState> __strong &, NSString *);
 };
-""" + factory + constructor + getter + r"""
+""" + factory + constructor + library + getter + r"""
 int main() {
     @autoreleasepool {
         Device device;
         SurfaceCaster caster(device);
-        assert(libraries == 1 && pipelines == 0);
+        assert(libraries == 0 && pipelines == 0);
+        // Owners used for blits, deferred readback and rejected requests must
+        // not depend on the shader compiler merely to exist or be destroyed.
+        {
+            std::vector<std::unique_ptr<SurfaceCaster>> owners;
+            library_failure = 1;
+            for (size_t i = 0; i < 32; ++i) owners.push_back(std::make_unique<SurfaceCaster>(device));
+            assert(library_failure == 1 && libraries == 0);
+            library_failure = 0;
+        }
         std::array<id<MTLComputePipelineState>,26> slots{};
         for (auto &slot : slots) {
             auto first = caster.compute_pipeline(slot, @"helper");
             assert(first);
             for (size_t i = 0; i < 1000; ++i) assert(caster.compute_pipeline(slot, @"helper") == first);
         }
-        assert(pipelines == 26);
+        assert(pipelines == 26 && libraries == 1);
+        auto shared = caster.surface_library();
+        for (size_t i = 0; i < 1000; ++i) assert(caster.surface_library() == shared);
+        assert(libraries == 1);
         id<MTLComputePipelineState> retry = nil;
         reject_next = true;
         bool rejected = false;
@@ -637,8 +697,24 @@ int main() {
         assert(rejected && !retry && pipelines == 27);
         assert(caster.compute_pipeline(retry, @"retry") && pipelines == 28);
         assert(caster.compute_pipeline(retry, @"retry") == retry && pipelines == 28);
+        // Compiler failures leave the lazy library/PSO unpopulated; a later
+        // request retries. A failed PSO never recompiles a successful library.
+        for (unsigned mode : {1u, 2u, 3u}) {
+            SurfaceCaster retry_caster(device);
+            const auto before_libraries = libraries, before_pipelines = pipelines;
+            library_failure = mode;
+            id<MTLComputePipelineState> slot = nil;
+            bool failed = false;
+            try { (void)retry_caster.compute_pipeline(slot, @"retry-library"); }
+            catch (const std::runtime_error &) { failed = true; }
+            assert(failed && !slot && !retry_caster.multisample_library);
+            assert(libraries == before_libraries + 1 && pipelines == before_pipelines);
+            assert(retry_caster.compute_pipeline(slot, @"retry-library"));
+            assert(libraries == before_libraries + 2 && pipelines == before_pipelines + 1);
+            assert(retry_caster.compute_pipeline(slot, @"retry-library") == slot);
+        }
     }
-    std::cout << "PASS surface helpers: actual constructor creates zero PSOs; lazy slots reuse 26000 calls and retry failures\n";
+    std::cout << "PASS surface helpers: 33 actual constructors create zero libraries/PSOs; first helper builds one shared library, 26 lazy PSOs reuse 26000 calls, direct library reuse, three library error/retry modes and PSO retry; ASAN/UBSAN, no device/GPU/app\n";
 }
 """
     file = directory / 'caster.mm'; file.write_text(source)
@@ -1547,6 +1623,7 @@ if __name__ == '__main__':
         run('bc_upload', bcn_upload_source(), directory)
         dds_import_test(directory)
         cache_write_slots_test(directory)
+        cache_read_concurrency_test(directory)
         guest_publication_test(directory)
         readback_buffers_test(directory)
         color_publication_test(directory)

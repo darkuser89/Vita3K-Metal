@@ -2165,7 +2165,11 @@ static id<MTLComputePipelineState> cached_compute(Device &device, id<MTLLibrary>
     if (!pipeline) throw std::runtime_error(error);
     return pipeline;
 }
-SurfaceCaster::SurfaceCaster(Device &device) : device(device) {
+SurfaceCaster::SurfaceCaster(Device &device) : device(device) {}
+id<MTLLibrary> SurfaceCaster::surface_library() {
+    // Blit-only paths and readback owners need no helper shaders. Compile the
+    // unchanged library only when an actual shader user first requests it.
+    if (multisample_library) return multisample_library;
     NSString *source = @R"(#include <metal_stdlib>
 using namespace metal;
 kernel void unpack_words(texture2d<uint, access::read> input [[texture(0)]],
@@ -2825,11 +2829,12 @@ fragment uint4 publication_words(float4 position [[position]],
     auto library = device.compile_library(source, nil, &error);
     if (!library) throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal: surface cast shader failed");
     multisample_library = library;
+    return multisample_library;
 }
 id<MTLComputePipelineState> SurfaceCaster::compute_pipeline(id<MTLComputePipelineState> __strong &slot, NSString *name) {
     // Only the selected helper is compiled. Failed creation leaves the slot
     // empty so a later attempt can retry; all users retain their native PSO.
-    if (!slot) slot = cached_compute(device, multisample_library, name);
+    if (!slot) slot = cached_compute(device, surface_library(), name);
     return slot;
 }
 void SurfaceCaster::resolve_raw_multisample(id<MTLTexture> source, id<MTLTexture> resolved,
@@ -2917,8 +2922,8 @@ void SurfaceCaster::seed_multisample(id<MTLTexture> source, id<MTLTexture> desti
     std::string error;
     if (!pipeline) {
         auto desc=[MTLRenderPipelineDescriptor new];
-        desc.vertexFunction=metal4_function(multisample_library, @"seed_vs");
-        desc.fragmentFunction=metal4_function(multisample_library, integer ? @"seed_fs_uint" : @"seed_fs");
+        desc.vertexFunction=metal4_function(surface_library(), @"seed_vs");
+        desc.fragmentFunction=metal4_function(surface_library(), integer ? @"seed_fs_uint" : @"seed_fs");
         desc.colorAttachments[0].pixelFormat=destination.pixelFormat;
         desc.rasterSampleCount=destination.sampleCount;
         pipeline=device.create_pipeline(desc,error);
@@ -2961,8 +2966,8 @@ void SurfaceCaster::restore_clipped_multisample(id<MTLTexture> source, id<MTLTex
     auto &pipeline = clip_pipelines[{uint32_t(destination.pixelFormat), uint32_t(destination.sampleCount)}];
     if (!pipeline) {
         auto descriptor = [MTLRenderPipelineDescriptor new];
-        descriptor.vertexFunction = metal4_function(multisample_library, @"seed_vs");
-        descriptor.fragmentFunction = metal4_function(multisample_library, bits == MTLPixelFormatInvalid ? @"restore_clip_float" : @"restore_clip_uint");
+        descriptor.vertexFunction = metal4_function(surface_library(), @"seed_vs");
+        descriptor.fragmentFunction = metal4_function(surface_library(), bits == MTLPixelFormatInvalid ? @"restore_clip_float" : @"restore_clip_uint");
         descriptor.colorAttachments[0].pixelFormat = destination.pixelFormat;
         descriptor.rasterSampleCount = destination.sampleCount;
         std::string error;
@@ -3264,8 +3269,8 @@ id<MTLTexture> SurfaceCaster::resample_publication(id<MTLTexture> source, uint32
     std::string error;
     if (!pipeline) {
         auto descriptor = [MTLRenderPipelineDescriptor new];
-        descriptor.vertexFunction = metal4_function(multisample_library, @"publication_vs");
-        descriptor.fragmentFunction = metal4_function(multisample_library, raw_words ? @"publication_words"
+        descriptor.vertexFunction = metal4_function(surface_library(), @"publication_vs");
+        descriptor.fragmentFunction = metal4_function(surface_library(), raw_words ? @"publication_words"
             : clipped ? @"publication_clipped" : @"publication_linear");
         descriptor.colorAttachments[0].pixelFormat = output.pixelFormat;
         pipeline = device.create_pipeline(descriptor,error);
@@ -3951,7 +3956,7 @@ id<MTLTexture> SurfaceCaster::surface_format_cast(id<MTLTexture> source, SceGxmC
         if (view) return view;
     }
     if (!component_cast_pipeline) {
-        component_cast_pipeline=cached_compute(device, multisample_library, @"repack_components");
+        component_cast_pipeline=cached_compute(device, surface_library(), @"repack_components");
     }
     std::array<uint32_t,4> channels{};
     for (uint32_t c=0;c<input.count;++c)
@@ -4006,7 +4011,7 @@ id<MTLTexture> SurfaceCaster::raw_texture_snapshot(id<MTLTexture> source, V3KMet
     // Cross-component views need not be supported. Split the same integer
     // storage words explicitly without a float read on any face or mip.
     if (!component_cast_pipeline)
-        component_cast_pipeline=cached_compute(device,multisample_library,@"repack_components");
+        component_cast_pipeline=cached_compute(device,surface_library(),@"repack_components");
     auto desc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Unorm
         width:source.width height:source.height mipmapped:NO];
     desc.textureType=source.textureType;
@@ -4049,7 +4054,7 @@ id<MTLTexture> SurfaceCaster::rgba8_surface_sampling(id<MTLTexture> source, SceG
     if (pending_commands && pending_commands.status != MTLCommandBufferStatusNotEnqueued)
         throw std::runtime_error("Metal: gamma conversion requires an open command buffer");
     if (gamma == 3 && !rg_gamma_pipeline) {
-        rg_gamma_pipeline = cached_compute(device, multisample_library, @"decode_rg_gamma");
+        rg_gamma_pipeline = cached_compute(device, surface_library(), @"decode_rg_gamma");
     }
     auto memory = sampling_view(rgba8_gamma_view(source,false), SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, &format);
     // Float storage keeps untouched B/A values and avoids a second UNORM or
@@ -4165,8 +4170,8 @@ void SurfaceCaster::clear_depth_region(id<MTLTexture> texture,SurfaceRect rect,f
     std::string error;
     if (!pipeline) {
         auto desc=[MTLRenderPipelineDescriptor new];
-        desc.vertexFunction=metal4_function(multisample_library, @"seed_vs");
-        desc.fragmentFunction=metal4_function(multisample_library, aspects.mask
+        desc.vertexFunction=metal4_function(surface_library(), @"seed_vs");
+        desc.fragmentFunction=metal4_function(surface_library(), aspects.mask
             ? @"clear_mask_region_value" : @"clear_depth_region_values");
         if (aspects.mask) desc.colorAttachments[0].pixelFormat=texture.pixelFormat;
         else desc.depthAttachmentPixelFormat=desc.stencilAttachmentPixelFormat=texture.pixelFormat;
@@ -4226,8 +4231,8 @@ bool SurfaceCaster::resample_depth(id<MTLTexture> source,id<MTLTexture> destinat
         auto &pipeline=depth_resample_pipelines[{uint32_t(source.sampleCount),mask}];
         if (!pipeline) {
             auto desc=[MTLRenderPipelineDescriptor new];
-            desc.vertexFunction=metal4_function(multisample_library, @"seed_vs");
-            desc.fragmentFunction=metal4_function(multisample_library, mask
+            desc.vertexFunction=metal4_function(surface_library(), @"seed_vs");
+            desc.fragmentFunction=metal4_function(surface_library(), mask
                 ? @"resample_depth_mask_grid" : @"resample_depth_grid");
             desc.rasterSampleCount=source.sampleCount;
             if (mask) desc.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA8Unorm;
@@ -4515,11 +4520,11 @@ bool SurfaceCaster::patch_depth_memory(id<MTLTexture> texture,const SceGxmDepthS
         auto &pipeline=depth_patch_pipelines[{uint32_t(texture.sampleCount),whole_depth?3u:aspect}];
         if (!pipeline) {
             auto pipeline_desc=[MTLRenderPipelineDescriptor new];
-            pipeline_desc.vertexFunction=metal4_function(multisample_library, @"seed_vs");
+            pipeline_desc.vertexFunction=metal4_function(surface_library(), @"seed_vs");
             NSString *name=whole_depth ? @"patch_depth_words"
                 : aspect==0 ? (texture.sampleCount>1 ? @"patch_depth_ms" : @"patch_depth")
                 : aspect==1 ? @"patch_stencil" : @"patch_depth_mask";
-            pipeline_desc.fragmentFunction=metal4_function(multisample_library, name);
+            pipeline_desc.fragmentFunction=metal4_function(surface_library(), name);
             if (aspect==2) pipeline_desc.colorAttachments[0].pixelFormat=mask.pixelFormat;
             else pipeline_desc.depthAttachmentPixelFormat=pipeline_desc.stencilAttachmentPixelFormat=texture.pixelFormat;
             pipeline_desc.rasterSampleCount=texture.sampleCount;
@@ -4574,11 +4579,11 @@ bool SurfaceCaster::copy_depth_stencil_region(id<MTLTexture> source,id<MTLTextur
     std::string error;
     if (!pipeline) {
         auto desc=[MTLRenderPipelineDescriptor new];
-        desc.vertexFunction=metal4_function(multisample_library, @"seed_vs");
+        desc.vertexFunction=metal4_function(surface_library(), @"seed_vs");
         NSString *function=stencil
             ? (source.sampleCount>1 ? @"copy_stencil_region_ms" : @"copy_stencil_region")
             : (source.sampleCount>1 ? @"copy_depth_region_ms" : @"copy_depth_region");
-        desc.fragmentFunction=metal4_function(multisample_library, function);
+        desc.fragmentFunction=metal4_function(surface_library(), function);
         desc.depthAttachmentPixelFormat=desc.stencilAttachmentPixelFormat=MTLPixelFormatDepth32Float_Stencil8;
         desc.rasterSampleCount=source.sampleCount;
         pipeline=device.create_pipeline(desc,error);
@@ -4631,8 +4636,8 @@ bool SurfaceCaster::load_depth_memory(id<MTLTexture> texture,const SceGxmDepthSt
     auto d=make(MTLPixelFormatR32Float,depths.data(),4),s=make(MTLPixelFormatR8Uint,stencils.data(),1);
     auto &pipeline=depth_seed_pipelines[uint32_t(texture.sampleCount)];std::string error;
     if(!pipeline) {
-        auto desc=[MTLRenderPipelineDescriptor new];desc.vertexFunction=metal4_function(multisample_library, @"seed_vs");
-        desc.fragmentFunction=metal4_function(multisample_library, @"seed_depth");
+        auto desc=[MTLRenderPipelineDescriptor new];desc.vertexFunction=metal4_function(surface_library(), @"seed_vs");
+        desc.fragmentFunction=metal4_function(surface_library(), @"seed_depth");
         desc.depthAttachmentPixelFormat=desc.stencilAttachmentPixelFormat=MTLPixelFormatDepth32Float_Stencil8;
         desc.rasterSampleCount=texture.sampleCount;pipeline=device.create_pipeline(desc,error);
         if(!pipeline) throw std::runtime_error(error);
@@ -4677,8 +4682,8 @@ bool SurfaceCaster::load_mask_memory(id<MTLTexture> mask,const SceGxmDepthStenci
     std::string error;
     if(!pipeline) {
         auto pipeline_desc=[MTLRenderPipelineDescriptor new];
-        pipeline_desc.vertexFunction=metal4_function(multisample_library, @"seed_vs");
-        pipeline_desc.fragmentFunction=metal4_function(multisample_library, @"seed_mask");
+        pipeline_desc.vertexFunction=metal4_function(surface_library(), @"seed_vs");
+        pipeline_desc.fragmentFunction=metal4_function(surface_library(), @"seed_mask");
         pipeline_desc.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA8Unorm;
         pipeline_desc.rasterSampleCount=mask.sampleCount;
         pipeline=device.create_pipeline(pipeline_desc,error);

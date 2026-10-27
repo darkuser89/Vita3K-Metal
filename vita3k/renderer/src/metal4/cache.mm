@@ -281,21 +281,26 @@ struct PersistentCache::Impl {
         if (counters.io_errors++ == 0)
             LOG_WARN("Metal cache: {} (rendering continues without cache writes)", message);
     }
+    void reject_file() {
+        std::lock_guard lock(mutex);
+        ++counters.rejected_files;
+    }
     id<MTL4Archive> load_archive(const std::filesystem::path &path) {
         std::error_code ec;
         const auto size = std::filesystem::file_size(path, ec);
         if (ec)
             return nil;
         if (size > 512ull * 1024 * 1024) {
-            ++counters.rejected_files;
+            reject_file();
             return nil;
         }
         NSError *error = nil;
         auto archive = [device.native_device() newArchiveWithURL:url(path) error:&error];
-        if (archive)
+        if (archive) {
+            std::lock_guard lock(mutex);
             counters.archive_loaded = true;
-        else {
-            ++counters.rejected_files;
+        } else {
+            reject_file();
             LOG_WARN("Metal cache: ignoring invalid native archive: {}", error_text(error));
         }
         return archive;
@@ -462,11 +467,11 @@ PersistentCache::PersistentCache(Device &device, const std::filesystem::path &ro
     : impl(std::make_unique<Impl>(device, root)) {}
 PersistentCache::~PersistentCache() = default;
 std::optional<shader::metal::Program> PersistentCache::load_program(std::string_view key) {
-    std::lock_guard lock(impl->mutex);
     const auto hash = digest(key);
     const auto path = impl->programs / (hash + ".mslcache");
     std::error_code ec;
     auto miss = [&](bool rejected) -> std::optional<shader::metal::Program> {
+        std::lock_guard lock(impl->mutex);
         ++impl->counters.program_misses;
         if (rejected)
             ++impl->counters.rejected_files;
@@ -475,9 +480,14 @@ std::optional<shader::metal::Program> PersistentCache::load_program(std::string_
     constexpr size_t header = 8 + 64 + 64 + 4;
     std::shared_ptr<const std::string> pending;
     std::string bytes;
-    if (auto found = impl->pending_programs.find(path); found != impl->pending_programs.end()) {
-        pending = found->second;
-    } else {
+    {
+        // Retain the immutable pending payload, then release the shared cache
+        // lock before any disk access, digest verification or source copying.
+        std::lock_guard lock(impl->mutex);
+        if (auto found = impl->pending_programs.find(path); found != impl->pending_programs.end())
+            pending = found->second;
+    }
+    if (!pending) {
         const auto size = std::filesystem::file_size(path, ec);
         if (ec) return miss(false);
         if (size < header + 16 || size > max_program_bytes + header) return miss(true);
@@ -505,8 +515,11 @@ std::optional<shader::metal::Program> PersistentCache::load_program(std::string_
     program.source = body.substr(16 + entry, source);
     if (program.entry_point.find('\0') != std::string::npos || program.source.find('\0') != std::string::npos)
         return miss(true);
-    ++impl->counters.program_hits;
-    if (!pending) ++impl->counters.program_disk_hits;
+    {
+        std::lock_guard lock(impl->mutex);
+        ++impl->counters.program_hits;
+        if (!pending) ++impl->counters.program_disk_hits;
+    }
     return program;
 }
 void PersistentCache::store_program(std::string_view key, const shader::metal::Program &program,
@@ -549,7 +562,6 @@ std::vector<CachedVariant> PersistentCache::variants(std::string_view guest_hash
     // Warmup enumeration requires completed indices, not an in-flight snapshot.
     // Ordinary shader lookup uses pending_programs and never drains the writer.
     impl->drain_writes();
-    std::lock_guard lock(impl->mutex);
     std::vector<CachedVariant> result;
     if (!valid_guest_hash(guest_hash)) return result;
     std::error_code ec;
@@ -562,14 +574,14 @@ std::vector<CachedVariant> PersistentCache::variants(std::string_view guest_hash
         if (path.extension() != ".variant") continue;
         const auto size = std::filesystem::file_size(path, ec);
         if (ec || size < 141 || size > 141 + max_variant_key_bytes) {
-            ++impl->counters.rejected_files;
+            impl->reject_file();
             ec.clear();
             continue;
         }
         std::string bytes(size, '\0');
         std::ifstream file(path, std::ios::binary);
         if (!file.read(bytes.data(), bytes.size())) {
-            ++impl->counters.rejected_files;
+            impl->reject_file();
             continue;
         }
         const std::string_view view(bytes), key = view.substr(141);
@@ -578,7 +590,7 @@ std::vector<CachedVariant> PersistentCache::variants(std::string_view guest_hash
             || view.substr(8, 64) != digest(key)
             || view.substr(72, 64) != digest(view.substr(136))
             || path.filename() != std::string(view.substr(8, 64)) + ".variant") {
-            ++impl->counters.rejected_files;
+            impl->reject_file();
             continue;
         }
         result.push_back({std::string(key), view[140] != 0});
@@ -614,7 +626,6 @@ void PersistentCache::store_render_pipeline_template(std::string_view fragment_h
 std::vector<CachedPipeline> PersistentCache::render_pipeline_templates(std::string_view fragment_hash,
     std::string_view vertex_hash) {
     impl->drain_writes();
-    std::lock_guard lock(impl->mutex);
     std::vector<CachedPipeline> result;
     if (!valid_guest_hash(fragment_hash) || !valid_guest_hash(vertex_hash)) return result;
     const auto directory=impl->native/"warmup"/std::string(fragment_hash)/std::string(vertex_hash);
@@ -627,20 +638,20 @@ std::vector<CachedPipeline> PersistentCache::render_pipeline_templates(std::stri
         if (path.extension()!=".pipeline") continue;
         const auto size=std::filesystem::file_size(path,ec);
         if (ec || size<72+16 || size>72+max_pipeline_template_bytes) {
-            ++impl->counters.rejected_files;ec.clear();continue;
+            impl->reject_file();ec.clear();continue;
         }
         std::string bytes(size,'\0');
         std::ifstream input(path,std::ios::binary);
-        if (!input.read(bytes.data(),bytes.size())) {++impl->counters.rejected_files;continue;}
+        if (!input.read(bytes.data(),bytes.size())) {impl->reject_file();continue;}
         const std::string_view view(bytes),body=view.substr(72);
         if (view.substr(0,8)!=pipeline_magic || view.substr(8,64)!=digest(body)) {
-            ++impl->counters.rejected_files;continue;
+            impl->reject_file();continue;
         }
         const size_t key_size=get32(body,0),vertex_size=get32(body,4),fragment_size=get32(body,8),descriptor_size=get32(body,12);
         if (!key_size || !vertex_size || !fragment_size || !descriptor_size
             || key_size>max_variant_key_bytes || vertex_size>max_variant_key_bytes
             || fragment_size>max_variant_key_bytes || size_t(16)+key_size+vertex_size+fragment_size+descriptor_size!=body.size()) {
-            ++impl->counters.rejected_files;continue;
+            impl->reject_file();continue;
         }
         const auto key=body.substr(16,key_size);
         const auto vertex=body.substr(16+key_size,vertex_size);
@@ -649,10 +660,10 @@ std::vector<CachedPipeline> PersistentCache::render_pipeline_templates(std::stri
         if (path.filename()!=digest(key)+".pipeline" || vertex.substr(0,64)!=vertex_hash
             || (fragment.substr(0,64)!=fragment_hash && !fragment.starts_with("metal-depth-only"))
             || !key.starts_with(vertex) || !key.substr(vertex.size()).starts_with(fragment)) {
-            ++impl->counters.rejected_files;continue;
+            impl->reject_file();continue;
         }
         auto restored=restore_render_template(descriptor);
-        if (!restored) {++impl->counters.rejected_files;continue;}
+        if (!restored) {impl->reject_file();continue;}
         restored->key=key;
         restored->vertex_key=vertex;
         restored->fragment_key=fragment;
@@ -691,7 +702,12 @@ id<MTLRenderPipelineState> PersistentCache::create_render_pipeline(MTLRenderPipe
             ++impl->counters.pipeline_hits;
             return it->second;
         }
-        archive = impl->load_archive(path);
+    }
+    // Archive I/O and Metal's archive loader must not serialize unrelated
+    // shader lookups, writer completion or statistics through the cache lock.
+    archive = impl->load_archive(path);
+    {
+        std::lock_guard lock(impl->mutex);
         writable = impl->counters.archive_writable;
     }
     NSError *native_error = nil;
@@ -737,7 +753,12 @@ id<MTLComputePipelineState> PersistentCache::create_compute_pipeline(id<MTLFunct
             ++impl->counters.pipeline_hits;
             return it->second;
         }
-        archive = impl->load_archive(path);
+    }
+    // Archive I/O and Metal's archive loader must not serialize unrelated
+    // shader lookups, writer completion or statistics through the cache lock.
+    archive = impl->load_archive(path);
+    {
+        std::lock_guard lock(impl->mutex);
         writable = impl->counters.archive_writable;
     }
     NSError *native_error = nil;

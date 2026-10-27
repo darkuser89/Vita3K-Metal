@@ -159,6 +159,7 @@ class SurfaceCaster {
     id<MTLComputePipelineState> multisample_integer_pipeline;
     id<MTLComputePipelineState> raw_multisample_resolve_pipeline;
     id<MTLLibrary> multisample_library;
+    id<MTLLibrary> surface_library();
     id<MTLComputePipelineState> compute_pipeline(id<MTLComputePipelineState> __strong &slot, NSString *name);
     std::map<std::pair<uint32_t,uint32_t>,id<MTLRenderPipelineState>> seed_pipelines;
     std::map<std::pair<uint32_t,uint32_t>,id<MTLRenderPipelineState>> clip_pipelines;

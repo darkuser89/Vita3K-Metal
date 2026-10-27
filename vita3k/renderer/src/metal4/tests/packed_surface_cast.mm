@@ -184,6 +184,7 @@ struct Device {
 };
 struct SurfaceCaster {
     Device &device; id<MTLLibrary> packed_cast_library=nil,multisample_library=nil;
+    id<MTLLibrary> surface_library() { return multisample_library; }
     id<MTLComputePipelineState> packed_cast_pipeline=nil,component_cast_pipeline=nil;
     id<MTLBuffer> packed_cast_input=nil,packed_cast_output=nil;
     id<MTLTexture> surface_format_cast(id<MTLTexture>,SceGxmColorFormat,SceGxmTextureBaseFormat,uint32_t,V3KMetal4Commands *,bool=false);

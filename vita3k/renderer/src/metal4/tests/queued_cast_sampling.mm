@@ -88,6 +88,7 @@ struct SurfaceCaster {
     Device &device;
     id<MTLComputePipelineState> rg_gamma_pipeline=nil,depth_pipeline=nil;
     id<MTLLibrary> multisample_library=nil;
+    id<MTLLibrary> surface_library() { return multisample_library; }
     explicit SurfaceCaster(Device &d):device(d){}
     id<MTLComputePipelineState> compute_pipeline(id<MTLComputePipelineState> __strong &p,NSString *name) {
         if(!p)p=cached_compute(device,multisample_library,name);return p;
