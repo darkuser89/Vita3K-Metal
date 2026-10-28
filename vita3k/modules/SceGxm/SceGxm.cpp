@@ -1966,7 +1966,7 @@ EXPORT(int, sceGxmColorSurfaceInit, SceGxmColorSurface *surface, SceGxmColorForm
 #endif
 
     TRACY_FUNC(sceGxmColorSurfaceInit, surface, colorFormat, surfaceType, scaleMode, outputRegisterSize, width, height, strideInPixels, data);
-    if (!surface || !data)
+    if (!surface)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
     if (width == 0 || width > 4096 || height == 0 || height > 4096)
