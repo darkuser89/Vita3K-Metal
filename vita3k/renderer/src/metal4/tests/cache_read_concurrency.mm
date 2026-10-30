@@ -90,6 +90,7 @@ struct PersistentCache {
         std::map<fs::path, id> pending_render, pending_compute;
         std::atomic<unsigned> drains = 0;
         void drain_writes() { ++drains; }
+        void drain_index_writes() { drain_writes(); } // Publication is a boundary here.
         // REJECT_HOOK
         // ARCHIVE_HOOK
     };

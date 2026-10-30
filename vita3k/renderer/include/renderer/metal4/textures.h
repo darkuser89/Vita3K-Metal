@@ -232,7 +232,8 @@ public:
     // Native sample IDs in a 1x2 (2X) or 2x2 (4X) image. Each guest sample
     // maps to the native extent using the actual guest and render dimensions.
     void expand_multisample(id<MTLTexture> source, id<MTLTexture> destination, float scale,
-        uint32_t guest_width = 0, uint32_t guest_height = 0, V3KMetal4Commands * pending_commands = nil);
+        uint32_t guest_width = 0, uint32_t guest_height = 0, V3KMetal4Commands * pending_commands = nil,
+        bool wait_for_completion = true);
     void seed_multisample(id<MTLTexture> source, id<MTLTexture> destination, float scale, bool expanded,
         uint32_t guest_width = 0, uint32_t guest_height = 0, V3KMetal4Commands * pending_commands = nil);
     // Keep identical F16 sample words; use the normal float resolve for mixed samples.
@@ -315,6 +316,9 @@ bool surface_format_cast_enqueueable(SceGxmColorFormat, SceGxmTextureBaseFormat,
 // keep the sampler from canonicalizing the reinterpreted F32 NaN words.
 bool surface_raw_cast_required(SceGxmColorFormat, SceGxmTextureBaseFormat);
 bool raw_texture_snapshot_supported(id<MTLTexture>);
+// A successful native view needs no encoder or producer flush. Nil means
+// the supported source must use the integer compute carrier instead.
+id<MTLTexture> raw_texture_snapshot_view(id<MTLTexture> source);
 float packed_alias_x_offset(float scale, uint32_t native_alias_width);
 // GPU work must be complete before reading. Preserves guest row/tile padding
 // and copies raw component bits, including floating-point NaN payloads.

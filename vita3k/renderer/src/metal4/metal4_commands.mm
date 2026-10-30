@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <memory>
 #include <cstring>
+#include <exception>
 #include <limits>
+#include <map>
 #include <bitset>
 #include <mutex>
 #include <stdexcept>
@@ -132,6 +134,9 @@ void check_index(NSUInteger index, NSUInteger count) {
     NSMutableArray<id<MTL4CommandAllocator>> *_allocatorPool;
     NSMutableArray<V3KMetal4Arguments *> *_argumentPool;
     NSMutableArray<id<MTLResidencySet>> *_residencyPool;
+    // Producers serialize native residency mutations before taking the short
+    // policy lock. Feedback only needs the latter to retire texture leases.
+    std::mutex _textureDriverMutex;
     std::mutex _textureMutex;
     id<MTLResidencySet> _textureResidency;
     std::unique_ptr<renderer::metal::ResidencyCachePolicy> _texturePolicy;
@@ -166,23 +171,44 @@ void check_index(NSUInteger index, NSUInteger count) {
 - (bool)pinTexture:(id<MTLTexture>)texture {
     if (!_texturePolicy) return false;
     const auto identity=resource_identity(texture);
-    std::lock_guard lock(_textureMutex);
-    const bool present=_textureOwners.contains(identity);
-    const bool pinned=_texturePolicy->pin(identity,texture.allocatedSize,[&](uintptr_t victim) {
-        [_textureResidency removeAllocation:_textureOwners.at(victim)];
-        _textureOwners.erase(victim);_textureResidencyDirty=true;
-    });
+    // Extract owners without allocating/copying them. Their last releases occur
+    // after both locks are gone, including the failed-insertion path.
+    decltype(_textureOwners) retired;
+    decltype(_textureOwners)::node_type rejected;
+    std::lock_guard driver(_textureDriverMutex);
+    const auto bytes=texture.allocatedSize;
+    bool present=false, pinned=false;
+    std::exception_ptr failure;
+    {
+        std::lock_guard lock(_textureMutex);
+        present=_textureOwners.contains(identity);
+        try {
+            // Allocate ownership before admitting a policy lease, so a failed
+            // map insertion cannot leave a lease without its resource owner.
+            if (!present) _textureOwners.emplace(identity,texture);
+            pinned=_texturePolicy->pin(identity,bytes,[&](uintptr_t victim) {
+                retired.insert(_textureOwners.extract(victim));
+            });
+        } catch (...) { failure=std::current_exception(); }
+        if (!pinned && !present) rejected=_textureOwners.extract(identity);
+    }
+    // Even if policy allocation failed after evictions, reconcile all removed
+    // memberships before propagating that failure. Never call the driver while
+    // holding the lock required by feedback-side unpinTexture.
+    for (const auto &[key, owner]:retired) {
+        [_textureResidency removeAllocation:owner];_textureResidencyDirty=true;
+    }
     if (pinned && !present) {
-        _textureOwners.emplace(identity,texture);
         [_textureResidency addAllocation:texture];_textureResidencyDirty=true;
     }
+    if (failure) std::rethrow_exception(failure);
     return pinned;
 }
 - (void)unpinTexture:(uintptr_t)identity {
     std::lock_guard lock(_textureMutex);_texturePolicy->unpin(identity);
 }
 - (void)commitTextureResidency {
-    std::lock_guard lock(_textureMutex);
+    std::lock_guard driver(_textureDriverMutex);
     if (_textureResidencyDirty) {
         [_textureResidency commit];_textureResidencyDirty=false;
         if (!_textureResidencyAttached) {
@@ -431,7 +457,9 @@ void check_index(NSUInteger index, NSUInteger count) {
         [_handlers removeAllObjects];
         [_completion unlock];
         for (void (^handler)(V3KMetal4Commands *) in handlers) handler(self);
-        [_completion lock];
+        // Feedback owns these submission-only resources. Driver recycling and
+        // owner destruction must not hold up terminal metadata/late handlers.
+        // The full waiter still observes _finished only after all cleanup.
         [_queue recycleAllocator:_allocator];
         _allocator = nil;
         if (!feedback.error) for (V3KMetal4Arguments *arguments in _argumentTables)
@@ -445,6 +473,7 @@ void check_index(NSUInteger index, NSUInteger count) {
         [_residency commit];
         if (!feedback.error) [_queue recycleResidency:_residency];
         _residency = nil;
+        [_completion lock];
         _finished = true;
         [_completion broadcast];
         [_completion unlock];

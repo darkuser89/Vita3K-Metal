@@ -8,11 +8,50 @@
 #include <atomic>
 #include <cassert>
 #include <cstring>
+#include <cstdlib>
 #include <deque>
+#include <future>
 #include <iostream>
 #include <mutex>
+#include <new>
+#include <semaphore>
 #include <thread>
 #include <type_traits>
+
+// Observe the real std::vector allocation/free boundary, not a simulated ring.
+struct MemoryGate {
+    std::binary_semaphore entered{0}, release{0};
+    std::atomic<bool> armed{true};
+    size_t bytes = 0;
+    void *retired = nullptr;
+    bool fail = false;
+    std::atomic<unsigned> allocations{0};
+};
+static std::atomic<MemoryGate *> memory_gate{nullptr};
+static thread_local bool observe_ring_allocation = false;
+void *operator new(size_t size) {
+    auto *gate = memory_gate.load();
+    if (gate && observe_ring_allocation && size == gate->bytes) {
+        ++gate->allocations;
+        if (gate->armed.exchange(false)) {
+            gate->entered.release(); gate->release.acquire();
+            if (gate->fail) throw std::bad_alloc();
+        }
+    }
+    if (auto *p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void *p) noexcept {
+    auto *gate = memory_gate.load();
+    if (p && gate && p == gate->retired && gate->armed.exchange(false)) {
+        gate->entered.release(); gate->release.acquire();
+    }
+    std::free(p);
+}
+void *operator new[](size_t n) { return ::operator new(n); }
+void operator delete[](void *p) noexcept { ::operator delete(p); }
+void operator delete(void *p, size_t) noexcept { ::operator delete(p); }
+void operator delete[](void *p, size_t) noexcept { ::operator delete(p); }
 
 using namespace renderer::metal;
 using Address = uint32_t;
@@ -63,6 +102,7 @@ struct MetalState {
         static constexpr size_t STREAM_SNAPSHOT_MAX_BYTES = 256;
         struct StreamSnapshotHeader { uint64_t handle; uint32_t size; uint32_t reserved = 0; };
         std::mutex stream_snapshot_mutex;
+        std::mutex stream_snapshot_allocation_mutex;
         std::vector<uint8_t> stream_snapshot_ring;
         VertexSnapshotOwners stream_snapshot_owners;
         uint64_t stream_snapshot_cursor = 0;
@@ -76,7 +116,113 @@ struct MetalState {
 };
 // SNAPSHOT_METHODS_HOOK
 
+template <typename Work> static auto joined_async(Work work) {
+    std::packaged_task<std::invoke_result_t<Work>()> task(std::move(work));
+    auto future = task.get_future();
+    return std::pair{std::thread(std::move(task)), std::move(future)};
+}
+static void allocation_lock_test() {
+    MetalState renderer; MemState mem; Command c; CommandList list{&c, &c};
+    MemoryGate gate; gate.bytes = MetalState::Impl::STREAM_SNAPSHOT_RING_SIZE;
+    memory_gate = &gate;
+    auto [capture_thread, capture] = joined_async([&] {
+        observe_ring_allocation = true;
+        renderer.snapshot_vertex_streams(mem, list);
+        observe_ring_allocation = false;
+    });
+    assert(gate.entered.try_acquire_for(std::chrono::seconds(5)));
+    auto [read_thread, read] = joined_async([&] { return renderer.vertex_stream_snapshot(0, 100); });
+    const bool ready = read.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    gate.release.release(); capture.get(); (void)read.get();
+    capture_thread.join(); read_thread.join(); memory_gate = nullptr;
+    assert(ready && "Snapshot lookup must not wait for ring allocation");
+    assert(renderer.vertex_stream_snapshot(c.handle, c.size));
+}
+static void retirement_lock_test() {
+    for (bool disable : {false, true}) for (bool retire_owner : {false, true}) {
+        MetalState renderer; MemState mem; Command c; CommandList list{&c, &c};
+        renderer.snapshot_vertex_streams(mem, list);
+        auto owner = renderer.vertex_stream_snapshot(c.handle, c.size);
+        assert(owner);
+        const std::weak_ptr<const std::vector<uint8_t>> weak = owner;
+        MemoryGate gate;
+        gate.retired = retire_owner ? const_cast<uint8_t *>(owner->data()) : renderer.impl->stream_snapshot_ring.data();
+        if (retire_owner) owner.reset();
+        memory_gate = &gate;
+        auto [retire_thread, retire] = joined_async([&] {
+            if (disable) renderer.disable_vertex_stream_snapshots();
+            else renderer.reset_vertex_stream_snapshots();
+        });
+        assert(gate.entered.try_acquire_for(std::chrono::seconds(5)));
+        auto [read_thread, read] = joined_async([&] { return renderer.vertex_stream_snapshot(c.handle, c.size); });
+        const bool ready = read.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        gate.release.release(); retire.get(); const auto expired = read.get();
+        retire_thread.join(); read_thread.join(); memory_gate = nullptr;
+        assert(ready && "Snapshot lookup must not wait for retired ring deallocation");
+        assert(!expired && renderer.impl->stream_snapshots_disabled == disable);
+        if (retire_owner) assert(weak.expired());
+        else assert(owner->size() == c.size);
+    }
+}
+static void initialization_races_test() {
+    // A disable/reset is allowed to complete while the allocation is pending.
+    for (bool disable : {false, true}) {
+        MetalState renderer; MemState mem; Command c; CommandList list{&c, &c};
+        MemoryGate gate; gate.bytes = MetalState::Impl::STREAM_SNAPSHOT_RING_SIZE;
+        memory_gate = &gate;
+        auto [capture_thread, capture] = joined_async([&] {
+            observe_ring_allocation = true; renderer.snapshot_vertex_streams(mem, list); observe_ring_allocation = false;
+        });
+        assert(gate.entered.try_acquire_for(std::chrono::seconds(5)));
+        auto [change_thread, change] = joined_async([&] {
+            if (disable) renderer.disable_vertex_stream_snapshots(); else renderer.reset_vertex_stream_snapshots();
+        });
+        const bool ready = change.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        gate.release.release(); capture.get(); change.get(); capture_thread.join(); change_thread.join(); memory_gate = nullptr;
+        assert(ready && renderer.impl->stream_snapshots_disabled == disable);
+        if (disable) assert(c.handle == ~0ull && renderer.impl->stream_snapshot_ring.empty());
+        else assert(renderer.vertex_stream_snapshot(c.handle, c.size));
+    }
+    // Two first-time producers share one allocation, preserving distinct handles.
+    {
+        MetalState renderer; MemState mem; Command a, b;
+        CommandList first{&a, &a}, second{&b, &b};
+        MemoryGate gate; gate.bytes = MetalState::Impl::STREAM_SNAPSHOT_RING_SIZE; memory_gate = &gate;
+        auto [ta, fa] = joined_async([&] {
+            observe_ring_allocation = true; renderer.snapshot_vertex_streams(mem, first); observe_ring_allocation = false;
+        });
+        assert(gate.entered.try_acquire_for(std::chrono::seconds(5)));
+        std::promise<void> started;
+        auto [tb, fb] = joined_async([&] {
+            started.set_value(); observe_ring_allocation = true;
+            renderer.snapshot_vertex_streams(mem, second); observe_ring_allocation = false;
+        });
+        started.get_future().wait();
+        const bool waiting = fb.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+        gate.release.release(); fa.get(); fb.get(); ta.join(); tb.join(); memory_gate = nullptr;
+        assert(waiting && gate.allocations == 1 && a.handle != b.handle);
+        assert(renderer.vertex_stream_snapshot(a.handle, a.size) && renderer.vertex_stream_snapshot(b.handle, b.size));
+    }
+    // Failed allocation releases both locks and can be retried normally.
+    {
+        MetalState renderer; MemState mem; Command c; CommandList list{&c, &c};
+        MemoryGate gate; gate.bytes = MetalState::Impl::STREAM_SNAPSHOT_RING_SIZE; gate.fail = true; memory_gate = &gate;
+        auto [thread, future] = joined_async([&] {
+            observe_ring_allocation = true; renderer.snapshot_vertex_streams(mem, list);
+        });
+        assert(gate.entered.try_acquire_for(std::chrono::seconds(5))); gate.release.release();
+        bool failed = false; try { future.get(); } catch (const std::bad_alloc &) { failed = true; }
+        thread.join(); memory_gate = nullptr;
+        assert(failed && c.handle == ~0ull && renderer.impl->stream_snapshot_ring.empty());
+        renderer.snapshot_vertex_streams(mem, list);
+        assert(renderer.vertex_stream_snapshot(c.handle, c.size));
+    }
+}
+
 int main() {
+    if (!std::getenv("VITA3K_SNAPSHOT_RETIRE_ONLY")) allocation_lock_test();
+    retirement_lock_test();
+    initialization_races_test();
     MetalState renderer; MemState mem; Command command;
     CommandList list{&command, &command};
     std::fill(mem.bytes.begin(), mem.bytes.end(), 0x13);
@@ -158,5 +304,5 @@ int main() {
         ++checked;
     }
     writer.join(); assert(checked == 10000);
-    std::cout << "PASS vertex snapshots: 10000 identical owner hits, actual kick/read/reset methods, ring wrap/expiry, prefixes, separated guest pages, MidSceneFlush, disable/reinit, bounded owners and 10000 concurrent kicks; ASAN/UBSAN\n";
+    std::cout << "PASS vertex snapshots: observed allocation/ring/owner-free gates permit independent lookups; reset/disable during allocation, single allocation for two producers, allocation failure/retry; real capture/read/reset methods, 10000 identical owner hits, ring wrap/expiry, prefixes, separated guest pages, MidSceneFlush, disable/reinit, bounded owners and 10000 concurrent kicks; no GPU/app\n";
 }

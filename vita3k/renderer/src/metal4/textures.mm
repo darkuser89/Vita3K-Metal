@@ -2866,7 +2866,8 @@ void SurfaceCaster::resolve_raw_multisample(id<MTLTexture> source, id<MTLTexture
     [encoder endEncoding];
 }
 void SurfaceCaster::expand_multisample(id<MTLTexture> source, id<MTLTexture> destination, float scale,
-    uint32_t guest_width, uint32_t guest_height, V3KMetal4Commands * pending_commands) {
+    uint32_t guest_width, uint32_t guest_height, V3KMetal4Commands * pending_commands,
+    bool wait_for_completion) {
     if (!scale || !source || source.textureType!=MTLTextureType2DMultisample || (source.sampleCount!=2 && source.sampleCount!=4)
         || !destination || destination.textureType!=MTLTextureType2D
         || (pending_commands && pending_commands.status!=MTLCommandBufferStatusNotEnqueued))
@@ -2894,8 +2895,15 @@ void SurfaceCaster::expand_multisample(id<MTLTexture> source, id<MTLTexture> des
     [encoder dispatchThreads:MTLSizeMake(destination.width,destination.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
     [encoder endEncoding];
     if (!pending_commands) {
-        std::string error;
-        if(!device.submit_and_wait(commands,error)) throw std::runtime_error(error);
+        if (wait_for_completion) {
+            std::string error;
+            if(!device.submit_and_wait(commands,error)) throw std::runtime_error(error);
+        } else {
+            [commands addCompletedHandler:^(V3KMetal4Commands * completed) {
+                if (completed.error) LOG_ERROR("Metal sample expansion: {}", completed.error.localizedDescription.UTF8String);
+            }];
+            [commands commit];
+        }
     }
 }
 void SurfaceCaster::seed_multisample(id<MTLTexture> source, id<MTLTexture> destination, float scale, bool expanded,
@@ -3994,6 +4002,11 @@ bool raw_texture_snapshot_supported(id<MTLTexture> source) {
     default: return false;
     }
 }
+id<MTLTexture> raw_texture_snapshot_view(id<MTLTexture> source) {
+    if (!raw_texture_snapshot_supported(source)) return nil;
+    if (source.pixelFormat==MTLPixelFormatRGBA16Unorm) return source;
+    return [source newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Unorm];
+}
 id<MTLTexture> SurfaceCaster::raw_texture_snapshot(id<MTLTexture> source, V3KMetal4Commands * pending_commands) {
     if (!raw_texture_snapshot_supported(source)) return nil;
     uint32_t count, bytes;
@@ -4005,8 +4018,7 @@ id<MTLTexture> SurfaceCaster::raw_texture_snapshot(id<MTLTexture> source, V3KMet
     default: return nil;
     }
     if (pending_commands && pending_commands.status!=MTLCommandBufferStatusNotEnqueued) return nil;
-    if (source.pixelFormat==MTLPixelFormatRGBA16Unorm) return source;
-    auto view=[source newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Unorm];
+    auto view=raw_texture_snapshot_view(source);
     if (view) return view;
     // Cross-component views need not be supported. Split the same integer
     // storage words explicitly without a float read on any face or mip.
@@ -4856,7 +4868,7 @@ id<MTLTexture> SurfaceCaster::depth_snapshot(id<MTLTexture> source, bool normali
     auto result = [device.native_device() newTextureWithDescriptor:desc];
     if (!result) throw std::runtime_error("Metal: cannot allocate depth snapshot");
     if (ms) {
-        expand_multisample(source,result,scale,guest_width,guest_height,pending_commands); return result;
+        expand_multisample(source,result,scale,guest_width,guest_height,pending_commands,wait_for_completion); return result;
     }
     auto commands = pending_commands ? pending_commands : surface_command_buffer(device, @"Vita3K surface depth snapshot");
     auto encoder = [commands computeCommandEncoder];

@@ -7,13 +7,78 @@
 #include <renderer/metal4/visibility_buffers.h>
 #include <renderer/metal4/residency_cache.h>
 #include <cassert>
+#include <atomic>
 #include <objc/runtime.h>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <limits>
+#include <new>
 #include <random>
+#include <semaphore>
 #include <stdexcept>
+#include <thread>
+
+// Inject memory pressure only on the producer under test; the production
+// ownership/policy maps and all other code still use their ordinary allocators.
+static thread_local int fail_texture_allocation=-1;
+void *operator new(size_t size) {
+    if(fail_texture_allocation==0){fail_texture_allocation=-1;throw std::bad_alloc();}
+    if(fail_texture_allocation>0)--fail_texture_allocation;
+    if(auto *p=std::malloc(size?size:1))return p;
+    throw std::bad_alloc();
+}
+void operator delete(void *p) noexcept {std::free(p);}
+void *operator new[](size_t n) {return ::operator new(n);}
+void operator delete[](void *p) noexcept {::operator delete(p);}
+void operator delete(void *p,size_t) noexcept {::operator delete(p);}
+void operator delete[](void *p,size_t) noexcept {::operator delete(p);}
+
+enum class RetireStage { Allocator, Arguments, Resource, Residency };
+struct RetireGate {
+    RetireStage stage;
+    std::binary_semaphore entered{0}, release{0};
+    std::atomic<bool> armed{true};
+    explicit RetireGate(RetireStage stage) : stage(stage) {}
+};
+static std::atomic<RetireGate *> retire_gate{nullptr};
+static std::atomic<unsigned> retired_test_owners{0};
+static void retirement_checkpoint(RetireStage stage) {
+    auto *gate=retire_gate.load();
+    if(gate && gate->stage==stage && gate->armed.exchange(false)) {
+        gate->entered.release();gate->release.acquire();
+    }
+}
+template <typename Work> static auto retirement_async(Work work) {
+    std::packaged_task<std::invoke_result_t<Work>()> task(std::move(work));
+    auto future=task.get_future();
+    return std::pair{std::thread(std::move(task)),std::move(future)};
+}
+enum class TextureStage { Size, Add, Remove, Commit, Attach, Owner };
+struct TextureGate {
+    TextureStage stage;
+    const void *target;
+    std::binary_semaphore entered{0}, release{0};
+    std::atomic<bool> armed{true};
+};
+static std::atomic<TextureGate *> texture_gate{nullptr};
+static void texture_checkpoint(TextureStage stage, id object) {
+    auto *gate=texture_gate.load();
+    if(gate && gate->stage==stage && gate->target==(__bridge const void *)object && gate->armed.exchange(false)) {
+        gate->entered.release();gate->release.acquire();
+    }
+}
+@interface V3KMetal4Queue (TextureResidencyTests)
+- (bool)pinTexture:(id<MTLTexture>)texture;
+- (void)unpinTexture:(uintptr_t)identity;
+- (void)commitTextureResidency;
+@end
+@interface RetiringTestOwner : NSObject
+@end
+@implementation RetiringTestOwner
+- (void)dealloc { retirement_checkpoint(RetireStage::Resource);++retired_test_owners; }
+@end
 
 @interface TestBuffer : NSObject {
     void *_bytes;
@@ -84,7 +149,10 @@ std::unique_ptr<Device> Device::create(std::string &error) {
 - (void)setSamplerState:(MTLResourceID)resource atIndex:(NSUInteger)index;
 @end
 @implementation TestTable
-- (void)setAddress:(MTLGPUAddress)address atIndex:(NSUInteger)index { addresses[index] = address; clears += address == 0; }
+- (void)setAddress:(MTLGPUAddress)address atIndex:(NSUInteger)index {
+    if(!address)retirement_checkpoint(RetireStage::Arguments);
+    addresses[index] = address; clears += address == 0;
+}
 - (void)setTexture:(MTLResourceID)resource atIndex:(NSUInteger)index { textures[index] = resource; clears += resource._impl == 0; }
 - (void)setSamplerState:(MTLResourceID)resource atIndex:(NSUInteger)index { samplers[index] = resource; clears += resource._impl == 0; }
 @end
@@ -98,10 +166,10 @@ std::unique_ptr<Device> Device::create(std::string &error) {
 @end
 @implementation TestResidency
 - (instancetype)init { if ((self=[super init])) _allocations=[NSMutableSet new]; return self; }
-- (void)addAllocation:(id)allocation { [_allocations addObject:allocation]; }
-- (void)removeAllocation:(id)allocation { [_allocations removeObject:allocation]; }
+- (void)addAllocation:(id)allocation { texture_checkpoint(TextureStage::Add,self);[_allocations addObject:allocation]; }
+- (void)removeAllocation:(id)allocation { texture_checkpoint(TextureStage::Remove,self);[_allocations removeObject:allocation]; }
 - (void)removeAllAllocations { [_allocations removeAllObjects]; }
-- (void)commit { ++_commits; }
+- (void)commit { texture_checkpoint(TextureStage::Commit,self);retirement_checkpoint(RetireStage::Residency);++_commits; }
 @end
 @interface TestNativeCommands : NSObject
 @property(strong) id<MTLDevice> device;
@@ -124,7 +192,7 @@ std::unique_ptr<Device> Device::create(std::string &error) {
 - (void)reset;
 @end
 @implementation TestAllocator
-- (void)reset {}
+- (void)reset { retirement_checkpoint(RetireStage::Allocator); }
 @end
 @interface TestFeedback : NSObject
 @property(strong) NSError *error;
@@ -151,7 +219,7 @@ static void capture_feedback(id options, SEL, MTL4CommitFeedbackHandler handler)
 - (void)completeNext:(BOOL)failed;
 @end
 @implementation TestNativeQueue
-- (void)addResidencySet:(id)residency { _textureResidency=residency; }
+- (void)addResidencySet:(id)residency { texture_checkpoint(TextureStage::Attach,residency);_textureResidency=residency; }
 - (instancetype)init {if((self=[super init]))_pending=[NSMutableArray new];return self;}
 - (void)commit:(const id<MTL4CommandBuffer> *)buffers count:(NSUInteger)count options:(MTL4CommitOptions *)options {
     assert(count==1 && buffers[0]);
@@ -167,6 +235,7 @@ static void capture_feedback(id options, SEL, MTL4CommitFeedbackHandler handler)
 @end
 static NSMutableArray<TestTable *> *tables;
 static size_t residency_allocations;
+static __weak TestResidency *last_texture_residency;
 @interface TestDevice (Commands)
 - (id)newArgumentTableWithDescriptor:(id)descriptor error:(NSError **)error;
 - (id)newCommandBuffer;
@@ -180,7 +249,11 @@ static size_t residency_allocations;
     auto table=[TestTable new];[tables addObject:table];return table;
 }
 - (id)newCommandBuffer {auto commands=[TestNativeCommands new];commands.device=(id<MTLDevice>)self;return commands;}
-- (id)newResidencySetWithDescriptor:(id)descriptor error:(NSError **)error {++residency_allocations;return [TestResidency new];}
+- (id)newResidencySetWithDescriptor:(MTLResidencySetDescriptor *)descriptor error:(NSError **)error {
+    ++residency_allocations;auto result=[TestResidency new];
+    if([descriptor.label isEqualToString:@"Vita3K cached native textures"])last_texture_residency=result;
+    return result;
+}
 - (id)newMTL4CommandQueueWithDescriptor:(id)descriptor error:(NSError **)error {return [TestNativeQueue new];}
 - (id)newCommandAllocator {return [TestAllocator new];}
 @end
@@ -192,9 +265,12 @@ static size_t residency_allocations;
 @end
 @interface TestResidentTexture : NSObject
 @property(strong) TestResidentTexture *parentTexture;
-@property NSUInteger allocatedSize;
+@property(nonatomic) NSUInteger allocatedSize;
 @end
 @implementation TestResidentTexture
+@synthesize allocatedSize=_allocatedSize;
+- (NSUInteger)allocatedSize { texture_checkpoint(TextureStage::Size,self);return _allocatedSize; }
+- (void)dealloc { texture_checkpoint(TextureStage::Owner,self); }
 - (BOOL)conformsToProtocol:(Protocol *)p { return p==@protocol(MTLTexture) || [super conformsToProtocol:p]; }
 - (id)buffer { return nil; }
 - (id)heap { return nil; }
@@ -661,11 +737,134 @@ static void check_submission_pools(id<MTLDevice> device) {
         }
         assert(![texture_native.textureResidency.allocations containsObject:texture]);
     }
+    // Native residency driver work and last-owner destruction must not block
+    // independent lease retirement. Producer mutations remain serialized.
+    for(auto stage:{TextureStage::Size,TextureStage::Add,TextureStage::Remove,TextureStage::Commit,TextureStage::Attach,TextureStage::Owner}) {
+        const char *name=stage==TextureStage::Size?"size":stage==TextureStage::Add?"add":stage==TextureStage::Remove?"remove"
+            :stage==TextureStage::Commit?"commit":stage==TextureStage::Attach?"attach":"owner";
+        if(const char *only=std::getenv("VITA3K_TEXTURE_STAGE");only && std::strcmp(only,name))continue;
+        auto q=[[V3KMetal4Queue alloc] initWithDevice:device];
+        auto residency=last_texture_residency;assert(residency);
+        auto active=[TestResidentTexture new];active.allocatedSize=512*1024;
+        assert([q pinTexture:(id<MTLTexture>)active]);
+        const auto identity=reinterpret_cast<uintptr_t>((__bridge void *)active);
+        const void *owner_target=nullptr;
+        if(stage==TextureStage::Remove || stage==TextureStage::Owner) {
+            auto victim=[TestResidentTexture new];victim.allocatedSize=512*1024;
+            assert([q pinTexture:(id<MTLTexture>)victim]);
+            [q unpinTexture:reinterpret_cast<uintptr_t>((__bridge void *)victim)];
+            owner_target=(__bridge const void *)victim;victim=nil;
+        }
+        auto replacement=[TestResidentTexture new];replacement.allocatedSize=512*1024;
+        const void *target=stage==TextureStage::Size?(__bridge const void *)replacement
+            :stage==TextureStage::Owner?owner_target:(__bridge const void *)residency;
+        TextureGate gate{stage,target};texture_gate=&gate;
+        auto [driver_thread,driver]=retirement_async([&]{@autoreleasepool{
+            if(stage==TextureStage::Commit || stage==TextureStage::Attach)[q commitTextureResidency];
+            else {assert([q pinTexture:(id<MTLTexture>)replacement]);[q unpinTexture:reinterpret_cast<uintptr_t>((__bridge void *)replacement)];}
+        }});
+        assert(gate.entered.try_acquire_for(std::chrono::seconds(5)));
+        auto [retire_thread,retire]=retirement_async([&]{[q unpinTexture:identity];});
+        const bool retired=retire.wait_for(std::chrono::seconds(2))==std::future_status::ready;
+        std::binary_semaphore producer_entered{0};
+        auto [producer_thread,producer]=retirement_async([&]{
+            producer_entered.release();assert([q pinTexture:(id<MTLTexture>)active]);[q unpinTexture:identity];
+        });
+        producer_entered.acquire();
+        const bool serialized=producer.wait_for(std::chrono::milliseconds(100))==std::future_status::timeout;
+        gate.release.release();driver.get();retire.get();producer.get();
+        driver_thread.join();retire_thread.join();producer_thread.join();texture_gate=nullptr;
+        assert(retired && "Texture lease retirement blocked behind driver work or last-owner destruction");
+        if(stage!=TextureStage::Owner)assert(serialized && "Native residency mutations overlapped");
+        [q commitTextureResidency];
+        assert([residency.allocations containsObject:active]);
+    }
+    // Exercise actual success/error feedback while the shared native residency
+    // commit is held. Full retirement of the prior submission must still finish.
+    for(bool failed:{false,true}) {
+        auto q=[[V3KMetal4Queue alloc] initWithDevice:device];
+        auto native=(TestNativeQueue *)q.native;
+        auto active=[TestResidentTexture new];active.allocatedSize=512*1024;
+        auto c=[q commandBuffer];[c retainResource:(id<MTLResource>)active];[c commit];
+        auto residency=native.textureResidency;
+        auto pending=[TestResidentTexture new];pending.allocatedSize=512*1024;
+        assert([q pinTexture:(id<MTLTexture>)pending]);[q unpinTexture:reinterpret_cast<uintptr_t>((__bridge void *)pending)];
+        TextureGate gate{TextureStage::Commit,(__bridge const void *)residency};texture_gate=&gate;
+        auto [driver_thread,driver]=retirement_async([&]{[q commitTextureResidency];});
+        assert(gate.entered.try_acquire_for(std::chrono::seconds(5)));
+        auto [feedback_thread,feedback]=retirement_async([&]{@autoreleasepool{[native completeNext:failed];[c waitUntilCompleted];}});
+        const bool finished=feedback.wait_for(std::chrono::seconds(2))==std::future_status::ready;
+        gate.release.release();driver.get();feedback.get();driver_thread.join();feedback_thread.join();texture_gate=nullptr;
+        assert(finished && "Prior submission feedback blocked behind a native residency commit");
+        auto full=[TestResidentTexture new];full.allocatedSize=1024*1024;
+        assert([q pinTexture:(id<MTLTexture>)full]);[q unpinTexture:reinterpret_cast<uintptr_t>((__bridge void *)full)];
+        assert(residency.allocations.count==1 && [residency.allocations containsObject:full]);
+    }
+    // Failed allocation before/after idle eviction cannot leak a policy user,
+    // lose an active owner, or leave stale native membership after recovery.
+    bool allocation_failed=false,allocation_succeeded=false;
+    for(int failure=0;failure<3;++failure) {
+        auto q=[[V3KMetal4Queue alloc] initWithDevice:device];auto residency=last_texture_residency;
+        auto active=[TestResidentTexture new];active.allocatedSize=512*1024;
+        auto idle=[TestResidentTexture new];idle.allocatedSize=512*1024;
+        assert([q pinTexture:(id<MTLTexture>)active]);assert([q pinTexture:(id<MTLTexture>)idle]);
+        [q unpinTexture:reinterpret_cast<uintptr_t>((__bridge void *)idle)];
+        auto incoming=[TestResidentTexture new];incoming.allocatedSize=512*1024;bool accepted=false;
+        fail_texture_allocation=failure;
+        try {accepted=[q pinTexture:(id<MTLTexture>)incoming];allocation_succeeded|=accepted;}
+        catch(const std::bad_alloc &){allocation_failed=true;}
+        fail_texture_allocation=-1;
+        assert([residency.allocations containsObject:active]);
+        if(!accepted){assert(![residency.allocations containsObject:incoming]);assert([q pinTexture:(id<MTLTexture>)incoming]);}
+        [q unpinTexture:reinterpret_cast<uintptr_t>((__bridge void *)incoming)];
+        [q unpinTexture:reinterpret_cast<uintptr_t>((__bridge void *)active)];
+        auto full=[TestResidentTexture new];full.allocatedSize=1024*1024;
+        assert([q pinTexture:(id<MTLTexture>)full]);[q unpinTexture:reinterpret_cast<uintptr_t>((__bridge void *)full)];
+        assert(residency.allocations.count==1&&[residency.allocations containsObject:full]);
+    }
+    assert(allocation_failed&&allocation_succeeded);
+    // Status/error/timing and late completion callbacks must remain available
+    // while driver retirement stalls. The full waiter must still await it.
+    for(auto stage:{RetireStage::Allocator,RetireStage::Arguments,RetireStage::Resource,RetireStage::Residency})
+    for(bool failed:{false,true}) {
+        const char *name=stage==RetireStage::Allocator?"allocator":stage==RetireStage::Arguments?"arguments"
+            :stage==RetireStage::Resource?"resource":"residency";
+        if(const char *only=std::getenv("VITA3K_RETIRE_STAGE");only && std::strcmp(only,name))continue;
+        if(failed && stage==RetireStage::Arguments)continue; // Failed bindings are discarded, not reset.
+        auto gated_queue=[[V3KMetal4Queue alloc] initWithDevice:device];
+        auto gated_native=(TestNativeQueue *)gated_queue.native;
+        auto commands=[gated_queue commandBuffer];
+        (void)render(commands);
+        auto owner=[RetiringTestOwner new];[commands retainObject:owner];owner=nil;
+        const auto owners_before=retired_test_owners.load();
+        [commands commit];
+        RetireGate gate(stage);retire_gate=&gate;
+        auto [feedback_thread,feedback]=retirement_async([&]{@autoreleasepool{[gated_native completeNext:failed];}});
+        assert(gate.entered.try_acquire_for(std::chrono::seconds(5)));
+        std::atomic<bool> late_handler=false;
+        auto [reader_thread,reader]=retirement_async([&]{
+            const auto status=commands.status;
+            assert(bool(commands.error)==failed && commands.GPUStartTime==1 && commands.GPUEndTime==2);
+            [commands addCompletedHandler:^(V3KMetal4Commands *){late_handler=true;}];
+            return status;
+        });
+        auto [waiter_thread,waiter]=retirement_async([&]{[commands waitUntilCompleted];});
+        const bool metadata_ready=reader.wait_for(std::chrono::seconds(2))==std::future_status::ready;
+        const bool waiter_blocked=waiter.wait_for(std::chrono::milliseconds(100))==std::future_status::timeout;
+        gate.release.release();feedback.get();const auto status=reader.get();waiter.get();
+        feedback_thread.join();reader_thread.join();waiter_thread.join();retire_gate=nullptr;
+        assert(metadata_ready && "Completed GPU metadata blocked behind driver/resource retirement");
+        assert(waiter_blocked && late_handler && retired_test_owners==owners_before+1);
+        assert(status==(failed?MTLCommandBufferStatusError:MTLCommandBufferStatusCompleted));
+    }
     method_setImplementation(method,original);
     tables=nil;
     std::cout << "PASS submission pools: actual feedback retirement, delayed distinct leases, handlers before reset, all 175 bindings cleared, 1000 reuses, GPU-error discard and 64-table/8-residency idle bounds\n";
     std::cout << "PASS cached guest residency: 1000 submissions reuse one committed set, subranges preserve lease, cache replacement/clear retain pending users through success/error feedback\n";
     std::cout << "PASS native texture residency: 1000 unchanged submissions commit membership once, views share roots, bounded idle eviction preserves active GPU users, cancellation and success/error retirement release pins\n";
+    std::cout << "PASS texture residency locking: observed size/add/remove/commit/attach/last-owner gates permit independent lease retirement; native mutations stay serialized and membership preserved; no GPU/app\n";
+    std::cout << "PASS texture residency feedback/recovery: actual success/error retirement finishes during shared driver commit; allocation failures preserve active owners, reconcile idle evictions and recover without leaked leases\n";
+    std::cout << "PASS completion locking: observed allocator/argument/resource/residency retirement gates permit independent status/error/timing/late handlers; full completion waits for all cleanup, success/error ownership preserved; no GPU/app\n";
 }
 
 // COLLISION_ARENA_HOOK

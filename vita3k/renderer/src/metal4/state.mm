@@ -985,6 +985,7 @@ struct MetalState::Impl {
         uint32_t reserved = 0;
     };
     std::mutex stream_snapshot_mutex;
+    std::mutex stream_snapshot_allocation_mutex;
     std::vector<uint8_t> stream_snapshot_ring;
     VertexSnapshotOwners stream_snapshot_owners;
     uint64_t stream_snapshot_cursor = 0;
@@ -1654,6 +1655,25 @@ void MetalState::precompile_shader(const ShadersHash &hash) {
                 }
             }
             drain_shaders();
+            // Pipeline variants for one cached pair are independent after
+            // their shaders are resident. Overlap at most two driver calls,
+            // retaining descriptors in workers and publishing on this thread.
+            std::deque<std::pair<std::string, std::future<Impl::PipelineResult>>> warming_pipelines;
+            const auto retire_pipeline = [&] {
+                auto [key, future] = std::move(warming_pipelines.front());
+                warming_pipelines.pop_front();
+                try {
+                    auto result = future.get();
+                    require(result.pipeline != nil, result.error.empty() ? "compiler returned no pipeline" : result.error);
+                    impl->pipelines[key] = result.pipeline;
+                    ++pipelines_count_precompiled;
+                } catch (const std::exception &error) {
+                    remember_warmup_failure(impl->warmup_failed_pipelines, key, "pipeline", error.what());
+                }
+            };
+            const auto drain_pipelines = [&] {
+                while (!warming_pipelines.empty()) retire_pipeline();
+            };
             if (!render_abort.load(std::memory_order_relaxed)) {
                 for (auto &saved : impl->device->cached_pipeline_templates(hex_string(hash.frag), hex_string(hash.vert))) {
                     if (render_abort.load(std::memory_order_relaxed)) break;
@@ -1661,7 +1681,11 @@ void MetalState::precompile_shader(const ShadersHash &hash) {
                     if (const auto found = impl->pipelines.find(saved.key);
                         found != impl->pipelines.end() && found->second) continue;
                     try {
-                        if (saved.fragment_key.starts_with("metal-depth-only")) {
+                        if (saved.fragment_key.starts_with("metal-depth-only")
+                            && !impl->shaders.contains(saved.fragment_key)) {
+                            // Keep the combined shader/pipeline worker limit
+                            // when a depth-only helper still needs compilation.
+                            drain_pipelines();
                             warm_shader(saved.fragment_key, shader::metal::Stage::Fragment, false);
                             drain_shaders();
                         }
@@ -1676,16 +1700,23 @@ void MetalState::precompile_shader(const ShadersHash &hash) {
                             || std::string_view(fragment->second->function.name.UTF8String ?: "") != saved.fragment_function) continue;
                         saved.descriptor.vertexFunction = vertex->second->function;
                         saved.descriptor.fragmentFunction = fragment->second->function;
-                        std::string error;
-                        auto pipeline = impl->device->create_pipeline(saved.descriptor, error);
-                        require(pipeline != nil, error.empty() ? "compiler returned no pipeline" : error);
-                        impl->pipelines[saved.key] = pipeline;
-                        ++pipelines_count_precompiled;
+                        if (warming_pipelines.size() == 2) retire_pipeline();
+                        Device *device = impl->device.get();
+                        MTLRenderPipelineDescriptor *descriptor = [saved.descriptor copy];
+                        warming_pipelines.emplace_back(saved.key, std::async(std::launch::async,
+                            [device, descriptor]() -> Impl::PipelineResult {
+                                @autoreleasepool {
+                                    Impl::PipelineResult result;
+                                    result.pipeline = device->create_pipeline(descriptor, result.error);
+                                    return result;
+                                }
+                            }));
                     } catch (const std::exception &error) {
                         remember_warmup_failure(impl->warmup_failed_pipelines, saved.key, "pipeline", error.what());
                     }
                 }
             }
+            drain_pipelines();
         } catch (const std::exception &error) {
             // Match Plus: a cache loading failure is not a render-thread failure.
             LOG_WARN("Metal: cached program pair warmup skipped: {}", error.what());
@@ -1710,7 +1741,9 @@ void MetalState::snapshot_vertex_streams(MemState &mem, CommandList &list) {
         if (cmd->opcode == CommandOpcode::MidSceneFlush)
             from = cmd == list.last ? nullptr : cmd->next;
 
-    const std::lock_guard lock(impl->stream_snapshot_mutex);
+    // Destroy an unused allocation only after releasing the shared ring lock.
+    std::vector<uint8_t> initial_ring;
+    std::unique_lock lock(impl->stream_snapshot_mutex);
     if (impl->stream_snapshots_disabled) return;
     for (Command *cmd = from; cmd; cmd = cmd == list.last ? nullptr : cmd->next) {
         if (cmd->opcode != CommandOpcode::SetState) continue;
@@ -1725,7 +1758,21 @@ void MetalState::snapshot_vertex_streams(MemState &mem, CommandList &list) {
             && end <= uint64_t(UINT32_MAX) - 4095
             && is_valid_addr_range(mem, stream.address(), Address(end))) {
             auto &ring = impl->stream_snapshot_ring;
-            if (ring.empty()) ring.resize(Impl::STREAM_SNAPSHOT_RING_SIZE);
+            if (ring.empty()) {
+                lock.unlock();
+                // Only first-time producers wait here. Render lookups can
+                // reject expired handles while the 64 MiB ring is allocated.
+                const std::lock_guard allocation(impl->stream_snapshot_allocation_mutex);
+                lock.lock();
+                if (impl->stream_snapshots_disabled) return;
+                if (ring.empty()) {
+                    lock.unlock();
+                    initial_ring.resize(Impl::STREAM_SNAPSHOT_RING_SIZE);
+                    lock.lock();
+                    if (impl->stream_snapshots_disabled) return;
+                    if (ring.empty()) ring.swap(initial_ring);
+                }
+            }
             const size_t slot = (sizeof(Impl::StreamSnapshotHeader) + size + 63) & ~size_t(63);
             handle = impl->stream_snapshot_cursor;
             size_t offset = size_t(handle % ring.size());
@@ -1771,16 +1818,24 @@ std::shared_ptr<const std::vector<uint8_t>> MetalState::vertex_stream_snapshot(u
     return impl->stream_snapshot_owners.get(handle, {bytes, size});
 }
 void MetalState::disable_vertex_stream_snapshots() {
-    const std::lock_guard lock(impl->stream_snapshot_mutex);
-    impl->stream_snapshots_disabled = true;
-    impl->stream_snapshot_owners.clear();
-    std::vector<uint8_t>().swap(impl->stream_snapshot_ring);
+    VertexSnapshotOwners retired_owners;
+    std::vector<uint8_t> retired_ring;
+    {
+        const std::lock_guard lock(impl->stream_snapshot_mutex);
+        impl->stream_snapshots_disabled = true;
+        std::swap(retired_owners, impl->stream_snapshot_owners);
+        retired_ring.swap(impl->stream_snapshot_ring);
+    }
 }
 void MetalState::reset_vertex_stream_snapshots() {
-    const std::lock_guard lock(impl->stream_snapshot_mutex);
-    impl->stream_snapshots_disabled = false;
-    impl->stream_snapshot_owners.clear();
-    std::vector<uint8_t>().swap(impl->stream_snapshot_ring);
+    VertexSnapshotOwners retired_owners;
+    std::vector<uint8_t> retired_ring;
+    {
+        const std::lock_guard lock(impl->stream_snapshot_mutex);
+        impl->stream_snapshots_disabled = false;
+        std::swap(retired_owners, impl->stream_snapshot_owners);
+        retired_ring.swap(impl->stream_snapshot_ring);
+    }
     // Keep handles monotonic so an old command cannot match a new slot after
     // GXM termination/reinitialization on the same MetalState.
 }
@@ -3478,6 +3533,7 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
         ctx.impl->raw_render_color = nil;
         ctx.impl->raw_attachment = nil;
         ctx.impl->raw_clip_snapshot = nil;
+        bool seed_color_samples = false;
         bool seed_raw_color = false;
         bool seed_raw_samples = false;
         if (surface.data) {
@@ -3662,12 +3718,7 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
                         MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView,samples);
                     entry.multisample_dirty=true;
                 }
-                if (entry.multisample_dirty) {
-                    if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
-                    impl->caster->seed_multisample(entry.color,entry.multisample_color,ctx.impl->sample_scale,ctx.impl->expanded_color,
-                        ctx.impl->expanded_color ? surface.width : 0,ctx.impl->expanded_color ? surface.height : 0);
-                    entry.multisample_dirty=false;
-                }
+                seed_color_samples=entry.multisample_dirty;
             }
             ctx.impl->render_color=samples>1 ? entry.multisample_color : entry.color;
             if (gxm::get_base_format(surface.colorFormat)==SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16) {
@@ -3847,6 +3898,16 @@ void MetalState::set_context(MetalContext &ctx, MemState &mem) {
         } else ctx.impl->transient_depth = selected;
         ctx.impl->depth = selected;
         ctx.impl->commands = scene_command_buffer(*impl->device);
+        if (seed_color_samples) {
+            // Seed and consume on this queue in the same submission. No CPU
+            // readback needs these samples before the scene's first draw.
+            if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+            impl->caster->seed_multisample(ctx.impl->color,ctx.impl->render_color,
+                ctx.impl->sample_scale,ctx.impl->expanded_color,
+                ctx.impl->expanded_color ? surface.width : 0,
+                ctx.impl->expanded_color ? surface.height : 0,ctx.impl->commands);
+            impl->surfaces.at(surface.data.address()).multisample_dirty=false;
+        }
         if (seed_raw_color) {
             // Follow prior submissions on the same queue. A CPU getBytes here
             // could race the previous scene's deferred color producer.
@@ -5461,8 +5522,15 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     "Metal: cube fallback requires a square 2D source");
                 const uintptr_t key=reinterpret_cast<uintptr_t>((__bridge void *)source);
                 auto found=impl->cube_aliases.find(key);
+                const bool queued_cube=!capture_draw && !impl->sync_draws;
                 if (found==impl->cube_aliases.end()) {
-                    finish(ctx);
+                    // The uploaded 2D image is immutable until replaced by a
+                    // new upload allocation. Copy and sample all six faces on
+                    // the scene queue; no CPU consumer needs the copied bytes.
+                    if (queued_cube) {
+                        mid_scene_flush(ctx,false);
+                        if (!ctx.impl->commands) ctx.impl->commands=scene_command_buffer(*impl->device);
+                    } else finish(ctx);
                     auto desc=[MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:source.pixelFormat
                         size:source.width mipmapped:NO];
                     desc.mipmapLevelCount=source.mipmapLevelCount;
@@ -5470,8 +5538,9 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                     desc.usage=MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView;
                     id<MTLTexture> replica=[impl->device->native_device() newTextureWithDescriptor:desc];
                     require(replica!=nil,"Metal: cube fallback allocation failed");
-                    auto commands=[impl->device->command_queue() commandBuffer];
+                    auto commands=queued_cube ? ctx.impl->commands : scene_command_buffer(*impl->device);
                     auto blit=[commands blitCommandEncoder];
+                    require(blit!=nil,"Metal: cannot encode cube fallback copy");
                     for (uint32_t mip=0;mip<source.mipmapLevelCount;++mip) {
                         const uint32_t width=std::max(1u,uint32_t(source.width)>>mip);
                         for (uint32_t face=0;face<6;++face)
@@ -5481,16 +5550,26 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
                                 destinationOrigin:MTLOriginMake(0,0,0)];
                     }
                     [blit endEncoding];
-                    std::string error;
-                    require(impl->device->submit_and_wait(commands,error),error);
+                    if (!queued_cube) {
+                        std::string error;
+                        require(impl->device->submit_and_wait(commands,error),error);
+                    }
                     if (impl->cube_aliases.size()>=8) impl->cube_aliases.erase(impl->cube_aliases.begin());
                     found=impl->cube_aliases.emplace(key,Impl::CubeAlias{source,replica}).first;
                     LOG_INFO("Metal: repeated 2D fallback texture over six cube faces at {:#x}",address);
                 }
                 found->second.last_used_frame = impl->frame_timestamp;
                 if (raw_cast_requested && raw_texture_snapshot_supported(found->second.cube)) {
-                    if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
-                    prepared_images[index]=impl->caster->raw_texture_snapshot(found->second.cube);
+                    prepared_images[index]=raw_texture_snapshot_view(found->second.cube);
+                    if (!prepared_images[index]) {
+                        if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+                        if (queued_cube) {
+                            mid_scene_flush(ctx,false);
+                            if (!ctx.impl->commands) ctx.impl->commands=scene_command_buffer(*impl->device);
+                        }
+                        prepared_images[index]=impl->caster->raw_texture_snapshot(found->second.cube,
+                            queued_cube ? ctx.impl->commands : nil);
+                    }
                     require(prepared_images[index]!=nil,"Metal: repeated cube raw surface carrier failed");
                     texture_mip_info[index].control[3]=1;
                 } else prepared_images[index]=sampling_view(found->second.cube,gxm::get_format(texture),nullptr);
@@ -5670,8 +5749,17 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             mip_info.control[3]=raw_cast;
             if (rendered.empty()) {
                 if (raw_cast) {
-                    if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
-                    uploaded=impl->caster->raw_texture_snapshot(base_image);
+                    uploaded=raw_texture_snapshot_view(base_image);
+                    if (!uploaded) {
+                        if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+                        const bool queued_upload=!capture_draw && !impl->sync_draws;
+                        if (queued_upload) {
+                            mid_scene_flush(ctx,false);
+                            if (!ctx.impl->commands) ctx.impl->commands=scene_command_buffer(*impl->device);
+                        }
+                        uploaded=impl->caster->raw_texture_snapshot(base_image,
+                            queued_upload ? ctx.impl->commands : nil);
+                    }
                     require(uploaded!=nil,"Metal: uploaded raw surface carrier failed");
                 }
                 prepared_images[index]=uploaded;continue;
@@ -6401,9 +6489,10 @@ void MetalState::draw(MetalContext &ctx, MemState &mem, SceGxmPrimitiveType prim
             auto &surface=impl->surfaces.at(ctx.impl->guest_color.data.address());
             if (surface.multisample_dirty) {
                 if (!impl->caster) impl->caster=std::make_unique<SurfaceCaster>(*impl->device);
+                if (!ctx.impl->commands) ctx.impl->commands=scene_command_buffer(*impl->device);
                 impl->caster->seed_multisample(surface.color,ctx.impl->render_color,ctx.impl->sample_scale,ctx.impl->expanded_color,
                     ctx.impl->expanded_color ? surface.guest.width : 0,
-                    ctx.impl->expanded_color ? surface.guest.height : 0);
+                    ctx.impl->expanded_color ? surface.guest.height : 0,ctx.impl->commands);
                 surface.multisample_dirty=false;
             }
             if (ctx.impl->raw_render_color && surface.raw_multisample_dirty) {

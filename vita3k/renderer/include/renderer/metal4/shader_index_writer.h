@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <list>
 #include <filesystem>
 #include <functional>
 #include <mutex>
@@ -18,6 +19,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 
@@ -55,34 +57,40 @@ private:
     std::chrono::milliseconds debounce;
     std::mutex mutex;
     std::condition_variable wake;
-    std::vector<Pair> pending;
+    // Only new records enter this queue. Growing it must not relocate the
+    // loaded history or a blocked writer's entire backlog on the render thread.
+    struct Block { std::array<Pair, 64> pairs; size_t size = 0; };
+    std::list<Block> pending;
     size_t submitted = 0;
+    bool initial_pending = false;
     bool stopping = false;
     bool failed = false;
     Stats statistics;
     std::thread worker;
 
-    void work() {
-        std::vector<Pair> history;
+    void work(std::vector<Pair> history) {
         for (;;) {
-            std::vector<Pair> additions;
+            std::list<Block> additions;
             {
                 std::unique_lock lock(mutex);
-                wake.wait(lock, [&] { return stopping || !pending.empty(); });
-                if (pending.empty() && stopping) return;
+                wake.wait(lock, [&] { return stopping || initial_pending || !pending.empty(); });
+                if (!initial_pending && pending.empty() && stopping) return;
                 // Fixed window, not a reset-on-every-draw timer: continuous
                 // shader discovery cannot postpone persistence indefinitely.
                 if (!stopping) wake.wait_for(lock, debounce, [&] { return stopping; });
                 additions.swap(pending);
+                initial_pending = false;
             }
             std::string error;
             size_t byte_count = 0;
             std::vector<uint8_t> bytes;
             try {
-                const size_t count = history.size() + additions.size();
+                size_t count = history.size();
+                for (const auto &block:additions) count += block.size;
                 if (history.capacity() < count)
                     history.reserve(std::min(max_pairs, std::max(count, history.capacity() * 2)));
-                history.insert(history.end(), additions.begin(), additions.end());
+                for (const auto &block:additions)
+                    history.insert(history.end(), block.pairs.begin(), block.pairs.begin() + block.size);
                 const size_t header = sizeof(size_t) + 2 * sizeof(uint32_t);
                 bytes.resize(header + count * sizeof(Pair));
                 std::memcpy(bytes.data(), &count, sizeof(count));
@@ -118,24 +126,35 @@ public:
         std::vector<Pair> initial, Sink sink = atomic_write,
         std::chrono::milliseconds debounce = std::chrono::milliseconds(100))
         : path(std::move(destination)), version(version), features(features), sink(std::move(sink)),
-          debounce(debounce), pending(std::move(initial)), submitted(pending.size()) {
+          debounce(debounce), submitted(initial.size()), initial_pending(!initial.empty()) {
         if (submitted > max_pairs) throw std::invalid_argument("Metal: shader index exceeds reader limit");
-        worker = std::thread([this] { work(); });
+        worker = std::thread([this, initial = std::move(initial)]() mutable { work(std::move(initial)); });
     }
     ShaderIndexWriter(const ShaderIndexWriter &) = delete;
     ShaderIndexWriter &operator=(const ShaderIndexWriter &) = delete;
     ~ShaderIndexWriter() { stop(); }
     bool append(const Pair &pair) {
-        {
-            std::lock_guard lock(mutex);
+        std::list<Block> spare;
+        for (;;) {
+            std::unique_lock lock(mutex);
             if (stopping || failed || submitted == max_pairs) return false;
-            if (pending.size() == pending.capacity())
-                pending.reserve(std::min(max_pairs, std::max(size_t(16), pending.capacity() * 2)));
-            pending.push_back(pair);
+            if (pending.empty() || pending.back().size == pending.back().pairs.size()) {
+                if (spare.empty()) {
+                    // A fixed-size block cannot copy the backlog. Allocate it
+                    // without preventing worker progress or another producer.
+                    lock.unlock();
+                    spare.emplace_back();
+                    continue; // Recheck stop, capacity and a racing producer.
+                }
+                pending.splice(pending.end(), spare);
+            }
+            auto &block = pending.back();
+            block.pairs[block.size++] = pair;
             ++submitted;
+            lock.unlock();
+            wake.notify_one();
+            return true;
         }
-        wake.notify_one();
-        return true;
     }
     Stats finish() {
         stop();

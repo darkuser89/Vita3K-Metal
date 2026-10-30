@@ -240,13 +240,17 @@ struct PersistentCache::Impl {
     std::filesystem::path root, programs, native;
     mutable std::mutex mutex;
     CacheStats counters;
+    // Native serialization must not hold up MSL/variant publication or its
+    // warmup readers. Each class keeps FIFO ordering and its own eight slots.
     dispatch_queue_t writer = dispatch_queue_create("org.vita3k.metal.cache-writer", DISPATCH_QUEUE_SERIAL);
+    dispatch_queue_t file_writer = dispatch_queue_create("org.vita3k.metal.cache-file-writer", DISPATCH_QUEUE_SERIAL);
     dispatch_semaphore_t archive_slots = dispatch_semaphore_create(8);
     dispatch_semaphore_t file_slots = dispatch_semaphore_create(8);
     std::map<std::filesystem::path, std::shared_ptr<PipelineArchiveWrite>> pending_archives;
     std::map<std::filesystem::path, id<MTLRenderPipelineState>> pending_render;
     std::map<std::filesystem::path, id<MTLComputePipelineState>> pending_compute;
     std::map<std::filesystem::path, std::shared_ptr<const std::string>> pending_programs;
+    size_t queued_files = 0; // Protected by mutex; includes pipeline indices.
     int lock_fd = -1;
     Impl(Device &d, const std::filesystem::path &path)
         : device(d) {
@@ -379,34 +383,45 @@ struct PersistentCache::Impl {
                         counters.archive_writable = false;
                         io_error("Cannot publish queued native archive");
                     }
-                    {
-                        std::lock_guard lock(mutex);
-                        const auto found = pending_archives.find(destination);
-                        if (found != pending_archives.end() && found->second == archive) {
-                            pending_archives.erase(found);
-                            pending_render.erase(destination);
-                            pending_compute.erase(destination);
-                        }
-                    }
+                    retire_archive(destination, archive);
                     dispatch_semaphore_signal(archive_slots);
                 }
             });
         } catch (...) {
-            {
-                std::lock_guard lock(mutex);
-                const auto found = pending_archives.find(path);
-                if (found != pending_archives.end() && found->second == archive) {
-                    pending_archives.erase(found);
-                    pending_render.erase(path);
-                    pending_compute.erase(path);
-                }
-            }
+            retire_archive(path, archive);
             dispatch_semaphore_signal(archive_slots);
             throw;
         }
     }
+    void retire_archive(const std::filesystem::path &path, const std::shared_ptr<PipelineArchiveWrite> &archive) {
+        decltype(pending_archives)::node_type retired_archive;
+        decltype(pending_render)::node_type retired_render;
+        decltype(pending_compute)::node_type retired_compute;
+        {
+            std::lock_guard lock(mutex);
+            const auto found = pending_archives.find(path);
+            if (found != pending_archives.end() && found->second == archive) {
+                retired_archive = pending_archives.extract(found);
+                retired_render = pending_render.extract(path);
+                retired_compute = pending_compute.extract(path);
+            }
+        }
+        // Releasing a last native pipeline owner can enter the driver. Keep
+        // that work outside the cache mutex, but before its write slot returns.
+    }
     void drain_writes() {
+        // Teardown/full flush still owns both classes until publication ends.
+        dispatch_sync(file_writer, ^{});
         dispatch_sync(writer, ^{});
+    }
+    void drain_index_writes() {
+        {
+            std::lock_guard lock(mutex);
+            if (!queued_files) return;
+        }
+        // Only queued file/index publication can change warmup enumeration.
+        // Native archives alone do not require waiting on the writer here.
+        dispatch_sync(file_writer, ^{});
     }
     void queue_file(const std::filesystem::path &path, std::string bytes, bool program,
         const std::filesystem::path &index_path = {}, std::string index_bytes = {}) {
@@ -414,6 +429,7 @@ struct PersistentCache::Impl {
         // caller never waits with the cache mutex held.
         acquire_write_slot(file_slots, &CacheStats::file_write_slots);
         std::shared_ptr<const std::string> contents;
+        bool registered = false;
         try {
             const auto destination = path;
             const auto index_destination = index_path;
@@ -421,9 +437,11 @@ struct PersistentCache::Impl {
             const auto index = std::make_shared<const std::string>(std::move(index_bytes));
             std::lock_guard lock(mutex);
             if (program) pending_programs.insert_or_assign(destination, contents);
+            ++queued_files;
+            registered = true;
             // Enqueue under the same lock as the pending entry, preserving
             // last-store ordering for simultaneous writes to the same key.
-            dispatch_async(writer, ^{
+            dispatch_async(file_writer, ^{
                 @autoreleasepool {
                     try {
                         std::error_code ec;
@@ -447,6 +465,7 @@ struct PersistentCache::Impl {
                         const auto found = pending_programs.find(destination);
                         if (found != pending_programs.end() && found->second == contents)
                             pending_programs.erase(found);
+                        --queued_files;
                     }
                     dispatch_semaphore_signal(file_slots);
                 }
@@ -457,6 +476,7 @@ struct PersistentCache::Impl {
                 const auto found = pending_programs.find(path);
                 if (found != pending_programs.end() && found->second == contents)
                     pending_programs.erase(found);
+                if (registered) --queued_files;
             }
             dispatch_semaphore_signal(file_slots);
             throw;
@@ -561,7 +581,7 @@ void PersistentCache::store_program(std::string_view key, const shader::metal::P
 std::vector<CachedVariant> PersistentCache::variants(std::string_view guest_hash) {
     // Warmup enumeration requires completed indices, not an in-flight snapshot.
     // Ordinary shader lookup uses pending_programs and never drains the writer.
-    impl->drain_writes();
+    impl->drain_index_writes();
     std::vector<CachedVariant> result;
     if (!valid_guest_hash(guest_hash)) return result;
     std::error_code ec;
@@ -625,7 +645,7 @@ void PersistentCache::store_render_pipeline_template(std::string_view fragment_h
 }
 std::vector<CachedPipeline> PersistentCache::render_pipeline_templates(std::string_view fragment_hash,
     std::string_view vertex_hash) {
-    impl->drain_writes();
+    impl->drain_index_writes();
     std::vector<CachedPipeline> result;
     if (!valid_guest_hash(fragment_hash) || !valid_guest_hash(vertex_hash)) return result;
     const auto directory=impl->native/"warmup"/std::string(fragment_hash)/std::string(vertex_hash);

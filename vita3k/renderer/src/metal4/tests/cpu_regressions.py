@@ -33,12 +33,12 @@ def function(path, signature, source=None):
     return source[begin:end]
 
 
-def run(name, source, directory, extra=(), arguments=()):
+def run(name, source, directory, extra=(), arguments=(), sanitizer='address,undefined'):
     path = directory / (name + '.cpp')
     path.write_text(source)
     binary = directory / name
     command = ['xcrun', 'clang++', '-std=c++23', '-O1', '-g',
-               '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
+               '-fsanitize='+sanitizer, '-fno-omit-frame-pointer',
                '-I' + str(ROOT / 'vita3k/gxm/include'),
                '-I' + str(ROOT / 'vita3k/util/include'), str(path), *extra, '-o', str(binary)]
     subprocess.run(command, check=True)
@@ -336,7 +336,7 @@ def cache_read_concurrency_test(directory, implementation=None):
                    env={**os.environ, 'UBSAN_OPTIONS':'halt_on_error=1', 'TSAN_OPTIONS':'halt_on_error=1'})
 
 
-def cache_write_slots_test(directory):
+def cache_write_slots_test(directory, implementation=None):
     path = 'vita3k/renderer/src/metal4/cache.mm'
     source = Path(__file__).with_name('cache_write_slots.mm').read_text()
     source = source.replace('// STATS_HOOK', '\n'.join(function('vita3k/renderer/include/renderer/metal4/cache.h', x) + ';'
@@ -348,17 +348,23 @@ def cache_write_slots_test(directory):
                               ('// DRAIN_HOOK', '    void drain_writes(')):
         # Keep the body verbatim. Spell out empty default constructors so the
         # brace-based extractor does not mistake an argument initializer for it.
-        implementation = (ROOT / path).read_text().replace(
+        text = (implementation if implementation is not None else (ROOT / path).read_text()).replace(
             'const std::filesystem::path &index_path = {}, std::string index_bytes = {})',
             'const std::filesystem::path &index_path = std::filesystem::path(), std::string index_bytes = std::string())')
-        source = source.replace(marker, function(path, signature, implementation))
+        source = source.replace(marker, function(path, signature, text))
+    drain_index = function(path, '    void drain_index_writes(', text) if 'void drain_index_writes(' in text else (
+        'void drain_index_writes() { drain_writes(); }')
+    source = source.replace('// INDEX_DRAIN_HOOK', drain_index)
+    source = source.replace('// RETIRE_HOOK', function(path, '    void retire_archive(', text)
+                            if 'void retire_archive(' in text else '')
     generated = directory / 'cache_write_slots.mm'; generated.write_text(source)
     binary = directory / 'cache_write_slots'
+    sanitizer = os.environ.get('VITA3K_CACHE_WRITE_SANITIZER', 'address,undefined')
     subprocess.run(['xcrun', 'clang++', '-std=c++23', '-fobjc-arc', '-O1', '-g',
-                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
+                    '-fsanitize='+sanitizer, '-fno-omit-frame-pointer',
                     str(generated), '-framework', 'Foundation', '-o', str(binary)], check=True)
     subprocess.run([str(binary), str(directory / 'cache-slot-files')], check=True,
-                   env={**os.environ, 'UBSAN_OPTIONS':'halt_on_error=1'})
+                   env={**os.environ, 'UBSAN_OPTIONS':'halt_on_error=1', 'TSAN_OPTIONS':'halt_on_error=1'})
 
 
 def guest_publication_test(directory):
@@ -518,7 +524,7 @@ def buffer_test(directory):
     source_path = directory / 'buffer_lifetime.mm'
     source_path.write_text(source)
     command = ['xcrun', 'clang++', '-std=c++23', '-O1', '-g', '-fobjc-arc',
-               '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
+               '-fsanitize='+os.environ.get('VITA3K_BUFFER_SANITIZER', 'address,undefined'), '-fno-omit-frame-pointer',
                '-Wno-nullability-completeness', '-mmacosx-version-min=26.0']
     command += ['-I' + str(ROOT / 'vita3k' / module / 'include')
                 for module in ('renderer', 'shader', 'gxm', 'util')]
@@ -572,15 +578,16 @@ def capture_pass_test(directory):
     subprocess.run([str(binary)], check=True, env={**os.environ, 'UBSAN_OPTIONS': 'halt_on_error=1'})
 
 
-def vertex_snapshot_test(directory):
+def vertex_snapshot_test(directory, implementation=None):
     source = Path(__file__).with_name('vertex_snapshots.cpp').read_text()
-    methods = '\n'.join(function('vita3k/renderer/src/metal4/state.mm', signature)
+    methods = '\n'.join(function('vita3k/renderer/src/metal4/state.mm', signature, implementation)
         for signature in ('void MetalState::snapshot_vertex_streams(',
                           'std::shared_ptr<const std::vector<uint8_t>> MetalState::vertex_stream_snapshot(',
                           'void MetalState::disable_vertex_stream_snapshots(',
                           'void MetalState::reset_vertex_stream_snapshots('))
     run('vertex_snapshots', source.replace('// SNAPSHOT_METHODS_HOOK', methods), directory,
-        ('-I' + str(ROOT / 'vita3k/renderer/include'),))
+        ('-I' + str(ROOT / 'vita3k/renderer/include'),),
+        sanitizer=os.environ.get('VITA3K_VERTEX_SANITIZER', 'address,undefined'))
 
 
 def mip_source():
@@ -958,6 +965,83 @@ def queued_cast_sampling_test(directory):
     subprocess.run(['xcrun', 'clang++', '-std=c++23', '-fobjc-arc', '-O1', '-g',
         '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
         '-I'+str(ROOT/'vita3k/gxm/include'), '-I'+str(ROOT/'vita3k/util/include'), str(output), '-framework', 'Foundation', '-framework', 'Metal', '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True, env={**os.environ, 'UBSAN_OPTIONS':'halt_on_error=1'})
+
+
+def cube_fallback_submission_test(directory, implementation=None, uploaded_only=False):
+    state = 'vita3k/renderer/src/metal4/state.mm'
+    text = implementation if implementation is not None else (ROOT / state).read_text()
+    begin = text.index('                const uintptr_t key=reinterpret_cast<uintptr_t>((__bridge void *)source);')
+    end = text.index('                continue;', begin)
+    source = Path(__file__).with_name('cube_fallback_submission.mm').read_text()
+    textures = 'vita3k/renderer/src/metal4/textures.mm'
+    source = source.replace('// RAW_SUPPORT_HOOK', function(textures, 'bool raw_texture_snapshot_supported('))
+    source = source.replace('// RAW_VIEW_HOOK', function(textures, 'id<MTLTexture> raw_texture_snapshot_view('))
+    source = source.replace('// FALLBACK_HOOK', text[begin:end])
+    source = source.replace('// UPLOADED_HOOK', function(state, '            if (rendered.empty())', text))
+    output = directory / 'cube_fallback_submission.mm'; output.write_text(source)
+    binary = directory / 'cube_fallback_submission'
+    subprocess.run(['xcrun', 'clang++', '-std=c++23', '-fobjc-arc', '-O1', '-g',
+        '-fsanitize=address,undefined', '-fno-omit-frame-pointer', str(output),
+        '-framework', 'Foundation', '-framework', 'Metal', '-o', str(binary)], check=True)
+    environment = {**os.environ, 'UBSAN_OPTIONS':'halt_on_error=1'}
+    if uploaded_only: environment['VITA3K_UPLOADED_RAW_ONLY'] = '1'
+    subprocess.run([str(binary)], check=True, env=environment)
+
+
+def multisample_snapshot_test(directory, implementation=None):
+    textures = 'vita3k/renderer/src/metal4/textures.mm'
+    text = implementation if implementation is not None else (ROOT / textures).read_text()
+    source = Path(__file__).with_name('multisample_snapshot.mm').read_text()
+    expand = function(textures, 'void SurfaceCaster::expand_multisample(', text)
+    source = source.replace('// WAIT_PARAMETER', ',bool = true' if 'bool wait_for_completion)' in expand else '')
+    source = source.replace('// EXPAND_HOOK', expand)
+    source = source.replace('// SNAPSHOT_HOOK', function(textures, 'id<MTLTexture> SurfaceCaster::depth_snapshot(', text))
+    source = source.replace('// BITS_HOOK', function(textures, 'static MTLPixelFormat sample_bits_format(', text))
+    output = directory / 'multisample_snapshot.mm'; output.write_text(source)
+    binary = directory / 'multisample_snapshot'
+    subprocess.run(['xcrun', 'clang++', '-std=c++23', '-fobjc-arc', '-O1', '-g',
+        '-fsanitize=address,undefined', '-fno-omit-frame-pointer', str(output),
+        '-framework', 'Foundation', '-framework', 'Metal', '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True, env={**os.environ, 'UBSAN_OPTIONS':'halt_on_error=1'})
+
+
+def pipeline_warmup_test(directory, implementation=None):
+    state = 'vita3k/renderer/src/metal4/state.mm'
+    source = Path(__file__).with_name('pipeline_warmup.mm').read_text()
+    source = source.replace('// WARMUP_HOOK', function(state,
+        'void MetalState::precompile_shader(', implementation)
+        .replace('MTLRenderPipelineDescriptor', 'WarmupDescriptor'))
+    output = directory / 'pipeline_warmup.mm'; output.write_text(source)
+    binary = directory / 'pipeline_warmup'
+    sanitizer = os.environ.get('VITA3K_WARMUP_SANITIZER', 'address,undefined')
+    subprocess.run(['xcrun', 'clang++', '-std=c++23', '-fobjc-arc', '-O1', '-g',
+        '-fsanitize='+sanitizer, '-fno-omit-frame-pointer',
+        '-I'+str(ROOT/'vita3k/renderer/include'), str(output),
+        '-framework', 'Foundation', '-framework', 'Metal', '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True,
+                   env={**os.environ, 'UBSAN_OPTIONS':'halt_on_error=1', 'TSAN_OPTIONS':'halt_on_error=1'})
+
+
+def msaa_seed_submission_test(directory, implementation=None):
+    state = 'vita3k/renderer/src/metal4/state.mm'
+    text = implementation if implementation is not None else (ROOT / state).read_text()
+    source = Path(__file__).with_name('msaa_seed_submission.mm').read_text()
+    textures = 'vita3k/renderer/src/metal4/textures.mm'
+    source = source.replace('// BITS_HOOK', function(textures, 'static MTLPixelFormat sample_bits_format('))
+    source = source.replace('// SEED_HOOK', function(textures, 'void SurfaceCaster::seed_multisample(')
+                            .replace('MTLRenderPipelineDescriptor', 'SeedPipelineDescriptor'))
+    source = source.replace('// DRAW_HOOK', function(state,
+        '        if (!ctx.impl->encoder && ctx.impl->samples>1 && ctx.impl->guest_color.data)', text))
+    # Old code has no delayed bind block; its actual draw block still exposes
+    # the private submit and fails the same ordering regression below.
+    bind = function(state, '        if (seed_color_samples)', text) if 'if (seed_color_samples)' in text else ''
+    source = source.replace('// BIND_HOOK', bind)
+    output = directory / 'msaa_seed_submission.mm'; output.write_text(source)
+    binary = directory / 'msaa_seed_submission'
+    subprocess.run(['xcrun', 'clang++', '-std=c++23', '-fobjc-arc', '-O1', '-g',
+        '-fsanitize=address,undefined', '-fno-omit-frame-pointer', str(output),
+        '-framework', 'Foundation', '-framework', 'Metal', '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, env={**os.environ, 'UBSAN_OPTIONS':'halt_on_error=1'})
 
 
@@ -1602,6 +1686,37 @@ int main() {
     run('official_lod', source, directory)
 
 
+def color_surface_null_data_test(directory):
+    module = 'vita3k/modules/SceGxm/metal4/SceGxm_metal.inl'
+    shared = 'vita3k/modules/SceGxm/SceGxm.cpp'
+    source = COMMON + r'''
+#include <map>
+#include <renderer/metal4/color_surface.h>
+#include <util/align.h>
+struct EmuEnvState {};
+#define TRACY_FUNC(...)
+#define LOG_WARN(...)
+#define RET_ERROR(x) static_cast<int>(x)
+#define EXPORT(ret, name, ...) ret name(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, __VA_ARGS__)
+#define CALL_EXPORT(name, ...) name(emuenv, thread_id, export_name, __VA_ARGS__)
+namespace gxm {
+''' + function('vita3k/gxm/src/color.cpp', 'SceGxmColorBaseFormat get_base_format(') + '\n'
+    source += function('vita3k/gxm/src/color.cpp', 'size_t bits_per_pixel(') + '\n'
+    source += function('vita3k/renderer/src/metal4/texture_format_metal.cpp',
+                       'bool convert_color_format_to_texture_format_metal3(') + '\n}\n'
+    source += function(shared, 'static int init_texture_base(') + '\n'
+    for name in ('Linear', 'Swizzled', 'Tiled'):
+        source += function(shared, 'EXPORT(int, sceGxmTextureInit' + name + ',') + '\n'
+    source += function(module, 'static void set_linear_strided_texture_stride_metal3(') + '\n'
+    source += function(module, 'int export_sceGxmTextureInitLinearStrided_metal3(') + '\n'
+    source += '#define sceGxmTextureInitLinearStrided export_sceGxmTextureInitLinearStrided_metal3\n'
+    source += function(module, 'int export_sceGxmColorSurfaceInit_metal3(') + '\n'
+    source += Path(__file__).with_name('color_surface_init.cpp').read_text()
+    run('color_surface_null_data', source, directory,
+        ('-I' + str(ROOT / 'vita3k/renderer/include'),
+         '-I' + str(ROOT / 'vita3k/mem/include')))
+
+
 if __name__ == '__main__':
     with tempfile.TemporaryDirectory(prefix='vita3k-metal-cpu-') as temporary:
         directory = Path(temporary)
@@ -1610,6 +1725,7 @@ if __name__ == '__main__':
         presentation_lifetime_test(directory)
         early_mask_rejection_test(directory)
         upstream_lod_test(directory)
+        color_surface_null_data_test(directory)
         empty_mask_visibility_test(directory)
         run('compile_jobs', Path(__file__).with_name('compile_jobs.cpp').read_text(), directory,
             ('-I' + str(ROOT / 'vita3k/renderer/include'),))
@@ -1645,6 +1761,10 @@ if __name__ == '__main__':
         fsr_presentation_test(directory)
         packed_surface_cast_test(directory)
         queued_cast_sampling_test(directory)
+        msaa_seed_submission_test(directory)
+        multisample_snapshot_test(directory)
+        cube_fallback_submission_test(directory)
+        pipeline_warmup_test(directory)
         finish_submission_test(directory)
         linear_surface_patch_test(directory)
         surface_write_patch_test(directory)
