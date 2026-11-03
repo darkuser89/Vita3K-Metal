@@ -161,6 +161,9 @@ void cmd_handle_set_context_metal3(renderer::State &renderer, MemState &mem, Con
         static_cast<metal::MetalContext &>(*render_context).native_record.has_depth_stencil_surface = false;
         // Do not retain a previous scene's format when the new scene disables it.
         render_context->record.depth_stencil_surface = {};
+        render_context->record.depth_stencil_surface.background_depth = 1.0f;
+        render_context->record.depth_stencil_surface.mask = 1;
+        render_context->record.depth_stencil_surface.unk2 = 1;
     }
 
     destroy_command_payload(*helper.cmd);

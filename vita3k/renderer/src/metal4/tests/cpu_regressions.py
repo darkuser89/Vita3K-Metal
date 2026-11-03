@@ -1717,9 +1717,67 @@ namespace gxm {
          '-I' + str(ROOT / 'vita3k/mem/include')))
 
 
+def yuv422_profiles_test(directory):
+    path = 'vita3k/renderer/src/metal4/texture_yuv_metal.cpp'
+    source = r'''#include <gxm/metal4/types.h>
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <iostream>
+#include <vector>
+extern "C" {
+#include <libswscale/swscale.h>
+}
+namespace renderer {
+''' + function('vita3k/renderer/include/renderer/texture_cache.h', 'struct YUVConversionCache') + ';\nnamespace metal {\n'
+    source += function('vita3k/renderer/include/renderer/metal4/texture_formats.h', 'struct YUVConversionCache') + ';\n}\n}\nnamespace renderer::texture {\n'
+    source += '\n'.join(function(path, signature) for signature in (
+        'static bool set_yuv_profile(', 'static SwsContext *get_sws_context(',
+        'void yuv420_texture_to_rgb_metal3(', 'bool yuv422_texture_to_rgb_metal3('))
+    source += '\n}\nnamespace renderer::metal {\n' + function(path, 'void release_yuv_cache(') + '\n}\n'
+    source += Path(__file__).with_name('yuv422_profiles.cpp').read_text()
+    libraries = Path('/Users/jbw/Documents/Vita3K-Metal-Build/build/external/ffmpeg/lib')
+    run('yuv422_profiles', source, directory,
+        ('-I'+str(ROOT/'external/ffmpeg/include'), str(libraries/'libswscale.a'), str(libraries/'libavutil.a'),
+         '-framework','CoreFoundation','-framework','CoreVideo','-framework','VideoToolbox'))
+
+
+def disabled_depth_defaults_test(directory):
+    path = 'vita3k/renderer/src/metal4/scene_metal.cpp'
+    body = function(path, 'void cmd_handle_set_context_metal3(')
+    first = body.index('        // Do not retain a previous scene')
+    last = body.index('\n    }', first)
+    source = r'''#include <renderer/gxm_types.h>
+#include <cassert>
+#include <iostream>
+struct Context { struct { SceGxmDepthStencilSurface depth_stencil_surface; } record; };
+static void disable(Context *render_context) {
+''' + body[first:last] + r'''
+}
+int main() {
+    Context context{};
+    auto &surface=context.record.depth_stencil_surface;
+    surface.depth_data=Ptr<void>(0x1000);surface.stencil_data=Ptr<void>(0x2000);
+    surface.background_depth=0.25f;surface.stencil=27;surface.force_load=1;surface.force_store=1;
+    surface.set_stride(128);surface.set_format(SCE_GXM_DEPTH_STENCIL_FORMAT_DF32);
+    disable(&context);
+    assert(!surface.depth_data&&!surface.stencil_data&&surface.background_depth==1.0f);
+    assert(surface.mask==1&&surface.unk2==1&&!surface.stencil&&!surface.force_load&&!surface.force_store);
+    assert(!surface.unk1&&!surface._type_and_format&&!surface._stride);
+    std::cout<<"PASS disabled depth: prior pointers/depth/stencil/format/load-store reset; official background depth=1, mask=1, unk2=1; no GPU/app\n";
+}
+'''
+    run('disabled_depth_defaults', source, directory,
+        ('-I'+str(ROOT/'vita3k/renderer/include'), '-I'+str(ROOT/'vita3k/mem/include')))
+
+
 if __name__ == '__main__':
     with tempfile.TemporaryDirectory(prefix='vita3k-metal-cpu-') as temporary:
         directory = Path(temporary)
+        yuv422_profiles_test(directory)
+        disabled_depth_defaults_test(directory)
         surface_allocation_test(directory)
         library_reuse_test(directory)
         presentation_lifetime_test(directory)

@@ -15,7 +15,6 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-#include <cpu/functions.h>
 #include <kernel/state.h>
 #include <kernel/sync_primitives.h>
 
@@ -1492,8 +1491,8 @@ void MsgPipe::drain(Receiver &receiver) {
 
 SceSize MsgPipe::available() const {
     SceSize bytes = static_cast<SceSize>(data_buffer.Used());
-    for (const auto *sender : senders)
-        bytes += sender->entry.left;
+    for (const auto &sender : senders)
+        bytes += sender.entry.left;
     return bytes;
 }
 

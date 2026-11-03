@@ -209,6 +209,17 @@ int main(int argc, char **argv) {
     for (auto &reader : readers) reader.join();
     assert(cache.stats().program_hits == after.program_hits + 512);
     assert(cache.stats().rejected_files == before_parallel.rejected_files + 512);
+    // Vulkan's crash-orphan fix addresses filenames that omit configuration.
+    // Metal's binary variant key and file header must reject such cross-key
+    // reuse even without a separate manifest, while retaining safe orphan hits.
+    const std::string old_key("guest\0features-A",16), new_key("guest\0features-B",16);
+    const auto old_path=cache.impl->programs/(digest(old_key)+".mslcache");
+    const auto new_path=cache.impl->programs/(digest(new_key)+".mslcache");
+    write(old_path,program_file(old_key,body));
+    assert(cache.load_program(old_key)&&!cache.load_program(new_key));
+    write(new_path,program_file(old_key,body));assert(!cache.load_program(new_key));
+    write(new_path,program_file(new_key,program_body(16,0,"main_vs","new config")));
+    assert(cache.load_program(new_key)->source=="new config");
     const auto calls = archive_calls.load();
     { std::lock_guard lock(cache.impl->mutex); cache.impl->pending_render[archive] = [NSObject new]; cache.impl->pending_compute[archive] = [NSObject new]; }
     assert(cache.open_render(archive) && cache.open_compute(archive) && archive_calls == calls);
@@ -217,5 +228,5 @@ int main(int argc, char **argv) {
     const auto rejected = cache.stats().rejected_files;
     fs::resize_file(archive, 512ull * 1024 * 1024 + 1); assert(!cache.open_compute(archive));
     assert(cache.stats().rejected_files == rejected + 1 && archive_calls == calls + 1);
-    std::cout << "PASS cache readers: five observed I/O gates permit independent statistics/pending reads; immutable snapshot survives writer removal; stage/feature/invalid file validation; 512 concurrent disk reads and variant scans; pending render/compute fast hits and archive errors; no device/GPU/app\n";
+    std::cout << "PASS cache readers: five observed I/O gates permit independent statistics/pending reads; immutable snapshot survives writer removal; stage/feature/invalid file validation; 512 concurrent disk reads and variant scans; binary configuration keys reject renamed crash-orphan files but retain valid same-key hits; pending render/compute fast hits and archive errors; no device/GPU/app\n";
 }

@@ -23,7 +23,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <iterator>
 #include <memory>
 #include <sstream>
@@ -31,16 +30,44 @@
 
 struct CPUState;
 struct CPUContext;
-struct CPUInterface;
 
-typedef std::unique_ptr<CPUState, std::function<void(CPUState *)>> CPUStatePtr;
-typedef std::unique_ptr<CPUInterface> CPUInterfacePtr;
+using CPUStatePtr = std::unique_ptr<CPUState>;
 
 inline constexpr std::size_t MAX_CORE_COUNT = 150;
 
-struct CPUContext {
-    CPUContext() = default;
+// How guest code goes on after a checkpoint
+enum class GuestResume : uint8_t {
+    run,
+    // One instruction, for the debugger
+    step,
+    // The function returned, the thread is ending, or it doesn't run on this host thread now
+    leave,
+};
 
+// Why guest code stopped, passed from the CPU to the checkpoint
+struct GuestStop {
+    // The stop came right after a kernel call, or the invocation starts inside one
+    bool after_kernel_call = false;
+    // A finished step or a breakpoint stopped guest code
+    bool debugger_stop = false;
+    // The function returned to the return address
+    bool returned = false;
+};
+
+// The kernel side of one thread's guest code, which the CPU calls without the thread's lock
+struct GuestBoundary {
+    // Checks the thread at a stop and says how guest code goes on, blocking while something holds it
+    virtual GuestResume checkpoint(GuestStop stop) = 0;
+    // Runs the import with this NID, which guest code called
+    virtual void call_import(uint32_t nid) = 0;
+    // Runs the guest's abort handler for the abort the CPU noted at fault_addr
+    virtual void dispatch_abort(Address fault_addr) = 0;
+
+protected:
+    ~GuestBoundary() = default;
+};
+
+struct CPUContext {
     std::array<uint32_t, 16> cpu_registers{};
     std::array<float, 64> fpu_registers{};
     uint32_t cpsr = 0;
@@ -81,14 +108,9 @@ struct CPUContext {
         cpu_registers[15] = val;
     }
 
-    std::string description() {
-        uint32_t pc = get_pc();
-        uint32_t sp = get_sp();
-        uint32_t lr = get_lr();
-
-        std::string str;
+    std::string description() const {
+        std::string str = fmt::format("PC: 0x{:0>8x},   SP: 0x{:0>8x},   LR: 0x{:0>8x}\n", get_pc(), get_sp(), get_lr());
         auto back_it = std::back_inserter(str);
-        fmt::format_to(back_it, "PC: 0x{:0>8x},   SP: 0x{:0>8x},   LR: 0x{:0>8x}\n", pc, sp, lr);
         for (int a = 0; a < 6; a++) {
             fmt::format_to(back_it, "r{: <2}: 0x{:0>8x}   r{: <2}: 0x{:0>8x}\n", a, cpu_registers[a], a + 6, cpu_registers[a + 6]);
         }
@@ -96,9 +118,4 @@ struct CPUContext {
         fmt::format_to(back_it, "Thumb: {}\n", thumb());
         return str;
     }
-};
-
-union DoubleReg {
-    double d;
-    float f[2];
 };

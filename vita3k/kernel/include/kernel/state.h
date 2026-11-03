@@ -143,9 +143,8 @@ struct KernelState {
     CorenumAllocator corenum_allocator;
     CallImportFunc call_import;
 
-    // Shared NOP+WFI sentinel used by the Dynarmic as the halt return address
+    // Thumb NOP and WFI that guest functions called by the kernel return to
     Block halt_instruction;
-    Address halt_instruction_pc;
 
     ObjectStore obj_store;
 
@@ -164,10 +163,6 @@ struct KernelState {
     static constexpr int EXCEPTION_HANDLER_MAX = 3;
     std::atomic<Address> exception_handlers[EXCEPTION_HANDLER_MAX]{};
     std::condition_variable thread_deleted_cond;
-    // Guarded by mutex. A removed guest thread may still be destroying its
-    // CPU, stack and TLS on the detached host thread.
-    size_t active_host_threads = 0;
-    bool process_exiting = false;
 
     SceUID get_next_uid() {
         return next_uid++;
@@ -176,9 +171,8 @@ struct KernelState {
     bool init(MemState &mem, const CallImportFunc &call_import, bool cpu_opt);
     void deinit(MemState &mem);
     void load_process_param(MemState &mem, Ptr<uint32_t> ptr);
-    ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point = Ptr<const void>(0));
     // Creates a dormant thread with these creation arguments, attr without THREAD_ATTR_USER, or returns null
-    ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, SceUInt32 attr, const SceKernelThreadOptParam *option);
+    ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, SceUInt32 attr);
 
     ThreadStatePtr get_thread(SceUID thread_id);
 
@@ -193,11 +187,11 @@ struct KernelState {
         const std::lock_guard<std::mutex> lock(mutex);
         return threads_paused;
     }
-    void pause_threads();
-    void resume_threads();
-    // Stops every thread for the debugger, and the threads created until the resume start stopped
-    void suspend_threads();
-    void resume_suspended_threads();
+    // Pauses every thread, and the threads created until the pause ends, or lets them run again
+    void set_threads_paused(bool paused);
+    // Stops every thread for the debugger, and the threads created until it lets them go, or lets
+    // them run again
+    void set_threads_suspended(bool suspended);
 
     // Kill all guest threads and block until they have exited. Must only be called from a host thread.
     void process_exit();
@@ -214,4 +208,6 @@ private:
     std::atomic<SceUID> next_uid{ 1 };
     bool threads_paused = false;
     bool threads_suspended = false;
+    // The process is exiting, so a thread still being created ends as well
+    bool process_exiting = false;
 };

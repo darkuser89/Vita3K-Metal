@@ -908,7 +908,6 @@ static void display_entry_thread(EmuEnvState &emuenv) {
 #endif
 
     auto &display_queue = emuenv.gxm.display_queue;
-    const Address callback_address = emuenv.gxm.params.displayQueueCallback.address();
     const ThreadStatePtr display_thread = emuenv.kernel.get_thread(emuenv.gxm.display_queue_thread);
     if (!display_thread) {
         LOG_CRITICAL("display_thread not found. thid:{}", emuenv.gxm.display_queue_thread);
@@ -946,7 +945,7 @@ static void display_entry_thread(EmuEnvState &emuenv) {
         emuenv.display.current_sync_object = display_callback->new_sync.address();
 
         // Now run callback
-        display_thread->run_guest_function(callback_address, display_callback->data);
+        display_thread->run_guest_function(display_callback->data);
 
         // Notifies the renderer of the completion of the callback for the display_entry.
         // The last_display of the entry, when pushed into the queue, is guaranteed to be timestamp_ahead + 1 at the time of the call.
@@ -964,12 +963,12 @@ static Ptr<void> gxmRunDeferredMemoryCallback(KernelState &kernel, const MemStat
     const std::lock_guard<std::mutex> guard(global_lock);
 
     const ThreadStatePtr thread = kernel.get_thread(thread_id);
-    const Address final_size_addr = stack_alloc(*thread->cpu, 4);
+    const Address final_size_addr = thread->cpu->stack_alloc(4);
 
     Ptr<void> result(thread->run_callback(callback.address(), { userdata.address(), size, final_size_addr }));
 
     return_size = *Ptr<std::uint32_t>(final_size_addr).get(mem);
-    stack_free(*thread->cpu, 4);
+    thread->cpu->stack_free(4);
 
     return result;
 }
@@ -3172,7 +3171,7 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
     emuenv.gxm.display_queue.maxPendingCount_ = max_queue_size;
 
     const ThreadStatePtr main_thread = emuenv.kernel.get_thread(thread_id);
-    const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", Ptr<void>(0), SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, 0, nullptr);
+    const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", emuenv.gxm.params.displayQueueCallback, SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, 0);
     if (!display_queue_thread) {
         return RET_ERROR(SCE_GXM_ERROR_DRIVER);
     }

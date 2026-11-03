@@ -23,22 +23,84 @@
 #include <util/types.h>
 
 #include <atomic>
+#include <initializer_list>
+#include <optional>
+#include <string>
 
+// The CPU of one guest thread, which a backend like DynarmicCPU implements
 struct CPUState {
-    CPUState() = default;
-
-    SceUID thread_id = 0;
-    MemState *mem = nullptr;
+    const SceUID thread_id;
+    MemState &mem;
+    // The core number the kernel gave the thread
+    const std::size_t processor_id;
     DisasmState disasm;
 
-    CPUInterfacePtr cpu;
-    bool svc_called;
-    uint32_t svc;
+    // Return address place_call() writes to LR. Execution stops there.
+    Address return_pc = 0;
 
-    // Exception handler support (kubridge abort handlers)
-    // These are set by the page fault callback (signal-safe atomics)
-    // and consumed by run_loop after HaltExecution returns.
+    // Set by the kubridge fault handler from a signal, read by the CPU after it halts
     std::atomic<bool> abort_pending{ false };
     std::atomic<uint32_t> abort_fault_addr{ 0 };
-    std::atomic<bool> abort_is_write{ false };
+
+    virtual ~CPUState() = default;
+
+    // Runs guest code from the PC until the function returns r0 or a checkpoint says to leave
+    virtual std::optional<uint32_t> execute(GuestBoundary &boundary, bool from_kernel_call) = 0;
+    // Asks the CPU to stop guest code soon so it reaches a checkpoint, safe in a signal handler
+    virtual void request_stop() = 0;
+
+    virtual uint32_t get_reg(uint8_t idx) = 0;
+    virtual void set_reg(uint8_t idx, uint32_t val) = 0;
+
+    virtual uint32_t get_cpsr() = 0;
+    virtual void set_cpsr(uint32_t val) = 0;
+
+    virtual uint32_t get_tpidruro() = 0;
+    virtual void set_tpidruro(uint32_t val) = 0;
+
+    virtual uint32_t get_tpidrurw() = 0;
+    virtual void set_tpidrurw(uint32_t val) = 0;
+
+    virtual float get_float_reg(uint8_t idx) = 0;
+    virtual void set_float_reg(uint8_t idx, float val) = 0;
+
+    virtual uint32_t get_fpscr() = 0;
+    virtual void set_fpscr(uint32_t val) = 0;
+
+    virtual CPUContext save_context() = 0;
+    virtual void load_context(const CPUContext &ctx) = 0;
+    virtual void invalidate_jit_cache(Address start, size_t length) = 0;
+
+    virtual bool hit_breakpoint() = 0;
+    virtual void set_log_code(bool log) = 0;
+    virtual void set_log_mem(bool log) = 0;
+    virtual bool get_log_mem() = 0;
+
+    uint32_t get_sp() { return get_reg(13); }
+    void set_sp(uint32_t val) { set_reg(13, val); }
+    uint32_t get_lr() { return get_reg(14); }
+    void set_lr(uint32_t val) { set_reg(14, val); }
+    uint32_t get_pc() { return get_reg(15); }
+    // Sets the PC, and the Thumb state from bit 0
+    void set_pc(uint32_t val);
+    bool is_thumb_mode() { return get_cpsr() & 0x20; }
+
+    // Sets up a call of fn with args: the first four in r0 to r3, the rest on the stack, and the
+    // return address in LR
+    void place_call(Address fn, std::initializer_list<uint32_t> args);
+    uint32_t stack_alloc(size_t size);
+    void stack_free(size_t size);
+
+    // Debugging helpers
+    std::string disassemble(uint64_t at, bool thumb, uint16_t *insn_size = nullptr);
+    std::string disassemble(uint64_t at, uint16_t *insn_size = nullptr);
+
+protected:
+    CPUState(MemState &mem, SceUID thread_id, std::size_t processor_id);
 };
+
+CPUStatePtr init_cpu(bool cpu_opt, SceUID thread_id, std::size_t processor_id, MemState &mem);
+
+// The CPU state running on this host thread, for signal handlers
+void set_current_cpu_state(CPUState *state);
+CPUState *get_current_cpu_state();

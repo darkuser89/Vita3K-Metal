@@ -181,7 +181,10 @@ static bool install_archive_content(EmuEnvState &emuenv, const ZipPtr &zip, cons
 
     auto output_path{ emuenv.vita_fs_path / "ux0" };
     if (mz_zip_reader_extract_file_to_callback(zip.get(), (content_path + sfo_path).c_str(), &write_to_buffer, &buffer, 0)) {
-        sfo::get_param_info(emuenv.app_info, buffer, emuenv.cfg.sys_lang);
+        if (!sfo::get_param_info(emuenv.app_info, buffer, emuenv.cfg.sys_lang)) {
+            LOG_ERROR("{}{} is not a readable param.sfo, not installing it", content_path, sfo_path);
+            return false;
+        }
         if (!set_content_path(emuenv, is_theme, output_path))
             return false;
     } else if (is_theme) {
@@ -370,7 +373,10 @@ static bool install_content(EmuEnvState &emuenv, const fs::path &content_path) {
     const auto is_theme = fs::exists(theme_path);
     auto dst_path{ emuenv.vita_fs_path / "ux0" };
     if (fs_utils::read_data(sfo_path, buffer)) {
-        sfo::get_param_info(emuenv.app_info, buffer, emuenv.cfg.sys_lang);
+        if (!sfo::get_param_info(emuenv.app_info, buffer, emuenv.cfg.sys_lang)) {
+            LOG_ERROR("{} is not a readable param.sfo, not installing it", fs_utils::path_to_utf8(sfo_path));
+            return false;
+        }
         if (!set_content_path(emuenv, is_theme, dst_path))
             return false;
 
@@ -657,7 +663,7 @@ ExitCode load_app(int32_t &main_module_id, EmuEnvState &emuenv, const AppLaunchR
 
     if (emuenv.cfg.gdbstub) {
         // The threads wait for the debugger's first continue
-        emuenv.kernel.suspend_threads();
+        emuenv.kernel.set_threads_suspended(true);
         server_open(emuenv);
     }
 
@@ -709,7 +715,7 @@ ExitCode run_app(EmuEnvState &emuenv, int32_t main_module_id, const AppLaunchReq
     // A main thread without its own affinity runs on every user core and reports them all
     if (affinity == SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT)
         affinity = SCE_KERNEL_CPU_MASK_USER_ALL;
-    const ThreadStatePtr main_thread = emuenv.kernel.create_thread(emuenv.mem, emuenv.io.title_id.c_str(), entry_point, priority, affinity, stack_size, 0, nullptr);
+    const ThreadStatePtr main_thread = emuenv.kernel.create_thread(emuenv.mem, emuenv.io.title_id.c_str(), entry_point, priority, affinity, stack_size, 0);
     if (!main_thread) {
         LOG_ERROR("Failed to init main thread.");
         return InitThreadFailed;
