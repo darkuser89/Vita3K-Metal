@@ -190,7 +190,7 @@ static void display_entry_thread_metal3(EmuEnvState &emuenv) {
             }
         }
 
-        // check if we're shutting down before calling run_guest_function to avoid deadlock
+        // check if we're shutting down before calling start_and_wait to avoid deadlock
         if (emuenv.display.abort.load()) {
             LOG_DEBUG("Abort detected, removing display callback data and exiting");
             display_queue.pop();
@@ -203,7 +203,7 @@ static void display_entry_thread_metal3(EmuEnvState &emuenv) {
         emuenv.display.current_sync_object = display_callback->new_sync.address();
 
         // Now run callback
-        display_thread->run_guest_function(display_callback->data);
+        display_thread->start_and_wait(display_callback->data);
 
         // Notifies the renderer of the completion of the callback for the display_entry.
         // The last_display of the entry, when pushed into the queue, is guaranteed to be timestamp_ahead + 1 at the time of the call.
@@ -234,7 +234,7 @@ static Ptr<void> gxmRunDeferredMemoryCallback_metal3(KernelState &kernel, const 
     if (native_metal)
         *Ptr<uint32_t>(final_size_addr).get(mem) = 0;
 
-    Ptr<void> result(thread->run_callback(callback.address(), { userdata.address(), request_size, final_size_addr }));
+    Ptr<void> result(thread->call_guest(callback.address(), { userdata.address(), request_size, final_size_addr }));
 
     return_size = *Ptr<std::uint32_t>(final_size_addr).get(mem);
     thread->cpu->stack_free(4);
@@ -858,16 +858,29 @@ int export_sceGxmCreateDeferredContext_metal3(EmuEnvState &emuenv, SceUID thread
 
 int export_sceGxmDisplayQueueAddEntry_metal3(EmuEnvState &emuenv, SceUID thread_id, const char *export_name, Ptr<SceGxmSyncObject> oldBuffer, Ptr<SceGxmSyncObject> newBuffer, Ptr<const void> callbackData) {
     TRACY_FUNC(sceGxmDisplayQueueAddEntry, oldBuffer, newBuffer, callbackData);
-    if (!oldBuffer || !newBuffer)
+    if (!emuenv.gxm.params.displayQueueCallback)
+        return RET_ERROR(SCE_GXM_ERROR_UNINITIALIZED);
+    const uint32_t data_size = emuenv.gxm.params.displayQueueCallbackDataSize;
+    if (!oldBuffer || !newBuffer || (!callbackData && data_size != 0))
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
-    const Address address = alloc(emuenv.mem, emuenv.gxm.params.displayQueueCallbackDataSize, __FUNCTION__);
-    const Ptr<void> ptr(address);
-    memcpy(ptr.get(emuenv.mem), callbackData.get(emuenv.mem), emuenv.gxm.params.displayQueueCallbackDataSize);
+    // The firmware waits for a free slot before it reserves the sync objects. The thread waits here
+    // for another thread's addition and for the slot, and the debugger can stop the process meanwhile.
+    std::unique_lock<std::mutex> add_lock(emuenv.gxm.display_queue_add_mutex, std::defer_lock);
+    {
+        const ThreadState::HostWait waiting(*emuenv.kernel.get_thread(thread_id));
+        add_lock.lock();
+        if (emuenv.gxm.display_queue_closed)
+            return RET_ERROR(SCE_GXM_ERROR_UNINITIALIZED);
+        if (!emuenv.gxm.display_queue.wait_space())
+            return 0;
+    }
+
+    const Address address = alloc(emuenv.mem, data_size, __FUNCTION__);
+    memcpy(Ptr<void>(address).get(emuenv.mem), callbackData.get(emuenv.mem), data_size);
 
     DisplayFrameInfo *frame = predict_next_image(emuenv, newBuffer.address());
 
-    // Block future rendering by setting values of sync object
     SceGxmSyncObject *oldBufferSync = oldBuffer.get(emuenv.mem);
     SceGxmSyncObject *newBufferSync = newBuffer.get(emuenv.mem);
 
@@ -880,13 +893,19 @@ int export_sceGxmDisplayQueueAddEntry_metal3(EmuEnvState &emuenv, SceUID thread_
         .frame_predicted = frame != nullptr
     };
 
+    const uint32_t old_last_display = oldBufferSync->last_display;
+    const uint32_t new_last_display = newBufferSync->last_display;
     oldBufferSync->last_display = ++oldBufferSync->timestamp_ahead;
     if (oldBufferSync != newBufferSync)
         newBufferSync->last_display = ++newBufferSync->timestamp_ahead;
     emuenv.gxm.last_display_global = emuenv.gxm.global_timestamp.fetch_add(1, std::memory_order_relaxed);
 
-    // function may be blocking here (expected behavior)
-    emuenv.gxm.display_queue.push(display_callback);
+    if (!emuenv.gxm.display_queue.push(display_callback)) {
+        oldBufferSync->last_display = old_last_display;
+        newBufferSync->last_display = new_last_display;
+        free(emuenv.mem, address);
+        return 0;
+    }
 
     // TODO: I do this because the sync function does not have access to the display state, but this is not great
     renderer::Context *active_renderer_context = nullptr;
@@ -900,14 +919,8 @@ int export_sceGxmDisplayQueueAddEntry_metal3(EmuEnvState &emuenv, SceUID thread_
 
     renderer::send_single_command(*emuenv.renderer, nullptr, renderer::CommandOpcode::NewFrame, false, frame, &emuenv.display, active_renderer_context);
 
-    if (emuenv.renderer->current_backend != renderer::Backend::Metal
-        && emuenv.gxm.params.displayQueueMaxPendingCount == 1)
-        // Metal keeps the callback queued until it returns, so the next push
-        // already enforces a one-entry limit without draining this entry here.
-        emuenv.gxm.display_queue.wait_empty();
-
     return 0;
-    }
+}
 
 static uint32_t metal_mapped_uniform_size_metal3(GxmState &gxm, Address address, uint32_t requested_size) {
     return metal_gxm_bookkeeping(gxm).uniform_mapping_bounds.size(
@@ -1468,6 +1481,7 @@ int export_sceGxmFinish_metal3(EmuEnvState &emuenv, SceUID thread_id, const char
             return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
         // A deferred allocator may be unavailable outside recording. Plus
         // waits through the generic command allocator in this case.
+        const ThreadState::HostWait waiting(*emuenv.kernel.get_thread(thread_id));
         renderer::finish(*emuenv.renderer, nullptr);
         return 0;
     }
@@ -1482,6 +1496,7 @@ int export_sceGxmFinish_metal3(EmuEnvState &emuenv, SceUID thread_id, const char
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
     // Wait on this context's rendering finish code.
+    const ThreadState::HostWait waiting(*emuenv.kernel.get_thread(thread_id));
     renderer::finish(*emuenv.renderer, renderer_context);
 
     return 0;
@@ -1563,19 +1578,17 @@ int export_sceGxmInitialize_metal3(EmuEnvState &emuenv, SceUID thread_id, const 
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
     }
 
+    if (params->displayQueueCallback && (params->displayQueueMaxPendingCount == 0 || params->displayQueueMaxPendingCount > 16 || params->displayQueueCallbackDataSize == 0)) {
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
+    }
+
 #ifdef __APPLE__
     if (emuenv.renderer->current_backend == renderer::Backend::Metal)
         static_cast<renderer::metal::MetalState &>(*emuenv.renderer).reset_vertex_stream_snapshots();
 #endif
     emuenv.gxm.params = *params;
-    // Plus subtracts a slot only when the worker releases an entry before its
-    // callback. Metal retains that entry through the callback, including Finish.
-    // Keep the existing limit of three pending frames; other backends retain
-    // their previous slot subtraction and the AddEntry wait for a limit of one.
-    const uint32_t max_queue_size = emuenv.renderer->current_backend == renderer::Backend::Metal
-        ? std::clamp(params->displayQueueMaxPendingCount, 1U, 3U)
-        : std::max(std::min(params->displayQueueMaxPendingCount, 3U) - 1, 1U);
-    emuenv.gxm.display_queue.maxPendingCount_ = max_queue_size;
+    // Keep each slot occupied through its callback, at the requested firmware capacity.
+    emuenv.gxm.display_queue.maxPendingCount_ = params->displayQueueMaxPendingCount;
 
     const ThreadStatePtr main_thread = emuenv.kernel.get_thread(thread_id);
     const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", emuenv.gxm.params.displayQueueCallback, SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, 0);
@@ -1586,6 +1599,7 @@ int export_sceGxmInitialize_metal3(EmuEnvState &emuenv, SceUID thread_id, const 
 
     // Reset the queue in case sceGxmTerminate was called earlier
     emuenv.gxm.display_queue.reset();
+    emuenv.gxm.display_queue_closed = false;
     if (emuenv.renderer->current_backend == renderer::Backend::Metal) {
         auto &bookkeeping = metal_gxm_bookkeeping(emuenv.gxm);
         bookkeeping.clear_metal_programs();
@@ -2342,7 +2356,7 @@ static void free_callbacked_metal3(EmuEnvState &emuenv, SceUID thread_id, SceGxm
         if (!params.hostFreeCallback)
             LOG_ERROR("Empty hostFreeCallback");
         const auto thread = emuenv.kernel.get_thread(thread_id);
-        thread->run_callback(params.hostFreeCallback.address(), { params.userData.address(), data.address() });
+        thread->call_guest(params.hostFreeCallback.address(), { params.userData.address(), data.address() });
         return;
     }
     free_callbacked(emuenv, thread_id, shaderPatcher, data.address());
@@ -2690,6 +2704,10 @@ int export_sceGxmTerminate_metal3(EmuEnvState &emuenv, SceUID thread_id, const c
     const bool native_metal = emuenv.renderer->current_backend == renderer::Backend::Metal;
     if (native_metal && emuenv.renderer->render_abort.load(std::memory_order_relaxed))
         return RET_ERROR(SCE_GXM_ERROR_DRIVER);
+    {
+        const std::lock_guard<std::mutex> add_guard(emuenv.gxm.display_queue_add_mutex);
+        emuenv.gxm.display_queue_closed = true;
+    }
     // Make sure everything is done in SDL side before killing Vita thread
     emuenv.gxm.display_queue.wait_empty();
     if (native_metal && emuenv.renderer->render_abort.load(std::memory_order_relaxed))
@@ -3102,12 +3120,12 @@ int export_sceGxmShaderPatcherDestroy_metal3(EmuEnvState &emuenv, SceUID thread_
     return 0;
 }
 
-void import_sceGxmSetYuvProfile_dispatch_metal3(EmuEnvState &emuenv, CPUState &cpu, SceUID thread_id) {
+CallResult import_sceGxmSetYuvProfile_dispatch_metal3(EmuEnvState &emuenv, CPUState &cpu, SceUID thread_id) {
     if (emuenv.renderer && emuenv.renderer->current_backend == renderer::Backend::Metal) {
         const auto bridge = make_bridge<&export_sceGxmSetYuvProfile_metal3>("sceGxmSetYuvProfile", &export_sceGxmSetYuvProfile_metal3);
-        bridge(emuenv, cpu, thread_id);
+        return bridge(emuenv, cpu, thread_id);
     } else {
         const auto bridge = make_bridge<&export_sceGxmSetYuvProfile>("sceGxmSetYuvProfile", &export_sceGxmSetYuvProfile);
-        bridge(emuenv, cpu, thread_id);
+        return bridge(emuenv, cpu, thread_id);
     }
 }

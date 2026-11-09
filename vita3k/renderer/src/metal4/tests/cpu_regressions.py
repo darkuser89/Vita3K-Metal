@@ -1773,9 +1773,27 @@ int main() {
         ('-I'+str(ROOT/'vita3k/renderer/include'), '-I'+str(ROOT/'vita3k/mem/include')))
 
 
+def display_queue_test(directory, implementation=None):
+    path = 'vita3k/modules/SceGxm/metal4/SceGxm_metal.inl'
+    text = implementation if implementation is not None else (ROOT/path).read_text()
+    init = function(path, 'int export_sceGxmInitialize_metal3(', text)
+    prefix = init[init.index('{')+1:init.index('#ifdef __APPLE__')]
+    start = init.index('    emuenv.gxm.params = *params;')
+    end = init.index('    const ThreadStatePtr main_thread', start)
+    configure = 'static int configure(EmuEnvState &emuenv,const SceGxmInitializeParams *params) {\n' + prefix + init[start:end] + '\nreturn 0;\n}'
+    finish = function('vita3k/modules/SceGxm/SceGxm.cpp', 'EXPORT(int, sceGxmDisplayQueueFinish)')
+    finish = 'static int finish(EmuEnvState &emuenv,int thread_id,const char *export_name) ' + finish[finish.index('{'):]
+    source = Path(__file__).with_name('display_queue.cpp').read_text().replace('// PRODUCTION_EXPORTS', configure + '\n' + finish + '\n' + '\n'.join(
+        function(path, signature, text) for signature in ('int export_sceGxmDisplayQueueAddEntry_metal3(', 'int export_sceGxmTerminate_metal3(', 'CallResult import_sceGxmSetYuvProfile_dispatch_metal3(')))
+    source = source.replace('// CALL_RESULT_TYPE', function('vita3k/cpu/include/cpu/common.h', 'struct CallResult') + ';')
+    run('display_queue', source, directory,
+        ('-I'+str(ROOT/'vita3k/threads/include'),), sanitizer=os.environ.get('VITA3K_DISPLAY_QUEUE_SANITIZER','address,undefined'))
+
+
 if __name__ == '__main__':
     with tempfile.TemporaryDirectory(prefix='vita3k-metal-cpu-') as temporary:
         directory = Path(temporary)
+        display_queue_test(directory)
         yuv422_profiles_test(directory)
         disabled_depth_defaults_test(directory)
         surface_allocation_test(directory)

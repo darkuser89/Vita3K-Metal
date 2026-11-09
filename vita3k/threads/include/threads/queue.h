@@ -94,7 +94,7 @@ public:
     bool push(const T &item) {
         {
             std::unique_lock<std::mutex> mlock(mutex_);
-            while (!aborted && queue_.size() == maxPendingCount_) {
+            while (!aborted && queue_.size() >= maxPendingCount_) {
                 cond_.wait(mlock);
             }
             if (aborted) {
@@ -104,6 +104,12 @@ public:
         }
         condempty_.notify_one();
         return true;
+    }
+
+    bool wait_space() {
+        std::unique_lock<std::mutex> mlock(mutex_);
+        cond_.wait(mlock, [&]() { return aborted || queue_.size() < maxPendingCount_; });
+        return !aborted;
     }
 
     // Take ownership of pending items after the consumer has stopped. Keep
